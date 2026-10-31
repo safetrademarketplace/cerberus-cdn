@@ -8292,6 +8292,7 @@ __bundle_register("FeatureRegistry", function(require, _LOADED, __bundle_registe
 local TabHome       = require("Tabs/Home")
 local TabMain       = require("Tabs/Main")
 local TabDefense    = require("Tabs/Defense")
+local TabDribble    = require("Tabs/Dribble")
 local TabPlayer     = require("Tabs/Player")
 local TabESP        = require("Tabs/ESP")
 local TabMisc       = require("Tabs/Misc")
@@ -8304,6 +8305,7 @@ local M = {}
 M.tabs = {
     { key = "Home",        label = "Home",        icon = "house",       mount = TabHome,       mountOrder = 2,  configKeys = { "Home" } },
     { key = "Main",        label = "Main",        icon = "star",        mount = TabMain,       mountOrder = 3,  configKeys = { "Basketball" } },
+    { key = "Dribble",     label = "Dribble",     icon = "volleyball",  mount = TabDribble,    mountOrder = 12, configKeys = { "Basketball" } },
     { key = "Defense",     label = "Defense",     icon = "shield",      mount = TabDefense,    mountOrder = 11, configKeys = { "Basketball" } },
     { key = "Player",      label = "Player",      icon = "circle-user", mount = TabPlayer,     mountOrder = 5,  captureAs = "Movement", configKeys = { "Movement", "PlayerUtils", "Visuals" } },
     { key = "ESP",         label = "ESP",         icon = "eye",         mount = TabESP,        mountOrder = 7,  configKeys = { "ESP" } },
@@ -13728,13 +13730,14 @@ end
 
 end)
 __bundle_register("Features/Basketball/Effects/LowEffects", function(require, _LOADED, __bundle_register, __bundle_modules)
--- low effects feature: a switch per expensive visual plus one for the lot, held through prefs overrides so nothing reaches the account, with the measured frame rate either side of the change
+-- low effects feature: a switch per expensive visual plus one for the lot, held through prefs overrides and the post effects hold so nothing reaches the account, with the measured frame rate either side of the change
 local Jobs    = require("Utility/Jobs")
 local Log     = require("Utility/Log")
 local UiWrite = require("Utility/UiWrite")
 
 local FrameRate    = require("Features/Basketball/Effects/FrameRate")
 local MenuCallback = require("Features/Basketball/Effects/MenuCallback")
+local PostEffects  = require("Features/Basketball/Effects/PostEffects")
 
 local LEVERS = {
     {
@@ -13786,6 +13789,11 @@ local LEVERS = {
     {
         id = "LowFxEvents", short = "event effects", setter = "setEventEffects", value = false,
         text = "No event effects",
+    },
+    {
+        id = "LowFxPost", short = "post effects", hold = PostEffects.hold,
+        text = "No Post Effects",
+        tooltip = "Bloom, blur, sun rays, color tint",
     },
 }
 
@@ -13839,7 +13847,7 @@ return function(ctx)
         return table.concat(parts, "\n")
     end
 
-    -- one label write per batch, so the master switch does not rebuild the groupbox eleven times
+    -- one label write per batch, so the master switch does not rebuild the groupbox once per lever
     local function queueStatus()
         if dead or statusJob then return end
         statusJob = Jobs.delay(0, function()
@@ -13861,11 +13869,22 @@ return function(ctx)
         end
     end
 
+    -- no fog's switch still reads on after its own teardown has run, so unload never counts it as holding
+    local function noFogHolding()
+        local noFog = ctx.Toggles.NoFog
+        return not dead and noFog ~= nil and noFog.Value == true
+    end
+
     -- a lever that throws counts as refused, so one bad lever can never stop the ones after it
     local function pull(lever)
-        local ok, token, reason = pcall(Prefs[lever.setter], lever.value)
+        local ok, token, reason
+        if lever.hold then
+            ok, token, reason = pcall(lever.hold, noFogHolding)
+        else
+            ok, token, reason = pcall(Prefs[lever.setter], lever.value)
+        end
         if not ok then
-            Log.devwarn("LowEffects", "%s threw: %s", lever.setter, tostring(token))
+            Log.devwarn("LowEffects", "%s threw: %s", lever.id, tostring(token))
             return nil, nil
         end
         return token, reason
@@ -13998,6 +14017,274 @@ return function(ctx)
         end,
     }
 end
+
+end)
+__bundle_register("Features/Basketball/Effects/PostEffects", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- post effects: holds every bloom, colour correction, depth of field, sun ray and blur effect under lighting and the current camera switched off, answering the game's re-enables and swaps by event, and gives each back the value it last asked for
+local Services = require("Services")
+local Maid     = require("Utility/Maid")
+
+local CLASSES = {
+    BloomEffect           = true,
+    BlurEffect            = true,
+    ColorCorrectionEffect = true,
+    DepthOfFieldEffect    = true,
+    SunRaysEffect         = true,
+}
+
+-- no fog only re-enables what carries this, and finds nothing to stamp on an effect we already switched off
+local NO_FOG_STAMP = "NFWasEnabled"
+
+-- the game turns this on for a live event and off after it (LiveEvent.Lighting:408, :464), keeping the event's colours; a hold cannot see the off, so this one only ever goes back off
+local EVENT_GRADE = "LiveEventGrade"
+
+local M = {}
+
+function M.isPostEffect(inst)
+    return CLASSES[inst.ClassName] == true
+end
+
+local function ownValue(inst)
+    return inst.Enabled and inst.Name ~= EVENT_GRADE
+end
+
+local function putBack(inst, was)
+    inst.Enabled = was
+end
+
+local function handToNoFog(inst, was)
+    if was then inst:SetAttribute(NO_FOG_STAMP, true) end
+end
+
+-- one root's effects, each held until it leaves the root or the returned function lets the lot go
+local function holdUnder(root)
+    local own, conns = {}, {}
+    local maid = Maid.new()
+
+    local function take(inst)
+        if not CLASSES[inst.ClassName] or own[inst] ~= nil then return end
+        own[inst] = ownValue(inst)
+        inst.Enabled = false
+        -- a true is the game, no fog or performance mode saying what it should be once we let go
+        conns[inst] = inst:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if own[inst] ~= nil and inst.Enabled then
+                own[inst] = ownValue(inst)
+                inst.Enabled = false
+            end
+        end)
+    end
+
+    local function free(inst)
+        local was = own[inst]
+        if was == nil then return end
+        conns[inst]:Disconnect()
+        own[inst], conns[inst] = nil, nil
+        inst.Enabled = was
+    end
+
+    maid:GiveTask(root.DescendantAdded:Connect(take))
+    maid:GiveTask(root.DescendantRemoving:Connect(free))
+    for _, inst in ipairs(root:GetDescendants()) do take(inst) end
+
+    return function(giveBack)
+        maid:DoCleaning()
+        for inst, conn in pairs(conns) do
+            conn:Disconnect()
+            giveBack(inst, own[inst])
+        end
+        table.clear(own)
+        table.clear(conns)
+    end
+end
+
+-- noFogHolding says whether no fog still wants lighting's effects off at the moment of release; it never looks under the camera
+function M.hold(noFogHolding)
+    local Workspace = Services.Workspace
+    local maid = Maid.new()
+    local letGoLighting = holdUnder(Services.Lighting)
+    local letGoCamera
+
+    local function followCamera()
+        if letGoCamera then letGoCamera(putBack) end
+        local camera = Workspace.CurrentCamera
+        letGoCamera = camera and holdUnder(camera) or nil
+    end
+
+    maid:GiveTask(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(followCamera))
+    followCamera()
+
+    local token = {}
+    local spent = false
+    function token.Restore()
+        if spent then return false end
+        spent = true
+        maid:DoCleaning()
+        letGoLighting(noFogHolding() and handToNoFog or putBack)
+        if letGoCamera then letGoCamera(putBack) end
+        return true
+    end
+    token.Destroy = token.Restore
+    token.Disconnect = token.Restore
+    return token
+end
+
+return M
+
+end)
+__bundle_register("Utility/Maid", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- quenty nevermore Maid, forked: luau types stripped for luabundler and every task dispatched under pcall, because upstream lets one throwing task abort the rest of DoCleaning
+local Log = require("Utility/Log")
+
+local Maid = {}
+Maid.ClassName = "Maid"
+
+-- one task's failure is logged and skipped, never allowed to abort the sweep
+local function runTask(job)
+	local ok, err = pcall(function()
+		if typeof(job) == "function" then
+			job()
+		elseif typeof(job) == "table" then
+			if type(job.Destroy) == "function" then
+				job:Destroy()
+			end
+		elseif typeof(job) == "Instance" then
+			job:Destroy()
+		elseif typeof(job) == "thread" then
+			local cancelled
+			if coroutine.running() ~= job then
+				cancelled = pcall(function()
+					task.cancel(job)
+				end)
+			end
+
+			if not cancelled then
+				task.defer(function()
+					task.cancel(job)
+				end)
+			end
+		elseif typeof(job) == "RBXScriptConnection" then
+			job:Disconnect()
+		end
+	end)
+	if not ok then
+		Log.devwarn("Maid", "task failed during cleanup: %s", tostring(err))
+	end
+end
+
+function Maid.new()
+	return setmetatable({ _tasks = {} }, Maid)
+end
+
+function Maid.isMaid(value)
+	return type(value) == "table" and value.ClassName == "Maid"
+end
+
+function Maid.__index(self, index)
+	if Maid[index] then
+		return Maid[index]
+	else
+		return self._tasks[index]
+	end
+end
+
+function Maid.__newindex(self, index, newTask)
+	if Maid[index] ~= nil then
+		error(string.format("Cannot use '%s' as a Maid key", tostring(index)), 2)
+	end
+
+	local tasks = self._tasks
+	local job = tasks[index]
+
+	if job == newTask then
+		return
+	end
+
+	tasks[index] = newTask
+
+	if job then
+		runTask(job)
+	end
+end
+
+function Maid:Add(taskItem)
+	if not taskItem then
+		error("Task cannot be false or nil", 2)
+	end
+
+	self[#self._tasks + 1] = taskItem
+
+	if type(taskItem) == "table" and not taskItem.Destroy then
+		Log.warn("[Maid.Add] - Gave table task without .Destroy\n\n" .. debug.traceback())
+	end
+
+	return taskItem
+end
+
+function Maid:GiveTask(taskItem)
+	if not taskItem then
+		error("Task cannot be false or nil", 2)
+	end
+
+	local taskId = #self._tasks + 1
+	self[taskId] = taskItem
+
+	if type(taskItem) == "table" and not taskItem.Destroy then
+		Log.warn("[Maid.GiveTask] - Gave table task without .Destroy\n\n" .. debug.traceback())
+	end
+
+	return taskId
+end
+
+function Maid:GivePromise(promise)
+	if not promise:IsPending() then
+		return promise
+	end
+
+	local newPromise = promise.resolved(promise)
+	local id = self:GiveTask(newPromise)
+
+	newPromise:Finally(function()
+		self[id] = nil
+	end)
+
+	return newPromise
+end
+
+-- second fork delta: upstream drains with `next()`, so unwinding GiveTask's ascending integer keys in reverse is what gives callers LIFO
+function Maid:DoCleaning()
+	local tasks = self._tasks
+
+	-- connections first, so a watcher can't fire on a state-restoring task and undo it
+	for index, job in pairs(tasks) do
+		if typeof(job) == "RBXScriptConnection" then
+			tasks[index] = nil
+			runTask(job)
+		end
+	end
+
+	local highest = 0
+	for index in pairs(tasks) do
+		if type(index) == "number" and index > highest then highest = index end
+	end
+	for i = highest, 1, -1 do
+		local job = tasks[i]
+		if job ~= nil then
+			tasks[i] = nil
+			runTask(job)
+		end
+	end
+
+	local index, job = next(tasks)
+	while job ~= nil do
+		tasks[index] = nil
+		runTask(job)
+		index, job = next(tasks)
+	end
+end
+
+Maid.Destroy = Maid.DoCleaning
+
+return Maid
 
 end)
 __bundle_register("Features/Basketball/Effects/MenuCallback", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -17609,12 +17896,825 @@ return function(ctx)
 end
 
 end)
+__bundle_register("Tabs/Dribble", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- dribble tab: move keys, combos, the combo creator and the auto ankle breaker
+local Moves = require("Features/Basketball/Moves")
+
+return function(ctx)
+    if ctx.Config.Basketball then Moves(ctx) end
+end
+
+end)
+__bundle_register("Features/Basketball/Moves", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- dribble suite: moves and combos on the left, the combo creator and ankle breaker on the right, all sending through one runner and one key listener; the game's input table is read only after the widgets stand, because a game call mid-build stops the next one being built
+local Jobs         = require("Utility/Jobs")
+local Mount        = require("Utility/Mount")
+local Scheduler    = require("Utility/Scheduler")
+local Kit          = require("Features/Basketball/Defense/Kit")
+local AnkleBreaker = require("Features/Basketball/Moves/AnkleBreaker")
+local Catalog      = require("Features/Basketball/Moves/Catalog")
+local Combos       = require("Features/Basketball/Moves/Combos")
+local Creator      = require("Features/Basketball/Moves/Creator")
+local Keys         = require("Features/Basketball/Moves/Keys")
+local MoveKeys     = require("Features/Basketball/Moves/MoveKeys")
+local Runner       = require("Features/Basketball/Moves/Runner")
+
+local TABLE_RETRY  = 2
+local STATUS_EVERY = 0.2
+
+return function(ctx)
+    local O = Mount.orchestrator(ctx, "Moves")
+    if not O then return end
+    local tab = ctx.Tabs and ctx.Tabs.Dribble
+    if not tab then return end
+
+    local api = ctx.Api or {}
+    if not (api.Court and api.Input and api.Net and api.Player) then
+        tab:AddLeftGroupbox("Moves", "footprints"):AddLabel("Not available here", true)
+        return
+    end
+
+    local Library = ctx.Library
+    local catalog = Catalog.new(api.Net)
+    local runner  = Runner.new(catalog, api.Input, api.Player)
+    O.onUnload(runner.stop)
+
+    local lines = {}
+
+    local function status(label, owner, toggle)
+        lines[#lines + 1] = { write = Kit.writer(Library, label), owner = owner, toggle = toggle }
+    end
+
+    local sub = O.subCtx({
+        Keys   = Keys.new(ctx.Services.UserInputService, Library, O.track),
+        Runner = runner,
+        Status = status,
+    })
+
+    O.mount(MoveKeys, sub)
+    O.mount(Combos, sub)
+    O.mount(Creator, sub)
+    O.mount(AnkleBreaker, sub)
+
+    O.track(Scheduler.heartbeat(function()
+        if Library.Toggled == false then return end
+        for i = 1, #lines do
+            local line = lines[i]
+            if line.toggle.Value then line.write(runner.status(line.owner)) end
+        end
+    end, { name = "DribbleStatus", interval = STATUS_EVERY, deferrable = true }))
+
+    O.track(Jobs.spawn(function(job)
+        while not catalog.read() do
+            if not job:sleep(TABLE_RETRY) then return end
+        end
+    end, { name = "DribbleTable" }))
+
+    O.finalize()
+    return {}
+end
+
+end)
+__bundle_register("Features/Basketball/Moves/Runner", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- dribble runner: the one place a move gets sent; plays a list of moves on one job, reading your hand before each and watching your action to see the last one end, and sends nothing without the ball, during a shot or while squared up
+local Jobs    = require("Utility/Jobs")
+local Catalog = require("Features/Basketball/Moves/Catalog")
+
+local BALL          = "Basketball"
+local DRIBBLING     = "Dribbling"
+local HAND          = "Hand"
+local SWITCH_INPUT  = "H"
+local TRIPLE_THREAT = "TripleThreat"
+
+local POLL = 1 / 30
+
+-- the action comes back a round trip after the send, so a slow connection has to fit inside this
+local START_LIMIT = 0.75
+
+-- the server holds a move and the client is never told how long; the sampled velocity tables run 0.3 to 0.75 s (Dribbling.Packages.Moves)
+local FINISH_LIMIT = 2.5
+
+-- a gather is the first step of a finish, so it counts with the shots
+local SHOT_ACTIONS = { Shooting = true, Dunking = true, ContactLayup = true, ClutchLayup = true, Gathering = true }
+
+local M = {}
+
+function M.new(catalog, input, player)
+    local current = nil
+
+    -- a job that threw is retired without reaching its own last line
+    local function active()
+        if current and current.job and not current.job.alive then current = nil end
+        return current
+    end
+
+    -- squared up the same letters are jabs (Dribbling.Input.TripleThreat), and a hand switch is not among them
+    local function blocked(id)
+        if not catalog.ready() then return "Loading moves" end
+        if not player.attr(BALL) then return "No ball" end
+        if SHOT_ACTIONS[player.action()] then return "Shooting" end
+        if id ~= Catalog.SWITCH_HAND and player.attr(TRIPLE_THREAT) then return "Walk first" end
+        return nil
+    end
+
+    local function notDribbling()
+        return player.action() ~= DRIBBLING
+    end
+
+    local function waitFor(job, done, limit)
+        local deadline = os.clock() + limit
+        while not done() do
+            if os.clock() >= deadline then return false end
+            if not job:sleep(POLL) then return false end
+        end
+        return true
+    end
+
+    -- true once the server took it, by the action or by the hand changing
+    local function sendAndWatch(job, letters)
+        local hand = player.attr(HAND)
+        if not input.dribble(letters) then return false end
+        return waitFor(job, function()
+            return player.action() == DRIBBLING or player.attr(HAND) ~= hand
+        end, START_LIMIT)
+    end
+
+    local function switchHands(job)
+        local hand = player.attr(HAND)
+        if not sendAndWatch(job, SWITCH_INPUT) then return end
+        waitFor(job, function() return player.attr(HAND) ~= hand end, START_LIMIT)
+        waitFor(job, notDribbling, FINISH_LIMIT)
+    end
+
+    -- returns whether the move started, and whether the whole run has to end because of the ball or a shot
+    local function step(job, run, id)
+        waitFor(job, notDribbling, FINISH_LIMIT)
+        if blocked(id) then return false, true end
+        run.name = Catalog.LABEL_OF[id]
+
+        -- a move ends on a new hand, so this has to be read fresh every step
+        local letters, needsSwitch = catalog.plan(id, player.attr(HAND))
+        if not letters then return false, false end
+
+        if needsSwitch then
+            switchHands(job)
+            if blocked(id) then return false, true end
+            letters, needsSwitch = catalog.plan(id, player.attr(HAND))
+            if not letters or needsSwitch then return false, false end
+        end
+        return sendAndWatch(job, letters), false
+    end
+
+    -- the list is read by index on every pass, so moves added while it loops join the next one; a whole pass that started nothing ends the loop, or it would send forever into a server that refuses
+    local function playList(job, run, ids, again)
+        repeat
+            local moved = false
+            local i = 1
+            while i <= #ids do
+                local started, halted = step(job, run, ids[i])
+                if halted then return end
+                moved = moved or started
+                i = i + 1
+            end
+        until not (moved and again and again())
+        waitFor(job, notDribbling, FINISH_LIMIT)
+    end
+
+    local function stop(owner)
+        local run = active()
+        if not run or (owner ~= nil and run.owner ~= owner) then return end
+        current = nil
+        if run.job then run.job:Cancel() end
+    end
+
+    -- takes over from whatever is playing; false when the rule on the first move refuses, in which case nothing changes
+    local function play(owner, ids, again)
+        if #ids == 0 or blocked(ids[1]) then return false end
+        stop()
+        local run = { owner = owner, name = Catalog.LABEL_OF[ids[1]] }
+        current = run
+        run.job = Jobs.spawn(function(job)
+            playList(job, run, ids, again)
+            if current == run then current = nil end
+        end, { name = "DribbleMoves" })
+        return true
+    end
+
+    local function owner()
+        local run = active()
+        return run and run.owner or nil
+    end
+
+    -- a status line for one feature: its move while it plays, otherwise what would stop a press right now
+    local function status(who)
+        local run = active()
+        if run and run.owner == who then return "Playing " .. run.name end
+        return blocked() or "Ready"
+    end
+
+    return { play = play, stop = stop, owner = owner, blocked = blocked, status = status }
+end
+
+return M
+
+end)
+__bundle_register("Features/Basketball/Moves/Catalog", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- dribble catalog: the moves the menu can name, fixed so the widgets can be built from it, and the letters that make each one on each hand, read from the game's own input table once it can be read
+local CONFIG = "Config.Game.Dribbling"
+
+local OTHER_HAND = { L = "R", R = "L" }
+
+local M = {}
+
+M.SWITCH_HAND = "SwitchHand"
+
+M.MOVES = {
+    { id = "Crossover",        label = "Crossover" },
+    { id = "Hesitation",       label = "Hesitation" },
+    { id = "BehindBack",       label = "Behind Back" },
+    { id = "Spin",             label = "Spin" },
+    { id = "HalfSpin",         label = "Half Spin" },
+    { id = "StepBack",         label = "Step Back" },
+    { id = "SnatchBack",       label = "Snatch Back" },
+    { id = "DoubleCrossover",  label = "Double Crossover" },
+    { id = "DoubleBehindBack", label = "Double Behind Back" },
+    { id = "Tween",            label = "Tween" },
+    { id = "Breakdown",        label = "Breakdown" },
+    { id = "Combo",            label = "Combo" },
+    { id = M.SWITCH_HAND,      label = "Switch Hand" },
+}
+
+M.LABELS, M.LABEL_OF, M.ID_OF = {}, {}, {}
+for i, move in ipairs(M.MOVES) do
+    M.LABELS[i] = move.label
+    M.LABEL_OF[move.id] = move.label
+    M.ID_OF[move.label] = move.id
+end
+
+-- several inputs can make one move, so the shortest wins and then the first by letter, which keeps the answer the same every session; TripleThreat sits beside the letters but has no hands of its own, so it adds nothing
+local function indexInputs(inputs)
+    local hands = { L = {}, R = {} }
+    for letters, moves in pairs(inputs) do
+        for hand, lookup in pairs(hands) do
+            local id = moves[hand]
+            if type(id) == "string" and id ~= "" then
+                local best = lookup[id]
+                if not best or #letters < #best or (#letters == #best and letters < best) then
+                    lookup[id] = letters
+                end
+            end
+        end
+    end
+    return hands
+end
+
+function M.new(net)
+    local hands = nil
+
+    -- a miss is never remembered, so the caller can simply ask again
+    local function read()
+        if hands then return true end
+        local config = net.shared(CONFIG)
+        local inputs = config and config.Input
+        if type(inputs) ~= "table" then return false end
+        hands = indexInputs(inputs)
+        return true
+    end
+
+    local function ready()
+        return hands ~= nil
+    end
+
+    -- the letters for a move from this hand, and true when they only work from the other hand, so a switch has to come first
+    local function plan(id, hand)
+        local here = hands and hands[hand]
+        if not here then return nil end
+        if here[id] then return here[id], false end
+        local there = hands[OTHER_HAND[hand]][id]
+        if there then return there, true end
+        return nil
+    end
+
+    return { read = read, ready = ready, plan = plan }
+end
+
+return M
+
+end)
+__bundle_register("Features/Basketball/Moves/MoveKeys", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- move keybinds: a key for each named move, which plays that move from whichever hand you are on
+local Catalog = require("Features/Basketball/Moves/Catalog")
+
+local OWNER = "Moves"
+
+return function(ctx)
+    local Runner = ctx.Runner
+
+    local Group = ctx.Tabs.Dribble:AddLeftGroupbox("Moves", "footprints")
+    local toggle = Group:AddToggle("MoveKeysEnabled", {
+        Text    = "Move Keybinds",
+        Default = false,
+    })
+
+    local Box = Group:AddDependencyBox()
+    ctx.Status(Box:AddLabel("Ready", true), OWNER, toggle)
+
+    for _, move in ipairs(Catalog.MOVES) do
+        local list = { move.id }
+        ctx.Keys.add(Box, "MoveKey" .. move.id, move.label, toggle, function()
+            Runner.play(OWNER, list)
+        end)
+    end
+
+    Box:SetupDependencies({ { toggle, true } })
+
+    toggle:OnChanged(function(on)
+        if not on then Runner.stop(OWNER) end
+    end)
+end
+
+end)
+__bundle_register("Features/Basketball/Moves/Keys", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- dribble keys: every key of the suite behind one input listener, because a key picker has no press callback; each starts unbound, since every sensible default is already a game key
+local M = {}
+
+function M.new(UserInputService, Library, track)
+    local binds = {}
+
+    track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        -- the press that picks a key is not a request for the move
+        if gameProcessed or Library.IsPicking then return end
+        for i = 1, #binds do
+            local bind = binds[i]
+            local key = bind.key
+            if key and bind.toggle.Value and (input.KeyCode == key or input.UserInputType == key) then
+                bind.press()
+                return
+            end
+        end
+    end))
+
+    local function add(group, id, text, toggle, press)
+        local bind = { toggle = toggle, press = press, key = nil }
+        binds[#binds + 1] = bind
+        group:AddLabel(text):AddKeyPicker(id, {
+            Default         = nil,
+            SyncToggleState = false,
+            Mode            = "Toggle",
+            Text            = text,
+            NoUI            = true,
+            ChangedCallback = function(key) bind.key = key end,
+        })
+    end
+
+    return { add = add }
+end
+
+return M
+
+end)
+__bundle_register("Features/Basketball/Moves/Creator", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- combo creator: build a list of moves, play it on a key or loop it until the key is pressed again or the ball goes, and keep named lists on disk for the next session
+local Jobs    = require("Utility/Jobs")
+local Store   = require("Utility/Store")
+local UiWrite = require("Utility/UiWrite")
+local Kit     = require("Features/Basketball/Defense/Kit")
+local Catalog = require("Features/Basketball/Moves/Catalog")
+
+local OWNER     = "Creator"
+local STORE_KEY = "DribbleCombos"
+local MAX_MOVES = 12
+local MAX_NAME  = 24
+local NOTE_TIME = 2
+
+local function copy(list)
+    return table.move(list, 1, #list, 1, {})
+end
+
+-- the file can be hand edited or older than the game, so anything that is no longer a move falls out here
+local function tidy(raw)
+    local saved = {}
+    if type(raw) ~= "table" then return saved end
+    for name, moves in pairs(raw) do
+        if type(name) == "string" and type(moves) == "table" then
+            local list = {}
+            for _, id in ipairs(moves) do
+                if Catalog.LABEL_OF[id] and #list < MAX_MOVES then list[#list + 1] = id end
+            end
+            if #list > 0 then saved[name] = list end
+        end
+    end
+    return saved
+end
+
+local function sortedNames(saved)
+    local names = {}
+    for name in pairs(saved) do names[#names + 1] = name end
+    table.sort(names)
+    return names
+end
+
+local function cleanName(raw)
+    local name = string.match(Kit.clean(raw or ""), "^%s*(.-)%s*$")
+    return string.sub(name, 1, MAX_NAME)
+end
+
+return function(ctx)
+    local Library = ctx.Library
+    local Options = ctx.Options
+    local Toggles = ctx.Toggles
+    local Runner  = ctx.Runner
+
+    local sequence, saved = {}, {}
+
+    local Group = ctx.Tabs.Dribble:AddRightGroupbox("Combo Creator", "list-ordered")
+    local toggle = Group:AddToggle("CreatorEnabled", {
+        Text    = "Combo Creator",
+        Default = false,
+    })
+
+    local Box = Group:AddDependencyBox()
+    Box:AddDropdown("CreatorMove", {
+        Text    = "Move",
+        Values  = Catalog.LABELS,
+        Default = 1,
+        Multi   = false,
+    })
+
+    local readout
+
+    local function show()
+        if #sequence == 0 then
+            UiWrite.text(readout, "Empty")
+            return
+        end
+        local labels = {}
+        for i, id in ipairs(sequence) do labels[i] = Catalog.LABEL_OF[id] end
+        UiWrite.text(readout, table.concat(labels, ", "))
+    end
+
+    local function note(text)
+        UiWrite.notify(Library, text, NOTE_TIME)
+    end
+
+    Box:AddButton({
+        Text = "Add",
+        Func = function()
+            local id = Catalog.ID_OF[Options.CreatorMove.Value]
+            if not id then return end
+            if #sequence >= MAX_MOVES then return note("Combo is full") end
+            sequence[#sequence + 1] = id
+            show()
+        end,
+    })
+
+    Box:AddButton({
+        Text = "Clear",
+        Func = function()
+            Runner.stop(OWNER)
+            table.clear(sequence)
+            show()
+        end,
+    })
+
+    readout = Box:AddLabel("Empty", true)
+    ctx.Status(Box:AddLabel("Ready", true), OWNER, toggle)
+
+    ctx.Keys.add(Box, "CreatorKey", "Play Key", toggle, function()
+        if Runner.owner() == OWNER then
+            Runner.stop(OWNER)
+            return
+        end
+        if #sequence == 0 then return note("Add a move first") end
+        Runner.play(OWNER, sequence, function() return Toggles.CreatorLoop.Value end)
+    end)
+
+    Box:AddToggle("CreatorLoop", {
+        Text    = "Loop",
+        Default = false,
+    })
+
+    Box:AddInput("CreatorName", {
+        Text        = "Name",
+        Default     = "",
+        Placeholder = "Combo name",
+        Finished    = false,
+    })
+
+    local savedDrop
+
+    Box:AddButton({
+        Text = "Save",
+        Func = function()
+            local name = cleanName(Options.CreatorName.Value)
+            if name == "" then return note("Name it first") end
+            if #sequence == 0 then return note("Add a move first") end
+            saved[name] = copy(sequence)
+            UiWrite.values(savedDrop, sortedNames(saved))
+            if Store.write(Store.GAME, STORE_KEY, saved) then
+                note("Saved " .. name)
+            else
+                note("Could not save")
+            end
+        end,
+    })
+
+    savedDrop = Box:AddDropdown("CreatorSaved", {
+        Text     = "Load",
+        Values   = {},
+        Multi    = false,
+        Callback = function(name)
+            local moves = saved[name]
+            if not moves then return end
+            Runner.stop(OWNER)
+            sequence = copy(moves)
+            show()
+            UiWrite.value(Options.CreatorName, name)
+        end,
+    })
+
+    Box:SetupDependencies({ { toggle, true } })
+
+    toggle:OnChanged(function(on)
+        if not on then Runner.stop(OWNER) end
+    end)
+
+    -- after the widgets, and it finishes before the first frame, so a config restoring the load dropdown finds its names
+    ctx.track(Jobs.spawn(function()
+        saved = tidy(Store.read(Store.GAME, STORE_KEY, {}))
+        UiWrite.values(savedDrop, sortedNames(saved))
+    end, { name = "DribbleSaved" }))
+end
+
+end)
+__bundle_register("Features/Basketball/Defense/Kit", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- defense kit: what the suite's features share and nothing about the game, a maid for what a toggle holds, label text that stays safe and readable, and the connection delay
+local Maid    = require("Utility/Maid")
+local UiWrite = require("Utility/UiWrite")
+
+local FALLBACK_PING = 0.1
+
+local M = {}
+
+-- track keeps every handle it is given for the whole session, so it gets this one and the toggle churns inside the maid
+function M.armedMaid(track)
+    local maid = Maid.new()
+    track({ Disconnect = function() maid:DoCleaning() end })
+    return maid
+end
+
+-- a closed menu is never read, so a tick skips it and the next tick with it open catches up; always is for the last word a stopped feature will not repeat
+function M.writer(Library, label)
+    local shown = nil
+    return function(text, always)
+        if text == shown then return end
+        if Library.Toggled == false and not always then return end
+        if UiWrite.text(label, text) then shown = text end
+    end
+end
+
+-- obsidian labels are rich text, so a string from the server could otherwise open a tag
+function M.clean(value)
+    return (string.gsub(tostring(value), "[<>]", ""))
+end
+
+function M.studs(distance)
+    local rounded = math.floor(distance + 0.5)
+    if rounded == 1 then return "1 stud" end
+    return ("%d studs"):format(rounded)
+end
+
+local function readPing(player)
+    return player:GetNetworkPing()
+end
+
+-- the round trip, which is what a reach or a jump is late by: what we see left the server half of it ago and what we send lands half of it from now
+function M.ping(player)
+    local ok, value = pcall(readPing, player)
+    return (ok and type(value) == "number") and value or FALLBACK_PING
+end
+
+return M
+
+end)
+__bundle_register("Features/Basketball/Moves/Combos", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- combos: three ready-made sequences, each on its own key
+local OWNER = "Combos"
+
+local COMBOS = {
+    { id = "ComboKeyHesiCross",     name = "Hesi Cross",      moves = { "Hesitation", "Crossover" } },
+    { id = "ComboKeyStepBackCross", name = "Step Back Cross", moves = { "StepBack", "Crossover" } },
+    { id = "ComboKeyCrossSpin",     name = "Cross Spin",      moves = { "Crossover", "Spin" } },
+}
+
+return function(ctx)
+    local Runner = ctx.Runner
+
+    local Group = ctx.Tabs.Dribble:AddLeftGroupbox("Combos", "swords")
+    local toggle = Group:AddToggle("CombosEnabled", {
+        Text    = "Combos",
+        Default = false,
+    })
+
+    local Box = Group:AddDependencyBox()
+    ctx.Status(Box:AddLabel("Ready", true), OWNER, toggle)
+
+    local playing = nil
+    for _, combo in ipairs(COMBOS) do
+        ctx.Keys.add(Box, combo.id, combo.name, toggle, function()
+            -- pressing the one already playing changes nothing, and a different one takes over
+            if Runner.owner() == OWNER and playing == combo then return end
+            if Runner.play(OWNER, combo.moves) then playing = combo end
+        end)
+    end
+
+    Box:SetupDependencies({ { toggle, true } })
+
+    toggle:OnChanged(function(on)
+        if not on then Runner.stop(OWNER) end
+    end)
+end
+
+end)
+__bundle_register("Features/Basketball/Moves/AnkleBreaker", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- auto ankle breaker: fires your escape move when the nearest defender is inside your range and moving at you, judged from where the defender has been, because a remote player's velocity reads zero
+local Scheduler = require("Utility/Scheduler")
+local Kit       = require("Features/Basketball/Defense/Kit")
+local Motion    = require("Features/Basketball/Defense/Motion")
+local Catalog   = require("Features/Basketball/Moves/Catalog")
+
+local OWNER = "AnkleBreaker"
+local TICK  = 0.05
+
+-- studs a second straight at you; a guard shuffling on the spot stays under it
+local CLOSING_SPEED = 4
+
+-- anything else is an action in progress (GameUtil.IsInCoreAction) or the ball on its way to you
+local FREE_ACTIONS = { [""] = true, Moving = true }
+
+local DEFAULT_MOVE  = "StepBack"
+local DEFAULT_RANGE = 10
+local DEFAULT_WAIT  = 1.5
+
+return function(ctx)
+    local Library = ctx.Library
+    local Runner  = ctx.Runner
+    local court   = ctx.Api.Court
+    local player  = ctx.Api.Player
+
+    local range, wait = DEFAULT_RANGE, DEFAULT_WAIT
+    local escape = { DEFAULT_MOVE }
+
+    local Group = ctx.Tabs.Dribble:AddRightGroupbox("Ankle Breaker", "zap")
+    local toggle = Group:AddToggle("AnkleBreakerEnabled", {
+        Text    = "Auto Ankle Breaker",
+        Default = false,
+    })
+
+    local Box = Group:AddDependencyBox()
+    Box:AddDropdown("AnkleBreakerMove", {
+        Text     = "Escape Move",
+        Values   = Catalog.LABELS,
+        Default  = Catalog.LABEL_OF[DEFAULT_MOVE],
+        Multi    = false,
+        Callback = function(label)
+            escape[1] = Catalog.ID_OF[label] or escape[1]
+        end,
+    })
+    Box:AddSlider("AnkleBreakerRange", {
+        Text     = "Range",
+        Default  = DEFAULT_RANGE,
+        Min      = 4,
+        Max      = 30,
+        Rounding = 0,
+        Suffix   = " studs",
+        Callback = function(value) range = value end,
+    })
+    Box:AddSlider("AnkleBreakerWait", {
+        Text     = "Wait",
+        Default  = DEFAULT_WAIT,
+        Min      = 0.25,
+        Max      = 5,
+        Rounding = 2,
+        Suffix   = " s",
+        Callback = function(value) wait = value end,
+    })
+    local say = Kit.writer(Library, Box:AddLabel("Ready", true))
+    Box:SetupDependencies({ { toggle, true } })
+
+    local armed = Kit.armedMaid(ctx.track)
+    local motion = Motion.new()
+    local target, lastFired = nil, nil
+
+    local function closingSpeed(from, vx, vz)
+        local here = player.position()
+        if not here then return 0 end
+        local dx, dz = here.X - from.X, here.Z - from.Z
+        local gap = math.sqrt(dx * dx + dz * dz)
+        if gap == 0 then return 0 end
+        return (vx * dx + vz * dz) / gap
+    end
+
+    local function tick()
+        local why = Runner.blocked()
+        if why then
+            target = nil
+            return say(why)
+        end
+
+        local rec, away = court.nearestOpponent()
+        if not rec then
+            target = nil
+            return say("No defender")
+        end
+
+        local now = os.clock()
+        if rec ~= target then
+            target = rec
+            motion:reset()
+        end
+
+        -- sampled while they are still out of range, so the reading is warm the moment they cross it
+        local at = rec.root.Position
+        local vx, vz = motion:sample(at, now)
+        if away > range then return say(("Too far: %s"):format(Kit.studs(away))) end
+        if closingSpeed(at, vx, vz) < CLOSING_SPEED then return say("Not closing") end
+        if lastFired and now - lastFired < wait then return say("Waiting") end
+        if Runner.owner() or not FREE_ACTIONS[player.action()] then return say("Busy") end
+
+        if Runner.play(OWNER, escape) then
+            lastFired = now
+            say(Catalog.LABEL_OF[escape[1]])
+        end
+    end
+
+    toggle:OnChanged(function(on)
+        armed:DoCleaning()
+        target = nil
+        motion:reset()
+        if on then
+            armed:GiveTask(Scheduler.heartbeat(tick, { name = "AnkleBreaker", interval = TICK }))
+        else
+            Runner.stop(OWNER)
+        end
+    end)
+end
+
+end)
+__bundle_register("Features/Basketball/Defense/Motion", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- defense motion: how fast a body is moving across the floor, from where it has been, because a remote player's velocity reads zero here
+local SMOOTHING   = 0.4   -- weight of the newest reading; replicated positions land unevenly
+local STALE_AFTER = 0.3   -- a gap this long means the old reading says nothing about now
+local MIN_STEP    = 1 / 240
+local MAX_SPEED   = 60    -- nobody runs this fast, so a step this big is the game moving them
+
+local Motion = {}
+Motion.__index = Motion
+
+function Motion.new()
+    return setmetatable({ vx = 0, vz = 0 }, Motion)
+end
+
+function Motion:reset()
+    self.at = nil
+    self.vx, self.vz = 0, 0
+end
+
+-- returns the smoothed speed along x and z, zero until there are two readings to compare
+function Motion:sample(position, now)
+    local at = self.at
+    local gap = at and (now - at) or nil
+    if gap and gap < MIN_STEP then return self.vx, self.vz end
+
+    local x, z = position.X, position.Z
+    if not gap or gap > STALE_AFTER then
+        self.vx, self.vz = 0, 0
+    else
+        local stepX, stepZ = (x - self.x) / gap, (z - self.z) / gap
+        if stepX * stepX + stepZ * stepZ > MAX_SPEED * MAX_SPEED then
+            self.vx, self.vz = 0, 0
+        else
+            self.vx = self.vx + (stepX - self.vx) * SMOOTHING
+            self.vz = self.vz + (stepZ - self.vz) * SMOOTHING
+        end
+    end
+    self.x, self.z, self.at = x, z, now
+    return self.vx, self.vz
+end
+
+return Motion
+
+end)
 __bundle_register("Tabs/Defense", function(require, _LOADED, __bundle_register, __bundle_modules)
--- defense tab: the basketball defense suite and court readouts
+-- defense tab: the defense suite and court readouts, plus glide, guard and finishing, which place boxes on main and defense
+local Control = require("Features/Basketball/Control")
 local Defense = require("Features/Basketball/Defense")
 
 return function(ctx)
-    if ctx.Config.Basketball then Defense(ctx) end
+    if ctx.Config.Basketball then
+        Defense(ctx)
+        Control(ctx)
+    end
 end
 
 end)
@@ -17827,212 +18927,6 @@ return function(ctx)
 
     Toggles.PlayFeedEnabled:OnChanged(setActive)
 end
-
-end)
-__bundle_register("Features/Basketball/Defense/Kit", function(require, _LOADED, __bundle_register, __bundle_modules)
--- defense kit: what the suite's features share and nothing about the game, a maid for what a toggle holds, label text that stays safe and readable, and the connection delay
-local Maid    = require("Utility/Maid")
-local UiWrite = require("Utility/UiWrite")
-
-local FALLBACK_PING = 0.1
-
-local M = {}
-
--- track keeps every handle it is given for the whole session, so it gets this one and the toggle churns inside the maid
-function M.armedMaid(track)
-    local maid = Maid.new()
-    track({ Disconnect = function() maid:DoCleaning() end })
-    return maid
-end
-
--- a closed menu is never read, so a tick skips it and the next tick with it open catches up; always is for the last word a stopped feature will not repeat
-function M.writer(Library, label)
-    local shown = nil
-    return function(text, always)
-        if text == shown then return end
-        if Library.Toggled == false and not always then return end
-        if UiWrite.text(label, text) then shown = text end
-    end
-end
-
--- obsidian labels are rich text, so a string from the server could otherwise open a tag
-function M.clean(value)
-    return (string.gsub(tostring(value), "[<>]", ""))
-end
-
-function M.studs(distance)
-    local rounded = math.floor(distance + 0.5)
-    if rounded == 1 then return "1 stud" end
-    return ("%d studs"):format(rounded)
-end
-
-local function readPing(player)
-    return player:GetNetworkPing()
-end
-
--- the round trip, which is what a reach or a jump is late by: what we see left the server half of it ago and what we send lands half of it from now
-function M.ping(player)
-    local ok, value = pcall(readPing, player)
-    return (ok and type(value) == "number") and value or FALLBACK_PING
-end
-
-return M
-
-end)
-__bundle_register("Utility/Maid", function(require, _LOADED, __bundle_register, __bundle_modules)
--- quenty nevermore Maid, forked: luau types stripped for luabundler and every task dispatched under pcall, because upstream lets one throwing task abort the rest of DoCleaning
-local Log = require("Utility/Log")
-
-local Maid = {}
-Maid.ClassName = "Maid"
-
--- one task's failure is logged and skipped, never allowed to abort the sweep
-local function runTask(job)
-	local ok, err = pcall(function()
-		if typeof(job) == "function" then
-			job()
-		elseif typeof(job) == "table" then
-			if type(job.Destroy) == "function" then
-				job:Destroy()
-			end
-		elseif typeof(job) == "Instance" then
-			job:Destroy()
-		elseif typeof(job) == "thread" then
-			local cancelled
-			if coroutine.running() ~= job then
-				cancelled = pcall(function()
-					task.cancel(job)
-				end)
-			end
-
-			if not cancelled then
-				task.defer(function()
-					task.cancel(job)
-				end)
-			end
-		elseif typeof(job) == "RBXScriptConnection" then
-			job:Disconnect()
-		end
-	end)
-	if not ok then
-		Log.devwarn("Maid", "task failed during cleanup: %s", tostring(err))
-	end
-end
-
-function Maid.new()
-	return setmetatable({ _tasks = {} }, Maid)
-end
-
-function Maid.isMaid(value)
-	return type(value) == "table" and value.ClassName == "Maid"
-end
-
-function Maid.__index(self, index)
-	if Maid[index] then
-		return Maid[index]
-	else
-		return self._tasks[index]
-	end
-end
-
-function Maid.__newindex(self, index, newTask)
-	if Maid[index] ~= nil then
-		error(string.format("Cannot use '%s' as a Maid key", tostring(index)), 2)
-	end
-
-	local tasks = self._tasks
-	local job = tasks[index]
-
-	if job == newTask then
-		return
-	end
-
-	tasks[index] = newTask
-
-	if job then
-		runTask(job)
-	end
-end
-
-function Maid:Add(taskItem)
-	if not taskItem then
-		error("Task cannot be false or nil", 2)
-	end
-
-	self[#self._tasks + 1] = taskItem
-
-	if type(taskItem) == "table" and not taskItem.Destroy then
-		Log.warn("[Maid.Add] - Gave table task without .Destroy\n\n" .. debug.traceback())
-	end
-
-	return taskItem
-end
-
-function Maid:GiveTask(taskItem)
-	if not taskItem then
-		error("Task cannot be false or nil", 2)
-	end
-
-	local taskId = #self._tasks + 1
-	self[taskId] = taskItem
-
-	if type(taskItem) == "table" and not taskItem.Destroy then
-		Log.warn("[Maid.GiveTask] - Gave table task without .Destroy\n\n" .. debug.traceback())
-	end
-
-	return taskId
-end
-
-function Maid:GivePromise(promise)
-	if not promise:IsPending() then
-		return promise
-	end
-
-	local newPromise = promise.resolved(promise)
-	local id = self:GiveTask(newPromise)
-
-	newPromise:Finally(function()
-		self[id] = nil
-	end)
-
-	return newPromise
-end
-
--- second fork delta: upstream drains with `next()`, so unwinding GiveTask's ascending integer keys in reverse is what gives callers LIFO
-function Maid:DoCleaning()
-	local tasks = self._tasks
-
-	-- connections first, so a watcher can't fire on a state-restoring task and undo it
-	for index, job in pairs(tasks) do
-		if typeof(job) == "RBXScriptConnection" then
-			tasks[index] = nil
-			runTask(job)
-		end
-	end
-
-	local highest = 0
-	for index in pairs(tasks) do
-		if type(index) == "number" and index > highest then highest = index end
-	end
-	for i = highest, 1, -1 do
-		local job = tasks[i]
-		if job ~= nil then
-			tasks[i] = nil
-			runTask(job)
-		end
-	end
-
-	local index, job = next(tasks)
-	while job ~= nil do
-		tasks[index] = nil
-		runTask(job)
-		index, job = next(tasks)
-	end
-end
-
-Maid.Destroy = Maid.DoCleaning
-
-return Maid
 
 end)
 __bundle_register("Features/Basketball/Defense/Jumper", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -18332,50 +19226,6 @@ return function(ctx)
 
     Toggles.AutoStealEnabled:OnChanged(setActive)
 end
-
-end)
-__bundle_register("Features/Basketball/Defense/Motion", function(require, _LOADED, __bundle_register, __bundle_modules)
--- defense motion: how fast a body is moving across the floor, from where it has been, because a remote player's velocity reads zero here
-local SMOOTHING   = 0.4   -- weight of the newest reading; replicated positions land unevenly
-local STALE_AFTER = 0.3   -- a gap this long means the old reading says nothing about now
-local MIN_STEP    = 1 / 240
-local MAX_SPEED   = 60    -- nobody runs this fast, so a step this big is the game moving them
-
-local Motion = {}
-Motion.__index = Motion
-
-function Motion.new()
-    return setmetatable({ vx = 0, vz = 0 }, Motion)
-end
-
-function Motion:reset()
-    self.at = nil
-    self.vx, self.vz = 0, 0
-end
-
--- returns the smoothed speed along x and z, zero until there are two readings to compare
-function Motion:sample(position, now)
-    local at = self.at
-    local gap = at and (now - at) or nil
-    if gap and gap < MIN_STEP then return self.vx, self.vz end
-
-    local x, z = position.X, position.Z
-    if not gap or gap > STALE_AFTER then
-        self.vx, self.vz = 0, 0
-    else
-        local stepX, stepZ = (x - self.x) / gap, (z - self.z) / gap
-        if stepX * stepX + stepZ * stepZ > MAX_SPEED * MAX_SPEED then
-            self.vx, self.vz = 0, 0
-        else
-            self.vx = self.vx + (stepX - self.vx) * SMOOTHING
-            self.vz = self.vz + (stepZ - self.vz) * SMOOTHING
-        end
-    end
-    self.x, self.z, self.at = x, z, now
-    return self.vx, self.vz
-end
-
-return Motion
 
 end)
 __bundle_register("Features/Basketball/Defense/AutoRebound", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -18834,19 +19684,20 @@ end
 
 end)
 __bundle_register("Features/Basketball/Defense/AutoBlock", function(require, _LOADED, __bundle_register, __bundle_modules)
--- auto block: jumps to contest when a nearby opponent starts a shot; each opponent gets one watcher on its Action attribute, the cue the game's own defender raises his hands on (Guard:102) and present on every player and ai, where a Meter show can hang on the show other meters setting and a meter style of None
+-- auto block: jumps to contest when a nearby opponent starts a shot; each opponent gets one watcher on its Action attribute, the cue the game's own defender raises his hands on (Guard:102) and present on every player and ai, where a Meter show can hang on the show other meters setting and a meter style of None; a pump fake or a hop shows that action too, so by default a shot only counts once meterOffset moves on the shooter, which the server writes whatever anyone's meter settings
 local Flat = require("Api/Court/Flat")
 local Jobs = require("Utility/Jobs")
 local Maid = require("Utility/Maid")
 local Kit  = require("Features/Basketball/Defense/Kit")
 
 local ACTION = "Action"
+local METER = "meterOffset"
 local SHOT_ACTIONS = { Shooting = true, Dunking = true, ContactLayup = true, ClutchLayup = true }
 local FREE_THROW = "FreeThrow"
 local REARM = 0.75  -- an action flicker this soon after a start is the same shot
 
--- a jumper leaves the hand about 0.39 s in (the meter's perfect step at the measured sweep rates) and a jump takes about 0.28 s to peak, which agrees with the game's own lesson to press as they jump (TutorialTypes.Simple:164)
-local DEFAULT_DELAY = 0.1
+-- a jumper leaves the hand about 0.39 s in (the meter's perfect step at the measured sweep rates) and a jump takes about 0.28 s to peak, which agrees with the game's own lesson to press as they jump (TutorialTypes.Simple:164); that is 0.11 s after the action, and the first meter write can land one 0.05 s delivery after it
+local DEFAULT_DELAY = 0.06
 local DEFAULT_REACH = 10
 
 return function(ctx)
@@ -18863,7 +19714,7 @@ return function(ctx)
         return
     end
 
-    local reach, delay = DEFAULT_REACH, DEFAULT_DELAY
+    local reach, delay, ignoreFakes = DEFAULT_REACH, DEFAULT_DELAY, true
 
     Group:AddToggle("AutoBlockEnabled", {
         Text = "Auto Block",
@@ -18894,6 +19745,11 @@ return function(ctx)
         Suffix = " s",
         Tooltip = "Time after the shot starts",
         Callback = function(value) delay = value end,
+    })
+    Box:AddToggle("AutoBlockIgnoreFakes", {
+        Text = "Ignore pump fakes",
+        Default = true,
+        Callback = function(value) ignoreFakes = value end,
     })
     local say = Kit.writer(Library, Box:AddLabel({ Text = "Off", DoesWrap = true }))
     Box:SetupDependencies({ { Toggles.AutoBlockEnabled, true } })
@@ -18953,16 +19809,39 @@ return function(ctx)
     end
 
     local function watch(rec)
+        local model = rec.model
         local state = {
-            shooting  = SHOT_ACTIONS[rec.model:GetAttribute(ACTION)] == true,
+            shooting  = SHOT_ACTIONS[model:GetAttribute(ACTION)] == true,
+            unproven  = false,
             startedAt = -math.huge,
         }
         local slot = Maid.new()
-        slot:GiveTask(rec.model:GetAttributeChangedSignal(ACTION):Connect(function()
-            local shooting = SHOT_ACTIONS[rec.model:GetAttribute(ACTION)] == true
+        local pending = Maid.new()
+        slot:GiveTask(pending)
+
+        -- the rearm clock only starts here, so the real shot straight after a fake is not taken for a flicker of it
+        local function awaitMeter()
+            state.unproven = true
+            pending:GiveTask(model:GetAttributeChangedSignal(METER):Connect(function()
+                -- only a value is a sweep, the attribute being cleared after the last shot is not
+                if model:GetAttribute(METER) == nil then return end
+                state.unproven = false
+                pending:DoCleaning()
+                shotStarted(rec, state)
+            end))
+        end
+
+        slot:GiveTask(model:GetAttributeChangedSignal(ACTION):Connect(function()
+            local shooting = SHOT_ACTIONS[model:GetAttribute(ACTION)] == true
             if shooting == state.shooting then return end
             state.shooting = shooting
-            if shooting then shotStarted(rec, state) end
+            if shooting then
+                if ignoreFakes then awaitMeter() else shotStarted(rec, state) end
+            elseif state.unproven then
+                state.unproven = false
+                pending:DoCleaning()
+                say(("%s faked"):format(Kit.clean(rec.name)))
+            end
         end))
         watchers[rec] = slot
         watched[rec] = true
@@ -19002,6 +19881,630 @@ return function(ctx)
     end
 
     Toggles.AutoBlockEnabled:OnChanged(setActive)
+end
+
+end)
+__bundle_register("Features/Basketball/Control", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- control suite: builds the glide box on the main tab and the guard and finishing boxes on the defense tab, mounts each feature into them and owns the one hold the glides and no stun share
+local Mount        = require("Utility/Mount")
+local AutoClutch   = require("Features/Basketball/Control/AutoClutch")
+local AutoGuard    = require("Features/Basketball/Control/AutoGuard")
+local AutoSelfLob  = require("Features/Basketball/Control/AutoSelfLob")
+local DribbleGlide = require("Features/Basketball/Control/DribbleGlide")
+local Hold         = require("Features/Basketball/Control/Hold")
+local NoStun       = require("Features/Basketball/Control/NoStun")
+local ShotGlide    = require("Features/Basketball/Control/ShotGlide")
+
+local UNAVAILABLE = "Not available here"
+
+return function(ctx)
+    local O = Mount.orchestrator(ctx, "Control")
+    if not O then return {} end
+
+    local Tabs = ctx.Tabs
+    if not (Tabs and Tabs.Main and Tabs.Defense) then return {} end
+
+    local Apis = ctx.Api or {}
+
+    local glideBox     = Tabs.Main:AddLeftGroupbox("Glide", "wind")
+    local guardBox     = Tabs.Defense:AddLeftGroupbox("Auto Guard", "user-check")
+    local finishingBox = Tabs.Defense:AddRightGroupbox("Finishing", "flame")
+
+    if Apis.Player then
+        local hold = Hold.new(Apis.Player)
+        O.onUnload(hold.clear)
+
+        local sub = O.subCtx({ Group = glideBox, Hold = hold })
+        O.mount(ShotGlide, sub)
+        O.mount(DribbleGlide, sub)
+        O.mount(NoStun, sub)
+    else
+        glideBox:AddLabel(UNAVAILABLE, true)
+    end
+
+    if Apis.Player and Apis.Court and Apis.Input then
+        O.mount(AutoGuard, O.subCtx({ Group = guardBox }))
+
+        local sub = O.subCtx({ Group = finishingBox })
+        O.mount(AutoSelfLob, sub)
+        O.mount(AutoClutch, sub)
+    else
+        guardBox:AddLabel(UNAVAILABLE, true)
+        finishingBox:AddLabel(UNAVAILABLE, true)
+    end
+
+    O.finalize()
+
+    return {}
+end
+
+end)
+__bundle_register("Features/Basketball/Control/ShotGlide", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- shot glide: keeps you walking through a jump shot; layups and floaters are Shooting packages too (Config.Game.Shooting.Packages.1.Layup) and are reached by a gather, so a shot out of a gather is left alone, as are free throws, and dunks and contact finishes have Actions of their own
+local Switch = require("Features/Basketball/Control/Switch")
+
+local SHOOTING   = "Shooting"
+local GATHERING  = "Gathering"
+local FREE_THROW = "FreeThrow"
+
+return function(ctx)
+    local player = ctx.Api.Player
+    local finishing = false
+
+    -- an empty Action can sit between the gather and its shot, so only the shot ending or a different Action closes the finish
+    local function judge(action, old)
+        if old == nil then finishing = false end
+        if action == GATHERING then
+            finishing = true
+        elseif action ~= SHOOTING and (action ~= "" or old == SHOOTING) then
+            finishing = false
+        end
+        return action == SHOOTING and not finishing and not player.attr(FREE_THROW)
+    end
+
+    Switch.mount(ctx, {
+        id      = "ShotGlide",
+        text    = "Shot Glide",
+        tooltip = "Walk during jump shots",
+        key     = "shot",
+        attr    = "Action",
+        judge   = judge,
+    })
+end
+
+end)
+__bundle_register("Features/Basketball/Control/Switch", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- control switch: the toggle behind every hold feature, which while on follows one of your attributes and tells the shared hold what it wants; nothing runs per frame
+local Kit = require("Features/Basketball/Defense/Kit")
+
+local M = {}
+
+-- spec: id, text, tooltip, key, attr, judge(value, old) returning whether the hold is wanted; judge also runs as the toggle comes on, with no old value
+function M.mount(ctx, spec)
+    local hold   = ctx.Hold
+    local player = ctx.Api.Player
+    local toggleId = spec.id .. "Enabled"
+
+    ctx.Group:AddToggle(toggleId, {
+        Text    = spec.text,
+        Default = false,
+        Tooltip = spec.tooltip,
+    }):AddKeyPicker(spec.id .. "Key", {
+        Default         = nil,
+        SyncToggleState = true,
+        Mode            = "Toggle",
+        Text            = spec.text,
+    })
+
+    local armed = Kit.armedMaid(ctx.track)
+    local active = false
+
+    local function refresh(value, old)
+        hold.want(spec.key, spec.judge(value, old) == true)
+    end
+
+    local function setActive(on)
+        if on == active then return end
+        active = on
+        armed:DoCleaning()
+        if on then
+            armed:GiveTask(player.onAttr(spec.attr, refresh))
+            refresh(player.attr(spec.attr))
+        else
+            hold.want(spec.key, false)
+        end
+    end
+
+    ctx.Toggles[toggleId]:OnChanged(setActive)
+end
+
+return M
+
+end)
+__bundle_register("Features/Basketball/Control/NoStun", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- no stun: being stunned stops you only through CanMove, since no client script reads Stunned, so the shared hold is asked for it for as long as you are stunned
+local Switch = require("Features/Basketball/Control/Switch")
+
+local function judge(stunned)
+    return stunned == true
+end
+
+return function(ctx)
+    Switch.mount(ctx, {
+        id      = "NoStun",
+        text    = "No Stun",
+        tooltip = "Move while stunned",
+        key     = "stun",
+        attr    = "Stunned",
+        judge   = judge,
+    })
+end
+
+end)
+__bundle_register("Features/Basketball/Control/Hold", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- control hold: the one CanMove token the glides and no stun share, taken the moment any of them wants it and handed back as soon as none does
+local CAN_MOVE = "CanMove"
+
+-- every reader in the game only asks if this is truthy; a plain true would hide the server writing true underneath, and the hand back would put a stale false on you and freeze you
+local HELD = 1
+
+local M = {}
+
+function M.new(player)
+    local wants = {}
+    local token = nil
+    local settling = false
+    local closed = false
+
+    local function settle()
+        settling = false
+        if closed or next(wants) ~= nil or not token then return end
+        local restore = token
+        token = nil
+        restore()
+    end
+
+    -- key names who is asking; on says whether it still wants the hold
+    local function want(key, on)
+        if closed then return end
+        wants[key] = on and true or nil
+        if next(wants) ~= nil then
+            if not token then token = player.overrideAttr(CAN_MOVE, HELD) end
+        elseif token and not settling then
+            -- the server's CanMove write can sit in the same batch as the Action that ended this, and it has to be heard before the hand back reads it
+            settling = true
+            task.defer(settle)
+        end
+    end
+
+    local function clear()
+        closed = true
+        table.clear(wants)
+        local restore = token
+        token = nil
+        if restore then restore() end
+    end
+
+    return { want = want, clear = clear }
+end
+
+return M
+
+end)
+__bundle_register("Features/Basketball/Control/DribbleGlide", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- dribble glide: keeps you walking through a dribble move; with CanMove held the game takes MoveDirection from your keys and never reads the direction it zeroes around a dribble (Movement:135-138,180), so the hold carries your speed, and the one thing it costs is the exit boost, stamped here as the move ends
+local Switch = require("Features/Basketball/Control/Switch")
+
+local DRIBBLING = "Dribbling"
+
+return function(ctx)
+    local player = ctx.Api.Player
+
+    local function judge(action, old)
+        if old == DRIBBLING and action ~= DRIBBLING then player.stampDribble() end
+        return action == DRIBBLING
+    end
+
+    Switch.mount(ctx, {
+        id      = "DribbleGlide",
+        text    = "Dribble Glide",
+        tooltip = "Walk during dribble moves",
+        key     = "dribble",
+        attr    = "Action",
+        judge   = judge,
+    })
+end
+
+end)
+__bundle_register("Features/Basketball/Control/AutoSelfLob", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- auto self lob: throws the game's self lob (Input.Keyboard:135-140) once a possession, as you go up after running at your hoop inside the range; live, the call only does something in the air, where it turns the shot into a ClutchShot
+local Scheduler = require("Utility/Scheduler")
+local Kit       = require("Features/Basketball/Defense/Kit")
+local Motion    = require("Features/Basketball/Defense/Motion")
+
+local TICK       = 0.05
+local MIN_TOWARD = 6  -- studs a second along the line to the hoop; a walk is about 14, so this means really heading there
+local REARM      = 4  -- seconds with empty hands before a new possession, longer than your own lob stays in the air
+local RUN_MEMORY = 0.6  -- going up stops the body, so the run that led to the jump counts for this long
+local GOING_UP   = "Shooting"
+
+return function(ctx)
+    local Library = ctx.Library
+    local Toggles = ctx.Toggles
+    local Group   = ctx.Group
+    local court   = ctx.Api.Court
+    local input   = ctx.Api.Input
+    local player  = ctx.Api.Player
+
+    local range = 25
+
+    Group:AddToggle("AutoSelfLobEnabled", {
+        Text = "Auto Self Lob",
+        Default = false,
+    }):AddKeyPicker("AutoSelfLobKey", {
+        Default = nil,
+        SyncToggleState = true,
+        Mode = "Toggle",
+        Text = "Auto Self Lob",
+    })
+
+    local Box = Group:AddDependencyBox()
+    Box:AddSlider("AutoSelfLobRange", {
+        Text = "Range",
+        Default = range,
+        Min = 5,
+        Max = 60,
+        Rounding = 0,
+        Suffix = " studs",
+        Callback = function(value) range = value end,
+    })
+    local say = Kit.writer(Library, Box:AddLabel({ Text = "Off", DoesWrap = true }))
+    Box:SetupDependencies({ { Toggles.AutoSelfLobEnabled, true } })
+
+    local armed = Kit.armedMaid(ctx.track)
+    local active = false
+    local motion = Motion.new()
+    local lobbed, emptySince, ranAt = nil, nil, nil
+
+    local function tick()
+        local now = os.clock()
+        if not court.hasBall() then
+            motion:reset()
+            emptySince = emptySince or now
+            if now - emptySince >= REARM then lobbed = nil end
+            return say(lobbed or "No ball")
+        end
+        emptySince = nil
+        if lobbed then return say(lobbed) end
+
+        local position = player.position()
+        local hoop = position and court.myHoop()
+        local flat = hoop and court.distanceToHoop(hoop, position)
+        if not flat then
+            motion:reset()
+            return say("No hoop near")
+        end
+
+        local vx, vz = motion:sample(position, now)
+        if flat > range then return say(("Too far: %s"):format(Kit.studs(flat))) end
+
+        local at = hoop.goal.Position
+        local toward = flat > 0 and (vx * (at.X - position.X) + vz * (at.Z - position.Z)) / flat or 0
+        if toward >= MIN_TOWARD then ranAt = now end
+        if player.action() ~= GOING_UP then
+            return say(ranAt and now - ranAt < RUN_MEMORY and "Ready" or "Not heading in")
+        end
+        if not (ranAt and now - ranAt < RUN_MEMORY) then return say("Not heading in") end
+
+        -- a failed send still spends the possession, so a dead remote is never spammed
+        lobbed = input.clutch(true) and "Lob sent" or "Lob failed"
+        say(lobbed)
+    end
+
+    local function setActive(on)
+        if on == active then return end
+        active = on
+        armed:DoCleaning()
+        motion:reset()
+        lobbed, emptySince, ranAt = nil, nil, nil
+        if on then
+            armed:GiveTask(Scheduler.heartbeat(tick, { name = "AutoSelfLob", interval = TICK }))
+        else
+            say("Off", true)
+        end
+    end
+
+    Toggles.AutoSelfLobEnabled:OnChanged(setActive)
+end
+
+end)
+__bundle_register("Features/Basketball/Control/AutoGuard", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- auto guard: walks you through the game's own movement to the spot between the nearest carrier inside your reach and the basket they attack, and holds the guard key once close enough for the stance; any key you press drives instead
+local Scheduler = require("Utility/Scheduler")
+local Flat      = require("Api/Court/Flat")
+local Kit       = require("Features/Basketball/Defense/Kit")
+local Guard     = require("Features/Player/Movement/Guard")
+
+local TICK          = 0.1
+local OFF_CARRIER   = 3.25  -- the game's own guard spot (Movement:ApplyGuardAssist)
+local STANCE_RANGE  = 16.5  -- past this the guard key follows some other player instead (Movement:Update)
+local ARRIVED       = 0.75  -- close enough to stand still
+local EASE_WITHIN   = 4     -- the walk slows from here in, so it settles instead of circling the spot
+local PRESS_GAP     = 0.5   -- a press needs a round trip to show, and your own G key letting go can cancel it
+local DEFAULT_REACH = 30
+
+local HOLD_G = "HoldingG"
+
+-- what the game itself counts as being on offense (Input.Mobile:83)
+local OFFENSE = { CatchingPass = true, CatchingLob = true, Shooting = true, Dunking = true }
+
+local function nearestCarrier(list, position, best, bestDistance)
+    for i = 1, #list do
+        local rec = list[i]
+        local root = rec.root
+        if rec.held and root then
+            local distance = Flat(root.Position, position)
+            if distance < bestDistance then best, bestDistance = rec, distance end
+        end
+    end
+    return best, bestDistance
+end
+
+return function(ctx)
+    local Library = ctx.Library
+    local Toggles = ctx.Toggles
+    local Group   = ctx.Group
+    local court   = ctx.Api.Court
+    local input   = ctx.Api.Input
+    local player  = ctx.Api.Player
+
+    local teamCheck, reach = true, DEFAULT_REACH
+
+    Group:AddToggle("AutoGuardEnabled", {
+        Text = "Auto Guard",
+        Default = false,
+    }):AddKeyPicker("AutoGuardKey", {
+        Default = nil,
+        SyncToggleState = true,
+        Mode = "Toggle",
+        Text = "Auto Guard",
+    })
+
+    local Box = Group:AddDependencyBox()
+    Box:AddToggle("AutoGuardTeamCheck", {
+        Text = "Team Check",
+        Default = true,
+        Tooltip = "Only guards opponents",
+        Callback = function(on) teamCheck = on == true end,
+    })
+    Box:AddSlider("AutoGuardReach", {
+        Text = "Reach",
+        Default = reach,
+        Min = 5,
+        Max = 60,
+        Rounding = 0,
+        Suffix = " studs",
+        Tooltip = "Furthest carrier it goes for",
+        Callback = function(value) reach = value end,
+    })
+    local say = Kit.writer(Library, Box:AddLabel({ Text = "Off", DoesWrap = true }))
+    Box:SetupDependencies({ { Toggles.AutoGuardEnabled, true } })
+
+    local armed = Kit.armedMaid(ctx.track)
+    local restore = nil
+    local target = nil
+    local pressed, pressedAt = false, nil
+
+    local function letGo()
+        if not pressed then return end
+        pressed, pressedAt = false, nil
+        input.holdG(false)
+    end
+
+    local function press()
+        if player.attr(HOLD_G) then return end
+        local now = os.clock()
+        if pressedAt and now - pressedAt < PRESS_GAP then return end
+        pressedAt = now
+        pressed = input.holdG(true) == true or pressed
+    end
+
+    local function standDown(text)
+        target = nil
+        letGo()
+        say(text)
+    end
+
+    local function worthKeeping(rec, position)
+        local root = rec.root
+        if not (rec.held and root) then return false end
+        if teamCheck and rec.isAlly then return false end
+        return Flat(root.Position, position) <= reach
+    end
+
+    -- the game's Guard type only ever faces an opponent, so a teammate is walked to without the stance
+    local function updateStance(rec, position)
+        if rec.isAlly then return letGo() end
+        local at = rec.root.Position
+        local dx, dy, dz = at.X - position.X, at.Y - position.Y, at.Z - position.Z
+        if math.sqrt(dx * dx + dy * dy + dz * dz) <= STANCE_RANGE then press() else letGo() end
+    end
+
+    local function tick()
+        local position = player.position()
+        if not position then return standDown("Waiting for your character") end
+        -- flight and hops read MoveDirection too, and steering would send them after the carrier
+        if player.motionOwner() then return standDown("Busy moving") end
+        if court.hasBall() or player.attr("Basketball") or OFFENSE[player.action()] then
+            return standDown("You have the ball")
+        end
+
+        if not (target and worthKeeping(target, position)) then
+            target = nil
+            local rec, away = nearestCarrier(court.opponents(), position, nil, math.huge)
+            if not teamCheck then rec, away = nearestCarrier(court.teammates(), position, rec, away) end
+            if not rec then return standDown("No carrier") end
+            if away > reach then return standDown(("Too far: %s"):format(Kit.studs(away))) end
+            target = rec
+        end
+
+        updateStance(target, position)
+        say(("Guarding %s"):format(Kit.clean(target.name)))
+    end
+
+    -- asked once a frame from inside the game's movement step, so it only reads
+    local function towardSpot()
+        local rec = target
+        local root = rec and rec.held and rec.root
+        local me = root and player.position()
+        if not me then return nil end
+
+        -- with no basket known it stops the same distance short of them on your side
+        local at = root.Position
+        local aim = rec.goal and rec.goal.Position or me
+        local dx, dy, dz = aim.X - at.X, aim.Y - at.Y, aim.Z - at.Z
+        local length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if length <= 0 then return nil end
+
+        local toX = at.X + dx / length * OFF_CARRIER - me.X
+        local toZ = at.Z + dz / length * OFF_CARRIER - me.Z
+        local away = math.sqrt(toX * toX + toZ * toZ)
+        if away <= ARRIVED then return nil end
+
+        local stick = math.min(away / EASE_WITHIN, 1) / away
+        return Vector3.new(toX * stick, 0, toZ * stick)
+    end
+
+    local function start()
+        if restore then return end
+        local token, err = player.setMoveVector(towardSpot)
+        if not token then return Guard.backOut(Library, Toggles.AutoGuardEnabled, player, err) end
+        restore = token
+        armed:GiveTask(Scheduler.heartbeat(tick, { name = "AutoGuard", interval = TICK }))
+    end
+
+    local function stop()
+        armed:DoCleaning()
+        target = nil
+        letGo()
+        if restore then
+            local token = restore
+            restore = nil
+            token()
+        end
+        say("Off", true)
+    end
+
+    Guard.drive(Toggles.AutoGuardEnabled, start, stop)
+
+    return { cleanup = stop }
+end
+
+end)
+__bundle_register("Features/Basketball/Control/AutoClutch", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- auto clutch: presses what the clutch key sends (Input.Keyboard:141-142, Input.Gamepad:129-130) once each time the server opens CanClutch, the moment you are in the air with the ball; it is a flag dunk packages carry (Config.Game.Dunking.Animations) and no client script reads the attribute, so the window is the server's word and the press is ours
+local Maid      = require("Utility/Maid")
+local Scheduler = require("Utility/Scheduler")
+local Kit       = require("Features/Basketball/Defense/Kit")
+
+local TICK       = 0.05
+local CAN_CLUTCH = "CanClutch"
+
+return function(ctx)
+    local Library = ctx.Library
+    local Toggles = ctx.Toggles
+    local Group   = ctx.Group
+    local court   = ctx.Api.Court
+    local input   = ctx.Api.Input
+    local player  = ctx.Api.Player
+
+    local contestedOnly, range = false, 10
+
+    Group:AddToggle("AutoClutchEnabled", {
+        Text = "Auto Clutch",
+        Default = false,
+    }):AddKeyPicker("AutoClutchKey", {
+        Default = nil,
+        SyncToggleState = true,
+        Mode = "Toggle",
+        Text = "Auto Clutch",
+    })
+
+    local Box = Group:AddDependencyBox()
+    Box:AddToggle("AutoClutchContested", {
+        Text = "Only if contested",
+        Default = false,
+        Callback = function(on) contestedOnly = on == true end,
+    })
+    local RangeBox = Box:AddDependencyBox()
+    RangeBox:AddSlider("AutoClutchRange", {
+        Text = "Range",
+        Default = range,
+        Min = 3,
+        Max = 30,
+        Rounding = 0,
+        Suffix = " studs",
+        Callback = function(value) range = value end,
+    })
+    local say = Kit.writer(Library, Box:AddLabel({ Text = "Off", DoesWrap = true }))
+    Box:SetupDependencies({ { Toggles.AutoClutchEnabled, true } })
+    RangeBox:SetupDependencies({
+        { Toggles.AutoClutchEnabled, true },
+        { Toggles.AutoClutchContested, true },
+    })
+
+    local armed = Kit.armedMaid(ctx.track)
+    local window = Maid.new()
+    local active = false
+    local sent = false
+
+    local function contested()
+        if not contestedOnly then return true end
+        local rec, distance = court.nearestOpponent()
+        return rec ~= nil and distance <= range
+    end
+
+    local function check()
+        if sent then return end
+        if not (player.inAir() and (court.hasBall() or player.attr("Basketball"))) then return say("Waiting") end
+        if not contested() then return say("Not contested") end
+        sent = true
+        window:DoCleaning()
+        say(input.clutch() and "Clutch sent" or "Clutch failed")
+    end
+
+    -- only the open window is watched per frame, because being in the air or a defender arriving can come after it opens
+    local function onWindow(open)
+        window:DoCleaning()
+        sent = false
+        if open ~= true then return say("Waiting") end
+        check()
+        if not sent then
+            window:GiveTask(Scheduler.heartbeat(check, { name = "AutoClutch", interval = TICK }))
+        end
+    end
+
+    local function setActive(on)
+        if on == active then return end
+        active = on
+        armed:DoCleaning()
+        window:DoCleaning()
+        sent = false
+        if on then
+            armed:GiveTask(player.onAttr(CAN_CLUTCH, onWindow))
+            onWindow(player.attr(CAN_CLUTCH))
+        else
+            say("Off", true)
+        end
+    end
+
+    Toggles.AutoClutchEnabled:OnChanged(setActive)
+
+    return {
+        cleanup = function()
+            window:DoCleaning()
+        end,
+    }
 end
 
 end)
@@ -23273,7 +24776,7 @@ local Scheduler = require("Utility/Scheduler")
 local RESULT_WAIT  = 2     -- seconds after a shot starts moving before one with no server reply is closed anyway
 local RESULT_GRACE = 0.25  -- the grade and the log line arrive together, this covers them landing a frame apart
 local MIN_SAMPLES  = 3     -- samples before the line through them is worth firing on
-local SAMPLE_GRACE = 0.15  -- seconds a shot waits for those samples before going by the clock instead
+local SAMPLE_GRACE = 0.1   -- seconds after the first sample before going on fewer, if a stall is holding the rest back
 local HISTORY_SIZE = 40
 local TAP_GRACE    = 0.5   -- a swallowed tap with no shot after this long was never a shot, so the button is let go
 local LEAD_CEILING = 0.5   -- seconds of measured overshoot beyond which a sample is not a release at all
@@ -23358,6 +24861,11 @@ function M.new(ctx)
 
         local sweep = shot.sweep
         shot.final = sweep:finalPhase()
+        -- a pump fake or hop stamps a start but never runs a meter or gets a grade, so it was never a shot
+        if sweep:samples() == 0 and not shot.grade then
+            if current == shot then current = nil end
+            return
+        end
         if shot.sentPhase and shot.final then
             local overshoot = (shot.final - shot.sentPhase) / sweep:rate()
             if overshoot >= 0 and overshoot <= LEAD_CEILING then learner.observeLead(overshoot) end
@@ -23396,7 +24904,7 @@ function M.new(ctx)
         local ok = verbs.shootRelease()
         if ok then
             shot.sentAt = now
-            shot.sentPhase = shot.sweep:phaseAt(now) or ((now - shot.startedAt) * shot.sweep:rate())
+            shot.sentPhase = shot.sweep:phaseAt(now)
             shot.released = true
             Released:Fire(shot)
         end
@@ -23412,13 +24920,12 @@ function M.new(ctx)
             end
             local sweep = shot.sweep
             local now = os.clock()
-            local fireAt = sweep:samples() >= MIN_SAMPLES and sweep:timeOfPhase(learner.target()) or nil
-            if not fireAt then
-                -- samples get a moment to arrive; firing before any exist would leave nothing to learn from
-                if now - shot.startedAt < SAMPLE_GRACE then return end
-                -- still too few to draw the line, so the start stamp's arrival stands in rather than holding the shot forever
-                fireAt = shot.startedAt + learner.target() / sweep:rate()
-            end
+            -- nothing fires until the meter is really moving: a hop or a move stamps the start, then gathers before the sweep begins, and a release sent in that gap is ignored
+            local count = sweep:samples()
+            if count == 0 then return end
+            if count < MIN_SAMPLES and now - sweep:firstSampleAt() < SAMPLE_GRACE then return end
+            local fireAt = sweep:timeOfPhase(learner.target())
+            if not fireAt then return end
             if now >= fireAt - learner.lead() then fireRelease(shot, now) end
         end, { name = "ShotRelease", priority = 1 })
     end
@@ -23662,6 +25169,8 @@ local MIN_FIT_POINTS = 8
 local TURN_FLOOR   = 0.75  -- the meter only turns back near its top; a drop before this is a stale or out-of-order value
 local TURN_DROP    = 0.35  -- and only a sample or two's worth, so a bigger drop is last shot's frozen value being replaced
 local MAX_POINTS   = 40
+local MIN_TIMED_POINTS = 4
+local LATE_PHASE   = 1.2
 
 local Sweep = {}
 Sweep.__index = Sweep
@@ -23714,6 +25223,11 @@ function Sweep:sample(now, offset)
             self.points, self.count = {}, 0
         end
     end
+    -- a stall can hide the turn, so a value that rose across it still reads as coming back down once the line says it is long past the top
+    if self.leg == 1 and self.count >= MIN_TIMED_POINTS and progress < TURN_FLOOR + 0.2 then
+        local anchor = self:anchor()
+        if anchor and (now - anchor) * self:rate() > LATE_PHASE then self.leg = -1 end
+    end
     self.lastProgress = progress
     self.lastPhase = self.leg == 1 and progress or (2 - progress)
 
@@ -23752,6 +25266,11 @@ function Sweep:samples()
     return self.count
 end
 
+function Sweep:firstSampleAt()
+    local first = self.points[1]
+    return first and first[1] or nil
+end
+
 function Sweep:anchor()
     local rate = self:rate()
     local best
@@ -23781,20 +25300,19 @@ return Sweep
 
 end)
 __bundle_register("Api/Shot/Learner", function(require, _LOADED, __bundle_register, __bundle_modules)
--- shot learner: a release leads by the median overshoot measured this session, since reported ping can stay wrong for seconds, and before that by live ping plus a margin saved between servers; also remembers each shot speed's sweep rate through Utility/Store
+-- shot learner: a release leads by the median overshoot measured this session, and before that by the last median saved, since reported ping doesn't track overshoot (measured 15 to 200 ms at about the same ping); also remembers each shot speed's sweep rate through Utility/Store
 local Jobs  = require("Utility/Jobs")
 local Store = require("Utility/Store")
 
 local SAVE_KEY     = "shot_timing_v2"
 local SAVE_DELAY   = 2
 local TARGET_PHASE = 0.99   -- frozen shots land on a fixed grid and this is its perfect step, measured live
-local START_MARGIN = 0.07   -- seconds of lead above ping before anything is learned
-local MARGIN_LIMIT = 0.25
-local BLEND        = 0.3
+local START_MARGIN = 0.07   -- seconds of lead above ping on a first ever shot, with nothing saved
+local LEAD_MIN, LEAD_MAX = 0, 0.45
 local RECENT_SIZE  = 9      -- overshoots the median is taken over
 local STRAY_LIMIT  = 3      -- this many in a row off the median means the network really changed, not a late packet
 local RATE_BLEND   = 0.2
-local OUTLIER      = 0.09   -- seconds off the margin that counts as a late packet, once a few shots are in
+local OUTLIER      = 0.09   -- seconds off the median that counts as a late packet, once a few shots are in
 local SETTLED      = 3
 local DEFAULT_RATE = 2.55
 local BIAS_LIMIT   = 0.12
@@ -23811,7 +25329,7 @@ local function median(list)
 end
 
 function M.new(base, pingOf)
-    local margin, shots = START_MARGIN, 0
+    local savedLead, shots = nil, 0
     local recent, recentHead, strays = {}, 0, 0
     local rates = {}
     local bias = 0
@@ -23820,7 +25338,7 @@ function M.new(base, pingOf)
 
     local stored = Store.read(Store.GAME, SAVE_KEY, nil)
     if type(stored) == "table" then
-        if type(stored.margin) == "number" then margin = math.clamp(stored.margin, -MARGIN_LIMIT, MARGIN_LIMIT) end
+        if type(stored.lead) == "number" then savedLead = math.clamp(stored.lead, LEAD_MIN, LEAD_MAX) end
         if type(stored.shots) == "number" then shots = stored.shots end
         if type(stored.rates) == "table" then rates = stored.rates end
         if type(stored.bias) == "number" then bias = math.clamp(stored.bias, -BIAS_LIMIT, BIAS_LIMIT) end
@@ -23830,14 +25348,14 @@ function M.new(base, pingOf)
         if saveJob then return end
         saveJob = Jobs.delay(SAVE_DELAY, function()
             saveJob = nil
-            Store.write(Store.GAME, SAVE_KEY, { margin = margin, shots = shots, rates = rates, bias = bias })
+            Store.write(Store.GAME, SAVE_KEY, { lead = savedLead, shots = shots, rates = rates, bias = bias })
         end, { name = "ShotLearnerSave" })
     end
 
     if base.maid then
         base.maid:GiveTask(function()
             if saveJob then saveJob:Cancel(); saveJob = nil end
-            Store.write(Store.GAME, SAVE_KEY, { margin = margin, shots = shots, rates = rates, bias = bias })
+            Store.write(Store.GAME, SAVE_KEY, { lead = savedLead, shots = shots, rates = rates, bias = bias })
         end)
     end
 
@@ -23852,10 +25370,9 @@ function M.new(base, pingOf)
 
     function self.lead()
         if #recent >= SETTLED then return median(recent) end
-        return math.max(0, pingOf() + margin)
+        return savedLead or math.clamp(pingOf() + START_MARGIN, LEAD_MIN, LEAD_MAX)
     end
 
-    function self.margin() return margin end
     function self.shots() return shots end
 
     function self.learning() return learning end
@@ -23877,8 +25394,7 @@ function M.new(base, pingOf)
         strays = 0
         recentHead = recentHead % RECENT_SIZE + 1
         recent[recentHead] = overshoot
-        local seen = median(recent) - pingOf()
-        margin = math.clamp(margin + (seen - margin) * BLEND, -MARGIN_LIMIT, MARGIN_LIMIT)
+        if #recent >= SETTLED then savedLead = math.clamp(median(recent), LEAD_MIN, LEAD_MAX) end
         shots = shots + 1
         save()
     end
@@ -23892,7 +25408,7 @@ function M.new(base, pingOf)
     end
 
     function self.reset()
-        margin, shots, bias = START_MARGIN, 0, 0
+        savedLead, shots, bias = nil, 0, 0
         rates = {}
         recent, recentHead, strays = {}, 0, 0
         save()
@@ -26686,6 +28202,7 @@ local Errors     = require("Api/Player/Errors")
 local Levers     = require("Api/Player/Levers")
 local Limits     = require("Api/Player/Limits")
 local Profile    = require("Api/Player/Profile")
+local Steering   = require("Api/Player/Steering")
 local Tracker    = require("Api/Player/Tracker")
 local Travel     = require("Api/Player/Travel")
 
@@ -26699,11 +28216,13 @@ function M.new(ctx)
     local levers  = Levers.new(base, ctx, tracker, attrs)
     local arbiter = Arbiter.new(base)
     local travel  = Travel.new(base, ctx, tracker, arbiter, levers)
+    local steering = Steering.new(base, ctx, tracker)
 
     -- motion first, because its release leans on the levers, and the tracker last, because everything reads it on the way out
     base.maid:GiveTask(function()
         travel.clear()
         levers.clear()
+        steering.clear()
         attrs.clear()
         tracker.clear()
     end)
@@ -26744,6 +28263,9 @@ function M.new(ctx)
         forceSprint  = levers.forceSprint,
         overrideAttr = attrs.overrideAttr,
         setNoclip    = levers.setNoclip,
+
+        setMoveVector = steering.setMoveVector,
+        stampDribble  = steering.stampDribble,
 
         startFlight = travel.startFlight,
         moveTo      = travel.moveTo,
@@ -27372,6 +28894,148 @@ end
 return M
 
 end)
+__bundle_register("Api/Player/Steering", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- player steering: walks the game's own movement toward a world direction by standing in where it reads the controls, so speed, animation and the guard stance stay its own and any key pressed goes straight through; also re-stamps the one dribble time a held CanMove skips
+local Errors = require("Api/Player/Errors")
+local Tokens = require("Api/Player/Tokens")
+
+local MOVEMENT   = "Components.Character.Movement"
+local RAW_VECTOR = "calculateRawMoveVector"
+
+local M = {}
+
+function M.new(base, ctx, tracker)
+    local steer
+    local hookModule, hookOriginal, hook
+    local complained = false
+    local closed = false
+
+    -- runs inside the game's heartbeat, where a throw would cost the whole movement step
+    local function ask(fn)
+        local ok, wanted = pcall(fn)
+        if not ok then
+            if not complained then
+                complained = true
+                base.warn("a steering function threw: %s", tostring(wanted))
+            end
+            return nil
+        end
+        if typeof(wanted) ~= "Vector3" then return nil end
+        local x, z = wanted.X, wanted.Z
+        local size = math.sqrt(x * x + z * z)
+        if size <= 0 or size ~= size then return nil end
+        if size > 1 then x, z = x / size, z / size end
+        return Vector3.new(x, 0, z)
+    end
+
+    -- the game reads this once a frame in UpdateMoveDirection with the raw stick or keys, and turns what comes back into MoveDirection
+    local function install()
+        if hook then return true end
+        local net = ctx.Api and ctx.Api.Net
+        local module = net and net.module(MOVEMENT)
+        local original = type(module) == "table" and rawget(module, RAW_VECTOR) or nil
+        if type(original) ~= "function" then return false end
+        hookModule, hookOriginal = module, original
+        hook = function(self, raw)
+            local fn = steer
+            if fn and raw.Magnitude <= 0 then
+                local wanted = ask(fn)
+                if wanted then return wanted end
+            end
+            return original(self, raw)
+        end
+        module[RAW_VECTOR] = hook
+        return true
+    end
+
+    local function uninstall()
+        if not hook then return end
+        if rawget(hookModule, RAW_VECTOR) == hook then hookModule[RAW_VECTOR] = hookOriginal end
+        hookModule, hookOriginal, hook = nil, nil, nil
+    end
+
+    local steerers = Tokens.stack(function(value)
+        steer = value
+        if value == nil then uninstall() end
+    end)
+
+    -- fn() returns a world Vector3 to walk along, length up to 1 like a stick, or nil to leave the game's input alone; height is ignored
+    local function setMoveVector(fn)
+        if type(fn) ~= "function" then return nil, Errors.BAD_ARGS end
+        if closed or not install() then return nil, Errors.NO_MOVEMENT end
+        return steerers.push(fn)
+    end
+
+    -- the exit boost counts from this stamp, and Types.Base:109 only writes it while CanMove is off, so a dribble held through gets none unless it is written as the dribble ends
+    local function stampDribble()
+        local state = tracker.state()
+        local movement = state and state.Movement
+        local types = movement and movement.Types
+        local baseType = types and types.Base
+        if not baseType or type(baseType.lastDribbleTime) ~= "number" then return nil, Errors.NO_MOVEMENT end
+        baseType.lastDribbleTime = os.clock()
+        return true
+    end
+
+    return {
+        setMoveVector = setMoveVector,
+        stampDribble  = stampDribble,
+        clear         = function()
+            closed = true
+            steerers.clear()
+        end,
+    }
+end
+
+return M
+
+end)
+__bundle_register("Api/Player/Tokens", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- player tokens: one last-in-wins stack per lever; a push returns an idempotent restore, the lever follows the newest live value, and only the last restore hands it back
+local M = {}
+
+function M.stack(onChange)
+    local entries = {}
+    local stack = {}
+
+    function stack.count() return #entries end
+
+    -- nil only when empty, so a stacked false still reads as a value
+    function stack.top()
+        local entry = entries[#entries]
+        if entry then return entry.value end
+        return nil
+    end
+
+    function stack.push(value)
+        local entry = { value = value }
+        entries[#entries + 1] = entry
+        onChange(value)
+        return function()
+            for i = #entries, 1, -1 do
+                if entries[i] == entry then
+                    local wasNewest = i == #entries
+                    table.remove(entries, i)
+                    -- an older token standing down changes nothing the lever is doing
+                    if wasNewest then onChange(stack.top()) end
+                    return
+                end
+            end
+        end
+    end
+
+    function stack.clear()
+        if #entries == 0 then return end
+        table.clear(entries)
+        onChange(nil)
+    end
+
+    return stack
+end
+
+return M
+
+end)
 __bundle_register("Api/Player/Profile", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- player profile: read-only views of our gameplay state, the build's stats, stamina and takeover, all through the attribute layer and the player controller so nothing else reads SlotData or the takeover config
 local Signal = require("Api/Player/Signal")
@@ -27675,52 +29339,6 @@ function M.new(base, ctx, tracker, attrs)
             noclips.clear()
         end,
     }
-end
-
-return M
-
-end)
-__bundle_register("Api/Player/Tokens", function(require, _LOADED, __bundle_register, __bundle_modules)
--- player tokens: one last-in-wins stack per lever; a push returns an idempotent restore, the lever follows the newest live value, and only the last restore hands it back
-local M = {}
-
-function M.stack(onChange)
-    local entries = {}
-    local stack = {}
-
-    function stack.count() return #entries end
-
-    -- nil only when empty, so a stacked false still reads as a value
-    function stack.top()
-        local entry = entries[#entries]
-        if entry then return entry.value end
-        return nil
-    end
-
-    function stack.push(value)
-        local entry = { value = value }
-        entries[#entries + 1] = entry
-        onChange(value)
-        return function()
-            for i = #entries, 1, -1 do
-                if entries[i] == entry then
-                    local wasNewest = i == #entries
-                    table.remove(entries, i)
-                    -- an older token standing down changes nothing the lever is doing
-                    if wasNewest then onChange(stack.top()) end
-                    return
-                end
-            end
-        end
-    end
-
-    function stack.clear()
-        if #entries == 0 then return end
-        table.clear(entries)
-        onChange(nil)
-    end
-
-    return stack
 end
 
 return M
