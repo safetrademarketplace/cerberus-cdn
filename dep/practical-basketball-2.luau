@@ -11581,6 +11581,7 @@ end
 end)
 __bundle_register("Features/Misc/StreamerMode", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- streamer mode: hides player names/skins via nameplate DDT, stripped avatar assets, and throttled TextLabel substitution
+local Executor  = require("Utility/Executor")
 local Scheduler = require("Utility/Scheduler")
 local UiHost    = require("UI/UiHost")
 
@@ -16674,7 +16675,8 @@ return function(ctx)
         if cam and Zoom.origFov then pcall(function() cam.FieldOfView = Zoom.origFov end) end
     end
 
-    local tg = UtilsGroup:AddToggle("ZOOM_Enable", {
+    local tg
+    tg = UtilsGroup:AddToggle("ZOOM_Enable", {
         Text = "Zoom",
         Default = false,
         Callback = function(on)
