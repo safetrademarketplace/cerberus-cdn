@@ -24775,8 +24775,9 @@ local Scheduler = require("Utility/Scheduler")
 
 local RESULT_WAIT  = 2     -- seconds after a shot starts moving before one with no server reply is closed anyway
 local RESULT_GRACE = 0.25  -- the grade and the log line arrive together, this covers them landing a frame apart
-local MIN_SAMPLES  = 3     -- samples before the line through them is worth firing on
+local MIN_SAMPLES  = 3     -- samples before a line that starts high on the meter is worth firing on
 local SAMPLE_GRACE = 0.1   -- seconds after the first sample before going on fewer, if a stall is holding the rest back
+local START_BAND   = 0.35  -- a first sample below this is the sweep starting, and at 350 ms the release has to leave right then; above it, it could be last shot's frozen value
 local HISTORY_SIZE = 40
 local TAP_GRACE    = 0.5   -- a swallowed tap with no shot after this long was never a shot, so the button is let go
 local LEAD_CEILING = 0.5   -- seconds of measured overshoot beyond which a sample is not a release at all
@@ -24831,7 +24832,7 @@ function M.new(ctx)
         return sorted[math.ceil(pingCount / 2)]
     end
 
-    local learner = Learner.new(base, ping)
+    local learner = Learner.new(base, ping, ctx.Services.Game.JobId)
 
     local function isMine(model)
         return typeof(model) == "Instance" and model.Name == References.player.Name
@@ -24923,7 +24924,7 @@ function M.new(ctx)
             -- nothing fires until the meter is really moving: a hop or a move stamps the start, then gathers before the sweep begins, and a release sent in that gap is ignored
             local count = sweep:samples()
             if count == 0 then return end
-            if count < MIN_SAMPLES and now - sweep:firstSampleAt() < SAMPLE_GRACE then return end
+            if count < MIN_SAMPLES and sweep:firstProgress() > START_BAND and now - sweep:firstSampleAt() < SAMPLE_GRACE then return end
             local fireAt = sweep:timeOfPhase(learner.target())
             if not fireAt then return end
             if now >= fireAt - learner.lead() then fireRelease(shot, now) end
@@ -25271,6 +25272,11 @@ function Sweep:firstSampleAt()
     return first and first[1] or nil
 end
 
+function Sweep:firstProgress()
+    local first = self.points[1]
+    return first and first[2] or nil
+end
+
 function Sweep:anchor()
     local rate = self:rate()
     local best
@@ -25300,14 +25306,14 @@ return Sweep
 
 end)
 __bundle_register("Api/Shot/Learner", function(require, _LOADED, __bundle_register, __bundle_modules)
--- shot learner: a release leads by the median overshoot measured this session, and before that by the last median saved, since reported ping doesn't track overshoot (measured 15 to 200 ms at about the same ping); also remembers each shot speed's sweep rate through Utility/Store
+-- shot learner: a release leads by the median overshoot measured on this server; a new server starts from ping, because a lead saved on one server is wrong on the next (10 ms from Learn PB against a 366 ms round trip in Blacktop); also remembers each shot speed's sweep rate through Utility/Store
 local Jobs  = require("Utility/Jobs")
 local Store = require("Utility/Store")
 
 local SAVE_KEY     = "shot_timing_v2"
 local SAVE_DELAY   = 2
 local TARGET_PHASE = 0.99   -- frozen shots land on a fixed grid and this is its perfect step, measured live
-local START_MARGIN = 0.07   -- seconds of lead above ping on a first ever shot, with nothing saved
+local START_MARGIN = 0.02   -- seconds of lead above ping before this server has a shot behind it; a real round trip read 5 to 10 ms over ping in Blacktop, and the server's tick adds a little
 local LEAD_MIN, LEAD_MAX = 0, 0.45
 local RECENT_SIZE  = 9      -- overshoots the median is taken over
 local STRAY_LIMIT  = 3      -- this many in a row off the median means the network really changed, not a late packet
@@ -25328,7 +25334,7 @@ local function median(list)
     return sorted[math.ceil(#sorted / 2)]
 end
 
-function M.new(base, pingOf)
+function M.new(base, pingOf, serverId)
     local savedLead, shots = nil, 0
     local recent, recentHead, strays = {}, 0, 0
     local rates = {}
@@ -25338,24 +25344,28 @@ function M.new(base, pingOf)
 
     local stored = Store.read(Store.GAME, SAVE_KEY, nil)
     if type(stored) == "table" then
-        if type(stored.lead) == "number" then savedLead = math.clamp(stored.lead, LEAD_MIN, LEAD_MAX) end
+        if type(stored.lead) == "number" and stored.server == serverId then savedLead = math.clamp(stored.lead, LEAD_MIN, LEAD_MAX) end
         if type(stored.shots) == "number" then shots = stored.shots end
         if type(stored.rates) == "table" then rates = stored.rates end
         if type(stored.bias) == "number" then bias = math.clamp(stored.bias, -BIAS_LIMIT, BIAS_LIMIT) end
+    end
+
+    local function write()
+        Store.write(Store.GAME, SAVE_KEY, { lead = savedLead, server = serverId, shots = shots, rates = rates, bias = bias })
     end
 
     local function save()
         if saveJob then return end
         saveJob = Jobs.delay(SAVE_DELAY, function()
             saveJob = nil
-            Store.write(Store.GAME, SAVE_KEY, { lead = savedLead, shots = shots, rates = rates, bias = bias })
+            write()
         end, { name = "ShotLearnerSave" })
     end
 
     if base.maid then
         base.maid:GiveTask(function()
             if saveJob then saveJob:Cancel(); saveJob = nil end
-            Store.write(Store.GAME, SAVE_KEY, { lead = savedLead, shots = shots, rates = rates, bias = bias })
+            write()
         end)
     end
 
@@ -25368,9 +25378,13 @@ function M.new(base, pingOf)
         save()
     end
 
+    -- until three shots are in, ping counts as one more reading, so one late shot can't move it and a wrong ping is outvoted by the second shot
     function self.lead()
         if #recent >= SETTLED then return median(recent) end
-        return savedLead or math.clamp(pingOf() + START_MARGIN, LEAD_MIN, LEAD_MAX)
+        local start = savedLead or math.clamp(pingOf() + START_MARGIN, LEAD_MIN, LEAD_MAX)
+        if #recent == 0 then return start end
+        local readings = table.move(recent, 1, #recent, 2, { start })
+        return median(readings)
     end
 
     function self.shots() return shots end
