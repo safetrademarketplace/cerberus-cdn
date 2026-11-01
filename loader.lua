@@ -142,6 +142,11 @@ local function onMobile()
     return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and not UserInputService.MouseEnabled
 end
 
+-- a flag handed out by hand: getgenv().bypassExecutorPromo = true before this runs skips the chimera pitch and the unsupported executor screen, and leaves the key check alone
+local function promoBypassed()
+    return truthy(ENV.bypassExecutorPromo) or truthy(_G.bypassExecutorPromo)
+end
+
 -- executors cerberus does not run on, matched against the reported name
 local UNSUPPORTED_EXECUTORS = {
     { match = "xeno",   name = "Xeno" },
@@ -578,7 +583,7 @@ function Panel:_pitchCard(o)
     make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = nameRow })
     txt({ Text = "Chimera", FontFace = SERIF, TextSize = 19, TextColor3 = CH.text, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20), LayoutOrder = 1, Parent = nameRow })
     local tag = txt({
-        Text = "FREE KEYLESS EXECUTOR", FontFace = MONO, TextSize = 9, TextColor3 = CH.accent, TextXAlignment = Enum.TextXAlignment.Center,
+        Text = "FREE TRIAL EXECUTOR", FontFace = MONO, TextSize = 9, TextColor3 = CH.accent, TextXAlignment = Enum.TextXAlignment.Center,
         BackgroundColor3 = CH.accent, BackgroundTransparency = 0.88, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 16), LayoutOrder = 2, Parent = nameRow,
     })
     corner(tag, 4)
@@ -869,14 +874,14 @@ end
 
 -- the first card is the headline, so it is the one outlined in gold
 local FEATURES = {
-    { "Fully keyless", "No key to get, ever." },
+    { "Free trial", "Three days, no card." },
     { "HWID ban bypass", "Hardware bans don't stop it." },
     { "Automatic updates", "Always on the latest build." },
     { "Multi instance", "Run several clients at once." },
 }
 
 local function featureSlide(page)
-    slideHead(page, "FEATURES", "The executor that's fully " .. gold("keyless"))
+    slideHead(page, "FEATURES", "The executor with a free " .. gold("trial"))
     local gap = 12
     local w = math.floor((SLIDE_W - gap) / 2)
     local h = 66
@@ -946,9 +951,9 @@ local function inviteSlide(page, owner)
         props.ZIndex = 2
         return stxt(props)
     end
-    centered({ Text = "FREE FOREVER", FontFace = MONO, TextSize = 11, TextColor3 = CH.accent, Position = UDim2.fromOffset(0, 6), Size = UDim2.new(1, 0, 0, 14), Parent = page })
+    centered({ Text = "FREE TRIAL", FontFace = MONO, TextSize = 11, TextColor3 = CH.accent, Position = UDim2.fromOffset(0, 6), Size = UDim2.new(1, 0, 0, 14), Parent = page })
     centered({ Text = "Skip the wait with " .. gold("Chimera"), FontFace = SERIF, TextSize = 38, TextColor3 = CH.text, RichText = true, Position = UDim2.fromOffset(0, 24), Size = UDim2.new(1, 0, 0, 46), Parent = page })
-    centered({ Text = "The free keyless Roblox executor. No wait, no key, ever.", TextSize = 14, TextColor3 = CH.subtext, Position = UDim2.fromOffset(0, 76), Size = UDim2.new(1, 0, 0, 18), Parent = page })
+    centered({ Text = "Start on a free three-day trial. No payment, no card.", TextSize = 14, TextColor3 = CH.subtext, Position = UDim2.fromOffset(0, 76), Size = UDim2.new(1, 0, 0, 18), Parent = page })
     local invite = make("TextButton", {
         Text = "discord.gg/fhErCU8GJx", FontFace = MONO, TextSize = 15, TextColor3 = CH.accentHi, AutoButtonColor = false,
         BackgroundColor3 = CH.bg, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 114),
@@ -968,14 +973,14 @@ local function inviteSlide(page, owner)
 end
 
 local FREE_SLIDES = {
-    heroSlide("MEET CHIMERA", "A free, " .. gold("keyless") .. "\nRoblox executor.",
-        "Run this script on Chimera and you skip the wait, every time. There's no key to get, ever, and every Cerberus premium feature unlocks free."),
+    heroSlide("MEET CHIMERA", "An executor on a\nfree " .. gold("trial") .. ".",
+        "Run this script on Chimera and you skip the wait, every time. The trial runs three days with no payment and no card, and every Cerberus premium feature unlocks on it."),
     benchmarkSlide, featureSlide, safetySlide, inviteSlide,
 }
 
 local PAID_SLIDES = {
     heroSlide("QUICK TIP", "Have you tried the\nChimera " .. gold("executor") .. "?",
-        "It's a free, fully keyless Roblox executor. On it you'd skip this wait and never need a key for Cerberus again."),
+        "It's a Roblox executor with a free three-day trial. On it you'd skip this wait and never need a key for Cerberus."),
     benchmarkSlide,
 }
 
@@ -1056,7 +1061,7 @@ local function boot()
 
     -- chimera and mobile never wait; keyless runs elsewhere wait out the full pitch, keyed runs see a short one now and then
     local rawKey = ENV.script_key or _G.script_key or script_key
-    if not onChimera() and not onMobile() then
+    if not onChimera() and not onMobile() and not promoBypassed() then
         if not truthy(rawKey) then
             if not panel:pitch({ seconds = FREE_WAIT, pill = "KEYLESS", slides = FREE_SLIDES, cta = ctaBtn, sub = "Run this script on it and you skip the wait." }) then return end
         elseif Random.new():NextInteger(1, PAID_PITCH_ODDS) == 1 then
@@ -1115,13 +1120,13 @@ local function boot()
             if code == "NO_KEY" then
                 fail({
                     title = "No key found", pill = "NO KEY",
-                    body = "This script needs a Cerberus key, and we couldn't find one.\n\nWant it free? Run it on Chimera, the fully keyless executor, and no key is needed. Or get a key from our Discord and set script_key before running the loader.",
+                    body = "This script needs a Cerberus key, and we couldn't find one.\n\nRun it on Chimera instead — it has a free three-day trial and needs no key. Or get a key from our Discord and set script_key before running the loader.",
                     buttons = { chimeraBtn, getKeyBtn, closeBtn },
                 })
             else
                 fail({
                     title = "Key not valid", pill = "KEY",
-                    body = "Your key didn't pass verification (" .. tostring(code) .. "). It may be expired, reset, or for a different plan.\n\nSkip keys for good: run it on Chimera, the fully keyless executor. Or get a fresh key from our Discord.",
+                    body = "Your key didn't pass verification (" .. tostring(code) .. "). It may be expired, reset, or for a different plan.\n\nSkip keys for good: run it on Chimera, which has a free three-day trial. Or get a fresh key from our Discord.",
                     buttons = {
                         chimeraBtn,
                         getKeyBtn,
@@ -1149,7 +1154,7 @@ local function warnUnsupported(name)
         title = name .. " isn't supported",
         pill = "UNSUPPORTED",
         body = "Cerberus doesn't work properly on " .. name .. " — it's missing things our scripts need, so features will break or nothing will load.\n\n"
-            .. "Switch to the Chimera executor instead. It's free, fully keyless, and runs every Cerberus script.",
+            .. "Switch to the Chimera executor instead. It has a free three-day trial and runs every Cerberus script.",
         option = {
             text = "Don't show this again",
             failText = "Couldn't save — this executor can't write files",
@@ -1164,7 +1169,7 @@ end
 
 task.spawn(function()
     local badExecutor = unsupportedExecutor()
-    if badExecutor and not warningDismissed() then
+    if badExecutor and not warningDismissed() and not promoBypassed() then
         warnUnsupported(badExecutor)
         return
     end
