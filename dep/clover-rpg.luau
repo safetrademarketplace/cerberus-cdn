@@ -8381,9 +8381,9 @@ M.tabs = {
     { key = "Teleports",   label = "Teleports",   icon = "map-pin",      mount = TabTeleports,  mountOrder = 5,  section = "WORLD",   configKeys = { "Teleports" } },
     { key = "Alerts",      label = "Alerts",      icon = "bell-ring",    mount = TabAlerts,     mountOrder = 17, section = "WORLD",   configKeys = { "Notifications", "Webhook" } },
 
-    { key = "Combat",      label = "Combat",      icon = "swords",       mount = TabCombat,     mountOrder = 7,  section = "COMBAT",  configKeys = { "Aimbot", "Instakill", "AutoParry", "SilentAim" } },
+    { key = "Combat",      label = "Combat",      icon = "swords",       mount = TabCombat,     mountOrder = 7,  section = "COMBAT",  configKeys = { "Aimbot", "Instakill", "AutoParry", "SilentAim", "Weapon" } },
 
-    { key = "Player",      label = "Player",      icon = "circle-user",  mount = TabPlayer,     mountOrder = 6,  section = "PLAYER",  captureAs = "Movement", configKeys = { "Movement", "PlayerUtils", "CloverUtils" } },
+    { key = "Player",      label = "Player",      icon = "circle-user",  mount = TabPlayer,     mountOrder = 6,  section = "PLAYER",  captureAs = "Movement", configKeys = { "Movement", "PlayerUtils", "CloverUtils", "Broom" } },
 
     { key = "ESP",         label = "ESP",         icon = "eye",          mount = TabESP,        mountOrder = 8,  section = "VISUALS", configKeys = { "ESP" } },
     { key = "Visuals",     label = "Visuals",     icon = "glasses",      mount = TabVisuals,    mountOrder = 9,  section = "VISUALS", configKeys = { "Visuals", "CloverUtils" } },
@@ -9705,6 +9705,7 @@ return M
 end)
 __bundle_register("Features/Fun/CustomCursor/Render", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- cursor renderer: ScreenGui + line/dot frames, ShowCustomCursor cooperation, and the per-frame position loop
+local Jobs      = require("Utility/Jobs")
 local Scheduler = require("Utility/Scheduler")
 local UiHost    = require("UI/UiHost")
 
@@ -11379,6 +11380,7 @@ end
 end)
 __bundle_register("Features/Misc/StreamerMode", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- streamer mode: hides player names/skins via nameplate DDT, stripped avatar assets, and throttled TextLabel substitution
+local Executor  = require("Utility/Executor")
 local Scheduler = require("Utility/Scheduler")
 local Place     = require("UI/Place")
 local UiHost    = require("UI/UiHost")
@@ -11799,23 +11801,33 @@ return function(ctx)
         disconnectList(legacyChatConns)
 
         if TextChatService and TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
-            chatConn = TextChatService.OnIncomingMessage:Connect(function(msg)
-                if not (Streamer.enabled and msg) then return end
+            -- this is a callback with one owner, and the game's quick chat holds it, so it is chained only if the executor can read it and left alone otherwise
+            local readCallback = Executor.get("getcallbackvalue")
+            if type(readCallback) ~= "function" then return end
+            local okRead, gameCallback = pcall(readCallback, TextChatService, "OnIncomingMessage")
+            if not okRead then return end
+
+            TextChatService.OnIncomingMessage = function(msg)
+                local passed = type(gameCallback) == "function" and gameCallback(msg) or nil
+                if not (Streamer.enabled and msg) then return passed end
                 local src = msg.TextSource
-                if not src then return end
+                if not src then return passed end
                 local plr = Players:GetPlayerByUserId(src.UserId)
-                if not plr then return end
+                if not plr then return passed end
 
                 local isMe = (plr.UserId == LOCAL.UserId)
                 local hideName = (isMe and Streamer.selected["Hide Own Name"])
                     or ((not isMe) and Streamer.selected["Hide Others Names"])
-                if not hideName then return end
+                if not hideName then return passed end
 
                 local props = Instance.new("TextChatMessageProperties")
                 props.PrefixText = "???:"
                 props.Text = (scrubText(msg.Text or ""))
                 return props
-            end)
+            end
+            chatConn = {
+                Disconnect = function() TextChatService.OnIncomingMessage = gameCallback end,
+            }
             return
         end
 
@@ -16056,9 +16068,10 @@ end
 
 end)
 __bundle_register("Tabs/Player", function(require, _LOADED, __bundle_register, __bundle_modules)
--- player tab: flight, speed, jump and auto stat on the left, clover utils, the utilities and safety boxes then auto traits on the right (all through UI/Place); returns the Movement module so Cerberus.lua can re-arm it on respawn
+-- player tab: flight, speed, jump, the broom editor and auto stat on the left, clover utils, the utilities and safety boxes then auto traits on the right (all through UI/Place); returns the Movement module so Cerberus.lua can re-arm it on respawn
 local Host        = require("Tabs/Host")
 local AutoStat    = require("Features/Clover/AutoStat")
+local Broom       = require("Features/Clover/Broom")
 local CloverUtils = require("Features/Clover/PlayerUtils")
 local Movement    = require("Features/Player/Movement")
 local PlayerUtils = require("Features/Player/Utils")
@@ -16078,6 +16091,9 @@ return function(ctx)
     end
     if Config.Movement then
         movementInst = Movement(Host.at(ctx, ctx.Tabs.Player, "Left"))
+    end
+    if Config.Broom then
+        Broom(Host.at(ctx, ctx.Tabs.Player, "Left"))
     end
     if Config.AutoStat then
         AutoStat(Host.at(ctx, ctx.Tabs.Player, { ["Auto Stat"] = "Left", ["Auto Traits"] = "Right" }))
@@ -16161,7 +16177,8 @@ return function(ctx)
         if cam and Zoom.origFov then pcall(function() cam.FieldOfView = Zoom.origFov end) end
     end
 
-    local tg = UtilsGroup:AddToggle("ZOOM_Enable", {
+    local tg
+    tg = UtilsGroup:AddToggle("ZOOM_Enable", {
         Text = "Zoom",
         Default = false,
         Callback = function(on)
@@ -17892,6 +17909,189 @@ return function(ctx)
 end
 
 end)
+__bundle_register("Features/Clover/Broom", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- broom editor box: speeds up the game's own broom and lifts its height limit by rescaling the two numbers its flight step reads from the broom script (the Broom Flying speed bonus and altitude factor, BroomClient.lua:112-131), so the flying stays the game's own; switching either off puts the game's numbers back
+local Executor = require("Utility/Executor")
+local Jobs     = require("Utility/Jobs")
+local Log      = require("Utility/Log")
+local Mount    = require("Utility/Mount")
+local Place    = require("UI/Place")
+
+-- professionBonus is the broom script's handler for Broom Flying level changes; its upvalues 2 and 3 are the speed bonus and the altitude factor (live 2026-11-02: 0.2225 and 1.3, in that order, unlike the decompile), told apart by the factor never being under 1
+local HANDLER = "professionBonus"
+local SLOTS = { 2, 3 }
+-- the ceiling is (125 + ground) * the altitude factor (BroomClient.lua:448-463): this puts it out of reach
+local NO_CEILING = 1000
+local CHECK_EVERY = 1
+local DEFAULT_SPEED = 1.5
+local MAX_SPEED = 3
+
+local UNSUPPORTED = "This doesn't work on your executor."
+
+return function(ctx)
+    local O = Mount.orchestrator(ctx, "Broom")
+    if not O then return end
+
+    local box = Place.groupbox(ctx, "Broom", "wind", { fallback = "Player", side = "Left" })
+    if not box then
+        O.finalize()
+        return
+    end
+
+    local References = ctx.References
+    local getconnections = Executor.get("getconnections")
+    local getupvalue = Executor.get("debug.getupvalue") or Executor.get("getupvalue")
+    local setupvalue = Executor.get("debug.setupvalue") or Executor.get("setupvalue")
+    local supported = type(getconnections) == "function" and type(getupvalue) == "function" and type(setupvalue) == "function"
+        and type(debug) == "table" and type(debug.info) == "function"
+
+    local cfg = { fast = false, speed = DEFAULT_SPEED, noCeiling = false }
+    -- per handler: which slot is which and the game's own values, read while they were still the game's
+    local seen = setmetatable({}, { __mode = "k" })
+    local current, written = nil, nil
+
+    local function handler()
+        local player = References.player
+        local folder = player and player:FindFirstChild("Professions")
+        local level = folder and folder:FindFirstChild("Broom Flying")
+        if not level then return nil end
+        local ok, list = pcall(getconnections, level:GetPropertyChangedSignal("Value"))
+        if not ok or type(list) ~= "table" then return nil end
+        for _, conn in ipairs(list) do
+            local okFn, fn = pcall(function() return conn.Function end)
+            if okFn and type(fn) == "function" then
+                local okName, name = pcall(debug.info, fn, "n")
+                if okName and name == HANDLER then return fn end
+            end
+        end
+        return nil
+    end
+
+    local function read(fn, slot)
+        local ok, value = pcall(getupvalue, fn, slot)
+        if ok and type(value) == "number" then return value end
+        return nil
+    end
+
+    local function learn(fn)
+        local a, b = read(fn, SLOTS[1]), read(fn, SLOTS[2])
+        if not a or not b then return nil end
+        local info
+        if b >= 1 and a < 1 then
+            info = { speed = SLOTS[1], altitude = SLOTS[2] }
+        elseif a >= 1 and b < 1 then
+            info = { speed = SLOTS[2], altitude = SLOTS[1] }
+        else
+            return nil
+        end
+        info.game = { speed = read(fn, info.speed), altitude = read(fn, info.altitude) }
+        return info
+    end
+
+    local function write(fn, slot, value)
+        local ok, err = pcall(setupvalue, fn, slot, value)
+        if not ok then Log.devwarn("Broom", "could not set the broom's numbers: %s", tostring(err)) end
+        return ok
+    end
+
+    -- the game resets both numbers on a Broom Flying level up, and a new character brings a new broom script; either is read afresh before writing
+    local function apply()
+        local fn = handler()
+        if not fn then
+            current, written = nil, nil
+            return
+        end
+        local info = seen[fn]
+        if fn ~= current then
+            current, written = fn, nil
+            if not info then
+                info = learn(fn)
+                if not info then return end
+                seen[fn] = info
+            end
+        end
+        local speedNow, altitudeNow = read(fn, info.speed), read(fn, info.altitude)
+        if not speedNow or not altitudeNow then return end
+        if written and (speedNow ~= written.speed or altitudeNow ~= written.altitude) then
+            info.game = { speed = speedNow, altitude = altitudeNow }
+        end
+        local speed = info.game.speed
+        if cfg.fast then speed = cfg.speed * (1 + info.game.speed) - 1 end
+        local altitude = cfg.noCeiling and NO_CEILING or info.game.altitude
+        if speedNow ~= speed then write(fn, info.speed, speed) end
+        if altitudeNow ~= altitude then write(fn, info.altitude, altitude) end
+        written = { speed = speed, altitude = altitude }
+    end
+
+    local function restore()
+        local fn = current
+        local info = fn and seen[fn]
+        if info and written then
+            write(fn, info.speed, info.game.speed)
+            write(fn, info.altitude, info.game.altitude)
+        end
+        written = nil
+    end
+
+    local loop = nil
+    local function sync()
+        if cfg.fast or cfg.noCeiling then
+            if not loop then
+                loop = O.track(Jobs.interval(CHECK_EVERY, apply, { name = "Broom.apply", immediate = true }))
+            else
+                apply()
+            end
+        else
+            if loop then
+                loop:Cancel()
+                loop = nil
+            end
+            restore()
+        end
+    end
+
+    local disabled = not supported or nil
+    box:AddToggle("BroomFast", {
+        Text            = "Faster Broom",
+        Default         = false,
+        Disabled        = disabled,
+        DisabledTooltip = UNSUPPORTED,
+        Callback        = function(on)
+            cfg.fast = on == true
+            sync()
+        end,
+    })
+    box:AddSlider("BroomSpeed", {
+        Text     = "Broom Speed",
+        Default  = DEFAULT_SPEED,
+        Min      = 1,
+        Max      = MAX_SPEED,
+        Rounding = 1,
+        Suffix   = "x",
+        Disabled = disabled,
+        Tooltip  = "How much faster than normal. The game may pull you back if you fly too fast.",
+        Callback = function(value)
+            cfg.speed = tonumber(value) or DEFAULT_SPEED
+            if cfg.fast then sync() end
+        end,
+    })
+    box:AddToggle("BroomNoCeiling", {
+        Text            = "No Height Limit",
+        Default         = false,
+        Disabled        = disabled,
+        Tooltip         = "Fly as high as you like on your broom.",
+        DisabledTooltip = UNSUPPORTED,
+        Callback        = function(on)
+            cfg.noCeiling = on == true
+            sync()
+        end,
+    })
+
+    O.onUnload(restore)
+    O.finalize()
+end
+
+end)
 __bundle_register("Features/Clover/AutoStat", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- auto stat: two boxes built through UI/Place (the tab file decides where each goes): Auto Stat spends your stat points as you get them, spreading them toward a goal for each stat that a build fills in (or you set yourself), never past the cap and never on Magic Power before you have magic to power; Auto Traits learns the traits you pick with your skill points as soon as each one's requirements are met, best first, saving up for a better one rather than spending past it
 local Jobs      = require("Utility/Jobs")
@@ -18376,13 +18576,14 @@ return M
 
 end)
 __bundle_register("Tabs/Combat", function(require, _LOADED, __bundle_register, __bundle_modules)
--- combat tab: instakill and auto parry in the left column, the aimbot and spell silent aim in the right; subCtx propagates Unloader since each sub-feature registers root cleanup itself
+-- combat tab: instakill, auto parry and the weapon box in the left column, the aimbot and spell silent aim in the right; subCtx propagates Unloader since each sub-feature registers root cleanup itself
 local Mount     = require("Utility/Mount")
 local Host      = require("Tabs/Host")
 local SilentAim = require("Features/Clover/SilentAim")
 local Aimbot    = require("Features/Combat/Aimbot")
 local Instakill = require("Features/Main/Instakill")
 local AutoParry = require("Features/Clover/AutoParry")
+local Weapon    = require("Features/Clover/Weapon")
 
 return function(ctx)
     local O = Mount.orchestrator(ctx, "Combat")
@@ -18391,6 +18592,7 @@ return function(ctx)
     local subCtx = O.subCtx({ Unloader = ctx.Unloader })
     if ctx.Config.Instakill then Instakill(Host.at(ctx, ctx.Tabs.Combat, "Left")) end
     if ctx.Config.AutoParry then AutoParry(Host.at(ctx, ctx.Tabs.Combat, "Left")) end
+    if ctx.Config.Weapon    then Weapon(Host.at(ctx, ctx.Tabs.Combat, "Left")) end
     if ctx.Config.Aimbot    then O.mount(Aimbot, subCtx) end
     if ctx.Config.SilentAim then SilentAim(Host.at(ctx, ctx.Tabs.Combat, "Right")) end
 
@@ -18398,8 +18600,103 @@ return function(ctx)
 end
 
 end)
+__bundle_register("Features/Clover/Weapon", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- weapon box: keeps the best weapon you carry as your fighting style (a boss drop is used as soon as it lands in your backpack) and can keep it drawn while your hands are empty, through the inventory and combat apis
+local Jobs  = require("Utility/Jobs")
+local Mount = require("Utility/Mount")
+local Place = require("UI/Place")
+
+local CHECK_EVERY = 3
+-- a weapon the server wouldn't take is left alone this long
+local REFUSED_FOR = 600
+
+return function(ctx)
+    local O = Mount.orchestrator(ctx, "Weapon")
+    if not O then return end
+
+    local box = Place.groupbox(ctx, "Weapon", "sword", { fallback = "Combat", side = "Left" })
+    if not box then
+        O.finalize()
+        return
+    end
+
+    local Api = ctx.Api or {}
+    local cfg = { best = false, drawn = false }
+    local refused = {}
+
+    local function equipBest(Inventory)
+        local ok, list = Inventory.weapons()
+        if not ok or type(list) ~= "table" then return end
+        local current = nil
+        for _, weapon in ipairs(list) do
+            if weapon.current then current = weapon end
+        end
+        local now = os.clock()
+        for _, weapon in ipairs(list) do
+            if weapon.meets and not (refused[weapon.key] and refused[weapon.key] > now) then
+                if not weapon.current and (not current or weapon.damage > current.damage) then
+                    local okEquip = Inventory.equipWeapon(weapon.key)
+                    if not okEquip then refused[weapon.key] = now + REFUSED_FOR end
+                end
+                return
+            end
+        end
+    end
+
+    -- never while something else drives the character (a farm, a trip) or the broom is out: they hold what they need themselves
+    local function keepDrawn(Combat, State, Movement)
+        if Movement then
+            local okOwner, owner = Movement.owner()
+            if okOwner and owner then return end
+        end
+        local okFly, flying = State.flying()
+        if not okFly or flying then return end
+        local okChar, char = State.character()
+        if not okChar or not char or char:FindFirstChildWhichIsA("Tool") then return end
+        Combat.equipWeapon()
+    end
+
+    local loop = nil
+    local function step()
+        local Inventory, Combat, State = Api.Inventory, Api.Combat, Api.State
+        if cfg.best and type(Inventory) == "table" then equipBest(Inventory) end
+        if cfg.drawn and type(Combat) == "table" and type(State) == "table" then keepDrawn(Combat, State, Api.Movement) end
+    end
+
+    local function sync()
+        if (cfg.best or cfg.drawn) and not loop then
+            loop = O.track(Jobs.interval(CHECK_EVERY, step, { name = "Weapon.step", immediate = true }))
+        elseif not (cfg.best or cfg.drawn) and loop then
+            loop:Cancel()
+            loop = nil
+        end
+    end
+
+    box:AddToggle("WeaponAutoBest", {
+        Text     = "Auto Equip Best Weapon",
+        Default  = false,
+        Tooltip  = "Makes the strongest weapon you carry your weapon, including new drops as soon as you get them.",
+        Callback = function(on)
+            cfg.best = on == true
+            sync()
+        end,
+    })
+    box:AddToggle("WeaponKeepDrawn", {
+        Text     = "Keep Weapon Out",
+        Default  = false,
+        Tooltip  = "Takes your weapon out whenever your hands are empty, like after respawning. Waits while a farm or teleport is moving you.",
+        Callback = function(on)
+            cfg.drawn = on == true
+            sync()
+        end,
+    })
+
+    O.finalize()
+end
+
+end)
 __bundle_register("Features/Clover/AutoParry", function(require, _LOADED, __bundle_register, __bundle_modules)
--- auto parry box: switches the parry api on for any mob that attacks within the range you set, with a timing nudge, the roll and block fallbacks for a parry the game refuses, and a line of what it has parried and how many attacks it has learned
+-- auto parry box: switches the parry api on for any mob (and, picked, any player facing you) that attacks within the range you set, with a timing nudge, the roll and block fallbacks for a parry the game refuses, and a line of what it has parried and how many attacks it has learned
 local Log       = require("Utility/Log")
 local Mount     = require("Utility/Mount")
 local Scheduler = require("Utility/Scheduler")
@@ -18474,6 +18771,16 @@ return function(ctx)
         Suffix   = " ms",
         Tooltip  = "Parries this much earlier (above 0) or later (below 0) than it has learned. Leave it at 0 unless parries keep landing a touch early or late.",
         Callback = function(value) Parry.configure({ offset = (tonumber(value) or 0) / 1000 }) end,
+    })
+    depends:AddToggle("APPlayers", {
+        Premium  = true,
+        Text     = "Parry Players Too",
+        Default  = false,
+        Tooltip  = "Also parries other players' attacks when they swing at you, learning each weapon's timing the same way.",
+        Callback = function(on)
+            opts.players = on == true
+            adjust()
+        end,
     })
     depends:AddToggle("APRoll", {
         Premium  = true,
@@ -19764,7 +20071,7 @@ end
 
 end)
 __bundle_register("Features/Auto/Webhooks/UI", function(require, _LOADED, __bundle_register, __bundle_modules)
--- webhook ui: builds the webhook groupbox through UI/Place and wires url/color/anon/events + auto-generated per-event option controls to the webhook api
+-- webhook ui: builds the webhook box (url, color, anon, who to ping on which events, test) and the webhook events box (events + auto-generated per-event option controls) through UI/Place and wires them to the webhook api
 local Place = require("UI/Place")
 
 -- set {label=true} or array -> array of labels, for obsidian multi-dropdown Default
@@ -19886,6 +20193,48 @@ return function(ctx, api)
         labelToKey[ev.label] = ev.key
     end
 
+    local function keysOf(val)
+        local sel = {}
+        for label, on in pairs(val) do
+            local key = labelToKey[label]
+            if key and on then sel[key] = true end
+        end
+        return sel
+    end
+
+    local pingId, pingKeys = api.GetPing()
+    group:AddInput("WebhookPingId", {
+        Text = "Ping (Your Discord ID)",
+        Placeholder = "Your user ID, or everyone",
+        ClearTextOnFocus = false,
+        Finished = true,
+        Default = pingId,
+        Callback = function(val)
+            if api.IsSuspended() then return end
+            api.SetPingId(val)
+        end,
+    })
+    local pingDefault = {}
+    for _, ev in ipairs(events) do
+        if pingKeys[ev.key] then pingDefault[#pingDefault + 1] = ev.label end
+    end
+    group:AddDropdown("WebhookPingEvents", {
+        Text = "Ping Me On",
+        Values = labels,
+        Default = pingDefault,
+        Multi = true,
+        Tooltip = "Which posts mention you, so Discord notifies you.",
+        Callback = function(val)
+            if api.IsSuspended() then return end
+            api.SetPingEvents(keysOf(val))
+        end,
+    })
+
+    group:AddButton("Send Test", fireTest)
+
+    -- the events and their options get a box of their own, so the settings above stay short
+    local eventsBox = Place.groupbox(ctx, "Webhook Events", "bell", { fallback = "Alerts", side = "Left" }) or group
+
     local function enabledLabels()
         local out = {}
         for _, ev in ipairs(events) do
@@ -19894,7 +20243,7 @@ return function(ctx, api)
         return out
     end
 
-    group:AddDropdown("WebhookEvents", {
+    eventsBox:AddDropdown("WebhookEvents", {
         Text = "Events",
         Values = labels,
         Default = enabledLabels(),
@@ -19910,11 +20259,9 @@ return function(ctx, api)
         end,
     })
 
-    group:AddButton("Send Test", fireTest)
-
     for _, ev in ipairs(events) do
         if ev.options and #ev.options > 0 then
-            renderEventOptions(group, api, ev)
+            renderEventOptions(eventsBox, api, ev)
         end
     end
 end
@@ -20455,6 +20802,8 @@ local LOADERS = {
     -- what you carry and selling it; loot bags and picking them up, which fires prompts through Interact
     { name = "Inventory", load = function() return require("Api/Inventory") end },
     { name = "Loot",    load = function() return require("Api/Loot") end },
+    -- the blacksmith's recipes and crafting them, through CloverNet
+    { name = "Crafting", load = function() return require("Api/Crafting") end },
     -- the shops round the world and buying from them, which fires prompts through Interact
     { name = "Shop",    load = function() return require("Api/Shop") end },
     -- your body stats and spending the points for them, through CloverNet
@@ -20575,6 +20924,8 @@ local Log             = require("Utility/Log")
 
 -- theme fallbacks when the user hasn't overridden username/avatar
 local DEFAULT_USERNAME = "Cerberus"
+-- the ping settings live in the store's per-event options under this key, which no event uses
+local PING = "_ping"
 local DEFAULT_AVATAR   = "https://media.discordapp.net/attachments/1349939253739651134/1428995137505067069/cerberus_logo.png"
 
 local M = {}
@@ -20649,7 +21000,21 @@ function M.new(ctx)
             avatar_url = spec.avatarUrl or store.getAvatarUrl() or DEFAULT_AVATAR,
             embeds     = { built },
         }
+        if type(spec.content) == "string" and spec.content ~= "" then
+            payload.content = spec.content
+            payload.allowed_mentions = spec.mentions
+        end
         return transport.post(url, payload, label or spec.title or "event", onDone)
+    end
+
+    -- the ping the player asked for on this event: their own Discord user id, or everyone; stored beside the events' own options
+    local function pingFor(key)
+        local events = store.getEventOption(PING, "events", {})
+        if type(events) ~= "table" or not events[key] then return nil end
+        local id = string.gsub(tostring(store.getEventOption(PING, "id", "") or ""), "%s", "")
+        if string.lower(id) == "everyone" or id == "@everyone" then return "@everyone", { parse = { "everyone" } } end
+        if string.match(id, "^%d+$") then return ("<@%s>"):format(id), { users = { id } } end
+        return nil
     end
 
     -- gated send for a registered event; accepts (key, spec) or (key, title, description)
@@ -20657,6 +21022,7 @@ function M.new(ctx)
         if not enabledGlobally or not store.isEventEnabled(key) then return false end
         local spec = (type(specOrTitle) == "table") and specOrTitle
             or { title = specOrTitle, description = description }
+        if spec.content == nil then spec.content, spec.mentions = pingFor(key) end
         local ev = registry.Get(key)
         return send(spec, (ev and ev.label) or key)
     end
@@ -20669,6 +21035,7 @@ function M.new(ctx)
         return {
             Services   = Services,
             References = References,
+            Api        = ctx.Api,
             NewMaid    = NewMaid,
             -- store value, else the schema default for this option, else the caller's fallback
             getOption  = function(optKey, fallback)
@@ -20751,6 +21118,12 @@ function M.new(ctx)
     api.OnSent   = signals.OnSent
     api.OnFailed = signals.OnFailed
 
+    api.GetPing = function()
+        local events = store.getEventOption(PING, "events", {})
+        return tostring(store.getEventOption(PING, "id", "") or ""), type(events) == "table" and events or {}
+    end
+    api.SetPingId = function(id) store.setEventOption(PING, "id", tostring(id or "")) end
+    api.SetPingEvents = function(set) store.setEventOption(PING, "events", type(set) == "table" and set or {}) end
     api.Send = function(spec, onDone) return send(spec, nil, onDone) end
     api.Emit = function(key, a, b) return emit(key, a, b) end
     -- test send; onDone(ok, status) reports discord's actual response (ui submit-test + button)
@@ -20811,18 +21184,21 @@ return M
 
 end)
 __bundle_register("Api/Webhook/Events", function(require, _LOADED, __bundle_register, __bundle_modules)
--- webhook events manifest, in the order the menu lists them: the launch ping, clover's own posts (staff, bosses, server events, raids, levels, professions, deaths, the alerts tab's other notices), then the universal built-ins
+-- webhook events manifest, in the order the menu lists them: the launch ping, clover's own posts (staff, bosses, server events, raids, levels, professions, farm reports, rare drops, missions, deaths, the alerts tab's other notices), then the universal built-ins
 
 local Alerts            = require("Api/Webhook/Events/Alerts")
 local BossSpawned       = require("Api/Webhook/Events/BossSpawned")
 local Chat              = require("Api/Webhook/Events/Chat")
 local Died              = require("Api/Webhook/Events/Died")
+local FarmReport        = require("Api/Webhook/Events/FarmReport")
 local InventoryChange   = require("Api/Webhook/Events/InventoryChange")
 local Launch            = require("Api/Webhook/Events/Launch")
 local LevelUp           = require("Api/Webhook/Events/LevelUp")
+local MissionDone       = require("Api/Webhook/Events/MissionDone")
 local PlayerJoinLeave   = require("Api/Webhook/Events/PlayerJoinLeave")
 local ProfessionLevelUp = require("Api/Webhook/Events/ProfessionLevelUp")
 local RaidStarted       = require("Api/Webhook/Events/RaidStarted")
+local RareDrop          = require("Api/Webhook/Events/RareDrop")
 local ServerEvent       = require("Api/Webhook/Events/ServerEvent")
 local StaffJoined       = require("Api/Webhook/Events/StaffJoined")
 
@@ -20834,6 +21210,9 @@ return {
     RaidStarted,
     LevelUp,
     ProfessionLevelUp,
+    FarmReport,
+    RareDrop,
+    MissionDone,
     Died,
     Alerts,
     Chat,
@@ -21425,6 +21804,71 @@ end
 return M
 
 end)
+__bundle_register("Api/Webhook/Events/RareDrop", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- rare drop post: an item of a rarity you pick landing in your inventory (a new LocalPlayer.Inventory entry, its rarity from the Items catalog), boss drops and mission chests included
+local Watch = require("Api/Webhook/Events/Watch")
+local Words = require("Api/Webhook/Events/Words")
+
+local PURPLE = Color3.fromRGB(180, 110, 255)
+-- the catalog's rarities, rarest last (live 2026-11-02)
+local RARITIES = { "Common", "Uncommon", "Rare", "Unique", "Legendary", "Fabled", "Exclusive", "Event" }
+
+local M = {
+    key     = "RareDrop",
+    label   = "Rare Drop",
+    default = false,
+    window  = 5,
+    options = {
+        { key = "rarities", kind = "multi", label = "Rarities", values = RARITIES, default = { "Rare", "Unique", "Legendary", "Fabled" } },
+    },
+}
+
+function M.subject(facts)
+    return facts.key
+end
+
+function M.build(facts)
+    return {
+        title       = ("Got a %s item"):format(facts.rarity),
+        description = facts.name,
+        color       = PURPLE,
+        fields      = facts.type and { { name = "Type", value = Words.plain(facts.type), inline = true } } or {},
+        timestamp   = true,
+    }
+end
+
+local function picked(value)
+    local set = {}
+    if type(value) ~= "table" then return set end
+    if value[1] ~= nil then
+        for _, name in ipairs(value) do set[name] = true end
+    else
+        for name, on in pairs(value) do if on then set[name] = true end end
+    end
+    return set
+end
+
+function M.arm(bus)
+    local player = bus.References.player
+    local modules = bus.Services.ReplicatedStorage:FindFirstChild("Modules")
+    local instance = modules and modules:FindFirstChild("Items")
+    local ok, items = false, nil
+    if instance then ok, items = pcall(require, instance) end
+    if not (player and ok and type(items) == "table" and type(items.AllItems) == "table") then return end
+    local function added(entry)
+        local name = string.split(entry.Name, "_")[1]
+        local def = items.AllItems[name]
+        if type(def) ~= "table" or type(def.Rarity) ~= "string" then return end
+        if not picked(bus.getOption("rarities", M.options[1].default))[def.Rarity] then return end
+        Watch.post(bus.emit, M, { key = entry.Name, name = name, rarity = def.Rarity, type = def.Type })
+    end
+    local inventory = player:FindFirstChild("Inventory")
+    if inventory then bus.track(inventory.ChildAdded:Connect(added)) end
+end
+
+return M
+
+end)
 __bundle_register("Api/Webhook/Events/RaidStarted", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- raid started post: a raid appearing in ReplicatedStorage.ActiveRaids, named by the place the game puts it
 local Watch = require("Api/Webhook/Events/Watch")
@@ -21533,6 +21977,47 @@ return {
 }
 
 end)
+__bundle_register("Api/Webhook/Events/MissionDone", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- mission done post: the Guild's result screen for a bird mission (Systems.ShowResults, BirdClient.lua:440-475): passed or failed, the XP and Marks it paid, how long it took and its grade
+local Words = require("Api/Webhook/Events/Words")
+
+local GREEN = Color3.fromRGB(90, 200, 120)
+local RED   = Color3.fromRGB(220, 80, 80)
+-- QueueData.lua:19
+local GRADES = { "F", "D", "C", "B", "A" }
+
+local M = {
+    key     = "MissionDone",
+    label   = "Mission Done",
+    default = false,
+}
+
+function M.build(facts)
+    return {
+        title     = facts.status and "Mission completed" or "Mission failed",
+        color     = facts.status and GREEN or RED,
+        fields    = {
+            { name = "XP",    value = Words.number(tonumber(facts.xp) or 0), inline = true },
+            { name = "Marks", value = Words.number(tonumber(facts.marks) or 0), inline = true },
+            { name = "Time",  value = Words.duration(tonumber(facts.completionTime) or 0), inline = true },
+            { name = "Grade", value = GRADES[tonumber(facts.orderRating) or 1] or "F", inline = true },
+        },
+        timestamp = true,
+    }
+end
+
+function M.arm(bus)
+    local net = type(bus.Api) == "table" and bus.Api.CloverNet or nil
+    if type(net) ~= "table" then return end
+    local ok, handle = net.listen("Systems", "ShowResults", function(data)
+        if type(data) == "table" then bus.emit(M.build(data)) end
+    end)
+    if ok then bus.track(handle) end
+end
+
+return M
+
+end)
 __bundle_register("Api/Webhook/Events/LevelUp", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- level up post: your level rising (the PlayerFolder Level attribute, the same rise the game's LEVEL INCREASED alert checks), with where you are
 local Watch = require("Api/Webhook/Events/Watch")
@@ -21638,6 +22123,97 @@ return {
         hookBackpack(player:FindFirstChild("Backpack"))
     end,
 }
+
+end)
+__bundle_register("Api/Webhook/Events/FarmReport", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- farm report post: every few minutes, what changed since the last one (levels, Marks, profession levels and the items you gained), so a farm left running can be checked on from Discord
+local Jobs  = require("Utility/Jobs")
+local Words = require("Api/Webhook/Events/Words")
+
+local BLUE = Color3.fromRGB(85, 170, 255)
+local MOST_ITEMS = 8
+
+local M = {
+    key     = "FarmReport",
+    label   = "Farm Report",
+    default = false,
+    options = {
+        { key = "minutes", kind = "slider", label = "Report Every (Minutes)", default = 15, min = 5, max = 60 },
+    },
+}
+
+-- level, Marks, profession levels and every stack's count, from the server-written PlayerFolder, Professions and Inventory
+local function snapshot(player)
+    local folder = player:FindFirstChild("PlayerFolder")
+    local out = {
+        level = folder and tonumber(folder:GetAttribute("Level")) or 0,
+        marks = folder and tonumber(folder:GetAttribute("Marks")) or 0,
+        professions = {}, items = {},
+    }
+    local professions = player:FindFirstChild("Professions")
+    if professions then
+        for _, value in ipairs(professions:GetChildren()) do
+            if value:IsA("ValueBase") and type(value.Value) == "number" then out.professions[value.Name] = value.Value end
+        end
+    end
+    local inventory = player:FindFirstChild("Inventory")
+    if inventory then
+        for _, entry in ipairs(inventory:GetChildren()) do
+            local name = string.split(entry.Name, "_")[1]
+            out.items[name] = (out.items[name] or 0) + (tonumber(entry:GetAttribute("Stock")) or 1)
+        end
+    end
+    return out
+end
+
+function M.build(facts)
+    local fields = {}
+    local levels = facts.now.level - facts.before.level
+    fields[#fields + 1] = { name = "Level", value = levels > 0 and ("%s (up %d)"):format(Words.number(facts.now.level), levels) or Words.number(facts.now.level), inline = true }
+    local marks = facts.now.marks - facts.before.marks
+    fields[#fields + 1] = { name = "Marks", value = ("%s (%s%s)"):format(Words.number(facts.now.marks), marks >= 0 and "+" or "", Words.number(marks)), inline = true }
+    local ups = {}
+    for name, level in pairs(facts.now.professions) do
+        local was = facts.before.professions[name]
+        if was and level > was then ups[#ups + 1] = ("%s %s"):format(name, Words.number(level)) end
+    end
+    table.sort(ups)
+    if #ups > 0 then fields[#fields + 1] = { name = "Professions Up", value = table.concat(ups, ", "), inline = false } end
+    local gained = {}
+    for name, count in pairs(facts.now.items) do
+        local delta = count - (facts.before.items[name] or 0)
+        if delta > 0 then gained[#gained + 1] = { name = name, delta = delta } end
+    end
+    table.sort(gained, function(a, b) return a.delta > b.delta end)
+    local lines = {}
+    for i = 1, math.min(#gained, MOST_ITEMS) do lines[i] = ("%s x%s"):format(gained[i].name, Words.number(gained[i].delta)) end
+    if #gained > MOST_ITEMS then lines[#lines + 1] = ("and %d more"):format(#gained - MOST_ITEMS) end
+    fields[#fields + 1] = { name = "Items Gained", value = #lines > 0 and table.concat(lines, "\n") or "Nothing new", inline = false }
+    return {
+        title       = "Farm report",
+        description = ("The last %s."):format(Words.duration(facts.seconds)),
+        color       = BLUE,
+        fields      = fields,
+        timestamp   = true,
+    }
+end
+
+function M.arm(bus)
+    local player = bus.References.player
+    if not player then return end
+    bus.track(Jobs.spawn(function(job)
+        local before, since = snapshot(player), os.clock()
+        while job.alive do
+            local minutes = tonumber(bus.getOption("minutes", 15)) or 15
+            if not job:sleep(math.max(5, minutes) * 60) then return end
+            local now = snapshot(player)
+            bus.emit(M.build({ before = before, now = now, seconds = os.clock() - since }))
+            before, since = now, os.clock()
+        end
+    end, { name = "Webhook.farmReport" }))
+end
+
+return M
 
 end)
 __bundle_register("Api/Webhook/Events/Died", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -22645,7 +23221,7 @@ return M
 
 end)
 __bundle_register("Api/Esp/Sources", function(require, _LOADED, __bundle_register, __bundle_modules)
--- esp sources: clover rpg's groups (mobs, bosses, npcs, quest givers, ores, crops, waypoints, shrines, shops, hidden things, points of interest) built over the World and Professions indexes; each source runs at its group's rescan rate, hands back { instance, kind, label } rows and returns nil when the game could not be read, which keeps what is on screen
+-- esp sources: clover rpg's groups (mobs, bosses, npcs, quest givers, ores, crops, waypoints, shrines, shops, hidden things, interactables, hidden quests, points of interest) built over the World and Professions indexes; each source runs at its group's rescan rate, hands back { instance, kind, label } rows and returns nil when the game could not be read, which keeps what is on screen
 
 local Groups = require("Api/Esp/Groups")
 local Read   = require("Api/World/Read")
@@ -22663,6 +23239,23 @@ local SHRINE  = Color3.fromRGB(255, 185, 120)
 local SHOP    = Color3.fromRGB(255, 245, 160)
 local HIDDEN  = Color3.fromRGB(190, 110, 255)
 local POI     = Color3.fromRGB(150, 255, 200)
+local USE     = Color3.fromRGB(255, 255, 255)
+local SECRET  = Color3.fromRGB(255, 90, 160)
+
+-- interactables by the prompt's name: the kinds the game's own scripts give their prompts (ProximityClient, WaypointClient:62, AlchemyClient:2018 and the profession nodes); anything else is Other
+local PROMPT_KINDS = {
+    ChatPrompt = "Talk", ChatObjectPrompt = "Use", HarvestPrompt = "Gather", MinePrompt = "Gather",
+    BuyPrompt = "Shop", AlchemyPrompt = "Cauldron",
+}
+local PROMPT_KIND_NAMES = { "Talk", "Use", "Gather", "Shop", "Cauldron", "Other" }
+local PROMPT_REACH = 500
+
+-- hidden quests: ClientNPCS's quest dialogue modules name every npc with a quest; one the game gives no QuestNPC tag shows no marker (LocalQuest.lua:29-32,90-112). Quest items lie in Objects.QuestObjects, puzzles in ChatObjects, and ManaHint beams point at quest steps (ManaVisionClient.lua:88-114)
+local QUEST_MODULES = "Quest"
+local QUEST_ITEMS = { "Objects", "QuestObjects" }
+local PUZZLES = { "ChatObjects" }
+local MANA_HINT = "ManaHint"
+local SECRET_KINDS = { "Quest givers with no marker", "Quest items", "Puzzles", "Mana hints" }
 
 -- ManaVisionClient.lua:321-327: what mana vision reveals
 local CONCEALED = "Concealed"
@@ -22899,7 +23492,123 @@ function M.install(register, ctx, origin)
         end,
     })
 
+    -- a prompt hangs off a part or an attachment; either way it is drawn on the thing it belongs to
+    local function promptAnchor(prompt)
+        local parent = prompt.Parent
+        if parent ~= nil and parent:IsA("Attachment") then parent = parent.Parent end
+        return Read.nearestModel(prompt) or drawable(parent)
+    end
+
+    local function wantedKinds(options)
+        if type(options.kinds) == "table" and next(options.kinds) ~= nil then return options.kinds end
+        return nil
+    end
+
     if World then
+        local useCfg = pointConfig(USE, 2.0)
+        useCfg.limitDistance = true
+        useCfg.maxDistance = PROMPT_REACH
+        register({
+            key = "Interactables", label = "Interactables", icon = "hand", config = useCfg, elements = Groups.POINT,
+            options = {
+                { type = "multi", id = "Kinds", field = "kinds", text = "Only show these", values = PROMPT_KIND_NAMES,
+                  tooltip = "Pick the kinds you want to see. Leave it empty to see all of them" },
+            },
+            source = function(g)
+                local cfg = g.config
+                local at = origin()
+                if at == nil then return nil end
+                local radius = cfg.limitDistance and cfg.maxDistance or math.huge
+                local ok, list = World.allPrompts(at, radius)
+                if not ok or type(list) ~= "table" then return nil end
+                local kinds = wantedKinds(cfg.options)
+                return rows(list, capOf(cfg), function(entry)
+                    local kind = PROMPT_KINDS[entry.name] or "Other"
+                    if kinds and not kinds[kind] then return nil end
+                    local label = entry.label or Read.readable(entry.name)
+                    return promptAnchor(entry.prompt), label and (label .. " (" .. kind .. ")") or kind
+                end)
+            end,
+        })
+
+        -- npc names with a quest dialogue, read once the modules load and never cached empty
+        local questNpcs = nil
+        local function questNames()
+            if questNpcs then return questNpcs end
+            local modules = ctx.Services.ReplicatedStorage:FindFirstChild("Modules")
+            local folder = modules and modules:FindFirstChild("ClientNPCS")
+            if folder == nil then return nil end
+            local names, any = {}, false
+            for _, module in ipairs(folder:GetChildren()) do
+                if module:IsA("ModuleScript") and string.find(module.Name, QUEST_MODULES, 1, true) then
+                    local ok, data = pcall(require, module)
+                    if ok and type(data) == "table" then
+                        for name in pairs(data) do
+                            if type(name) == "string" then
+                                names[name] = true
+                                any = true
+                            end
+                        end
+                    end
+                end
+            end
+            if not any then return nil end
+            questNpcs = names
+            return names
+        end
+
+        -- every interactive piece of a quest item or puzzle, named after the item or puzzle it belongs to
+        local function interactivePieces(segments, out, cap, label)
+            local folder = Read.walk(ctx.Services.Workspace, segments)
+            if folder == nil then return end
+            for _, group in ipairs(folder:GetChildren()) do
+                local name = label or Read.readable(group.Name)
+                for _, inst in ipairs(group:GetDescendants()) do
+                    if #out >= cap then return end
+                    if inst:IsA("ProximityPrompt") or inst:IsA("ClickDetector") then
+                        out[#out + 1] = { inst = promptAnchor(inst), label = label and (label .. ": " .. Read.readable(group.Name)) or name }
+                    end
+                end
+            end
+        end
+
+        local secretCfg = bodyConfig(SECRET, 3.0)
+        secretCfg.health.bar = false
+        secretCfg.name.color = SECRET
+        secretCfg.distance.enabled = true
+        register({
+            key = "HiddenQuests", label = "Hidden Quests", icon = "scroll-text", config = secretCfg,
+            options = {
+                { type = "multi", id = "SecretKinds", field = "kinds", text = "Only show these", values = SECRET_KINDS,
+                  tooltip = "Pick what you want to see. Leave it empty to see all of them" },
+            },
+            source = function(g)
+                local cfg = g.config
+                local kinds = wantedKinds(cfg.options)
+                local cap = capOf(cfg)
+                local found = {}
+                local function want(kind) return kinds == nil or kinds[kind] == true end
+                if want(SECRET_KINDS[1]) then
+                    local names = questNames()
+                    local okNpcs, npcs = World.npcs(near(cfg, {}))
+                    if names and okNpcs and type(npcs) == "table" then
+                        for _, npc in ipairs(npcs) do
+                            if names[npc.name] and not npc.questGiver then found[#found + 1] = { inst = npc.model, label = npc.name .. " (hidden quest)" } end
+                        end
+                    end
+                end
+                if want(SECRET_KINDS[2]) then interactivePieces(QUEST_ITEMS, found, cap, "Quest item") end
+                if want(SECRET_KINDS[3]) then interactivePieces(PUZZLES, found, cap, nil) end
+                if want(SECRET_KINDS[4]) then
+                    for _, hint in ipairs(CollectionService:GetTagged(MANA_HINT)) do
+                        local quest = hint:GetAttribute("HintQuest")
+                        found[#found + 1] = { inst = hint:IsA("Model") and hint or Read.nearestModel(hint) or drawable(hint), label = "Hint" .. (type(quest) == "string" and (": " .. quest) or "") }
+                    end
+                end
+                return rows(found, cap, function(entry) return entry.inst, entry.label end)
+            end,
+        })
+
         -- most points of interest are bare parts, which the engine draws as a point
         register({
             key = "POIs", label = "Points of Interest", icon = "flag", config = pointConfig(POI, 5.0),
@@ -25264,6 +25973,9 @@ local LABEL_AFTER = 0.15
 local WATCH_EVERY = 0.4
 local WATCH_SLACK = 30
 local WATCH_LIMIT = 30
+-- other players' attacks are learned under this one kind; a swing only counts when the swinger faces us this squarely (cosine of ~60 degrees)
+local PLAYER_KIND = "Player"
+local PLAYER_FACING = 0.5
 local SAVE_EVERY  = 10
 local STORE_KEY   = "moves"
 local HISTORY     = 30
@@ -25432,10 +26144,10 @@ function M.new(ctx)
     end
 
     -- the asks that cover a mob this far off, merged: a fallback any of them wants is used (one asker rolling through specials is enough for the farm and the parry box both on)
-    local function coverFor(model, gap)
+    local function coverFor(model, gap, isPlayer)
         local merged = nil
         for _, request in pairs(requests) do
-            if gap <= request.range then
+            if gap <= request.range and (not isPlayer or request.players) then
                 local fits = true
                 if request.filter then
                     local ok, answer = pcall(request.filter, model)
@@ -25468,7 +26180,16 @@ function M.new(ctx)
         if not here then return end
         local ok, gap = pcall(function() return (entry.root.Position - here).Magnitude end)
         if not ok then return end
-        local request = coverFor(entry.model, gap)
+        -- a player swinging at someone else in a crowd isn't a threat: only a swing that faces us is
+        if entry.player then
+            local okFacing, facing = pcall(function()
+                local toUs = here - entry.root.Position
+                if toUs.Magnitude < 1e-3 then return 1 end
+                return entry.root.CFrame.LookVector:Dot(toUs.Unit)
+            end)
+            if not okFacing or facing < PLAYER_FACING then return end
+        end
+        local request = coverFor(entry.model, gap, entry.player)
         if not request then return end
         local now = os.clock()
         local threat = { model = entry.model, base = entry.base, kind = kind, tell = now, request = request }
@@ -25501,7 +26222,7 @@ function M.new(ctx)
 
     local function watch(mob)
         if watched[mob.model] then return end
-        local entry = { model = mob.model, root = mob.root, base = mob.baseName or mob.name, conns = {} }
+        local entry = { model = mob.model, root = mob.root, base = mob.baseName or mob.name, player = mob.player == true, conns = {} }
         local model = mob.model
         local conns = entry.conns
         conns[#conns + 1] = model.AttributeChanged:Connect(function(attribute)
@@ -25529,6 +26250,22 @@ function M.new(ctx)
         for _, mob in ipairs(list) do
             keep[mob.model] = true
             watch(mob)
+        end
+        -- other players carry the same tells on their characters (live 2026-11-02: State_Swinging, State_Attacking and State_SkillActive replicate); every player's attack is learned under one kind, per animation
+        local wantPlayers = false
+        for _, request in pairs(requests) do
+            if request.players then wantPlayers = true end
+        end
+        if wantPlayers then
+            local okPlayers, players = World.players({ origin = here, maxDistance = widest() + WATCH_SLACK, alive = true })
+            if okPlayers and type(players) == "table" then
+                for _, other in ipairs(players) do
+                    if other.player ~= References.player and other.character then
+                        keep[other.character] = true
+                        watch({ model = other.character, root = other.root, humanoid = other.humanoid, baseName = PLAYER_KIND, player = true })
+                    end
+                end
+            end
         end
         for model in pairs(watched) do
             if not keep[model] then unwatch(model) end
@@ -25801,10 +26538,14 @@ function M.new(ctx)
             if type(opts.filter) ~= "function" then return nil end
             request.filter = opts.filter
         end
+        if opts.players ~= nil then
+            if type(opts.players) ~= "boolean" then return nil end
+            request.players = opts.players
+        end
         return request
     end
 
-    -- name says who asked; range in studs (30), roll and block as the fallbacks to a refused parry (both on), dodge to roll through specials instead of parrying them (off), filter(model) to narrow which mobs
+    -- name says who asked; range in studs (30), roll and block as the fallbacks to a refused parry (both on), dodge to roll through specials instead of parrying them (off), filter(model) to narrow which mobs, players to parry other players' attacks too (off)
     expose("request", function(name, opts)
         if type(name) ~= "string" or name == "" then return false, Errors.BAD_ARGS end
         local request = readRequest(name, opts)
@@ -25819,7 +26560,7 @@ function M.new(ctx)
     expose("adjust", function(token, opts)
         local request = requests[token]
         if not request then return false, Errors.NO_TOKEN end
-        if not readRequest(request.name, opts, { name = request.name, range = request.range, roll = request.roll, block = request.block, dodge = request.dodge, filter = request.filter }) then
+        if not readRequest(request.name, opts, { name = request.name, range = request.range, roll = request.roll, block = request.block, dodge = request.dodge, filter = request.filter, players = request.players }) then
             return false, Errors.BAD_ARGS
         end
         readRequest(request.name, opts, request)
@@ -27439,6 +28180,173 @@ return {
 }
 
 end)
+__bundle_register("Api/Crafting", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- crafting api: the blacksmith's recipes you have learned (LocalPlayer.Schematics, each item's _craftsettings in the Items catalog, CraftingClient.lua:655-680) with how many you can afford, the blacksmiths, and crafting through Remotes.Client.CraftRemote the way the blacksmith window does (CraftingClient.lua:2385-2392); live 2026-11-02 the server took a craft from beside Patch and ignored one from 117 studs; shared as ctx.Api.Crafting
+local References = require("References")
+local Services   = require("Services")
+local Api        = require("Api")
+local Errors     = require("Api/Crafting/Errors")
+
+local CRAFT = "Client/CraftRemote"
+local ANSWER_WAIT = 6
+-- ClientNPCS.Blacksmith.lua:10,57,79; Patch found live 2026-11-02, the others used once they stream in
+local SMITHS = {
+    { name = "Patch",  position = Vector3.new(40, 333, -4083) },
+    { name = "Vulcan" },
+    { name = "Brutus" },
+}
+
+local M = {}
+
+function M.new(ctx)
+    local base = Api.define("Crafting", ctx)
+    local api = { Errors = Errors }
+    local closed = false
+
+    local function apiOf(name)
+        local found = ctx.Api and ctx.Api[name]
+        if type(found) == "table" then return found end
+        return nil
+    end
+
+    local function settle(label, ok, ...)
+        if ok then return ... end
+        base.warn("%s threw: %s", label, tostring((...)))
+        return false, Errors.NOT_READY
+    end
+
+    local function expose(name, fn)
+        local label = "Crafting." .. name
+        api[name] = function(...)
+            if closed then return false, Errors.NOT_READY end
+            return settle(label, pcall(fn, ...))
+        end
+    end
+
+    local function module(name)
+        local modules = Services.ReplicatedStorage:FindFirstChild("Modules")
+        local instance = modules and modules:FindFirstChild(name)
+        if not instance then return nil end
+        local ok, value = pcall(require, instance)
+        if ok and type(value) == "table" then return value end
+        return nil
+    end
+
+    -- CraftingClient.lua:531-541: every stack named <item> or <item>_… counts
+    local function stockOf(name)
+        local inventory = References.player and References.player:FindFirstChild("Inventory")
+        if not inventory then return 0 end
+        local total = 0
+        for _, entry in ipairs(inventory:GetChildren()) do
+            if string.split(entry.Name, "_")[1] == name then total = total + (tonumber(entry:GetAttribute("Stock")) or 1) end
+        end
+        return total
+    end
+
+    -- Professions.Crafting.lua:21-118: bulk_craft grows with Crafting level; below it, one at a time
+    local function bulk()
+        local professions = module("Professions")
+        if not professions or type(professions.GetPlayerBenefits) ~= "function" then return 1 end
+        local ok, benefits = pcall(professions.GetPlayerBenefits, professions, References.player, "Crafting")
+        if ok and type(benefits) == "table" and tonumber(benefits.bulk_craft) then return math.max(1, math.floor(benefits.bulk_craft)) end
+        return 1
+    end
+
+    -- (true, list) of the recipes you have learned: { key, materials = { name = count }, marks, affordable }
+    expose("recipes", function()
+        local items = module("Items")
+        local player = References.player
+        local schematics = player and player:FindFirstChild("Schematics")
+        if not (items and type(items.AllItems) == "table" and schematics) then return false, Errors.NOT_READY end
+        local folder = player:FindFirstChild("PlayerFolder")
+        local marks = folder and tonumber(folder:GetAttribute("Marks")) or 0
+        local out = {}
+        for _, learned in ipairs(schematics:GetChildren()) do
+            local def = items.AllItems[learned.Name]
+            local settings = type(def) == "table" and def._craftsettings or nil
+            if type(settings) == "table" and type(settings.Materials) == "table" then
+                local affordable = math.huge
+                local materials = {}
+                for material, count in pairs(settings.Materials) do
+                    count = tonumber(count) or 0
+                    materials[material] = count
+                    if count > 0 then affordable = math.min(affordable, math.floor(stockOf(material) / count)) end
+                end
+                local cost = tonumber(settings.Marks) or 0
+                if cost > 0 then affordable = math.min(affordable, math.floor(marks / cost)) end
+                if affordable == math.huge then affordable = 0 end
+                out[#out + 1] = { key = learned.Name, materials = materials, marks = cost, affordable = affordable }
+            end
+        end
+        table.sort(out, function(a, b) return a.key < b.key end)
+        return true, out
+    end)
+
+    expose("stock", function(name)
+        if type(name) ~= "string" or name == "" then return false, Errors.BAD_ARGS end
+        return true, stockOf(name)
+    end)
+
+    -- (true, list) of blacksmiths with a known spot: a streamed one where it stands, else the spot found live
+    expose("smiths", function()
+        local World = apiOf("World")
+        local out = {}
+        for _, smith in ipairs(SMITHS) do
+            local position = smith.position
+            if World then
+                local ok, entry = World.npc(smith.name)
+                if ok and type(entry) == "table" and typeof(entry.position) == "Vector3" then position = entry.position end
+            end
+            if position then out[#out + 1] = { name = smith.name, position = position } end
+        end
+        return true, out
+    end)
+
+    expose("bulk", function() return true, bulk() end)
+
+    -- crafts count of a learned recipe, at most the bulk your Crafting level allows per call; (true, made); yields
+    expose("craft", function(key, count)
+        if type(key) ~= "string" or key == "" then return false, Errors.BAD_ARGS end
+        count = math.floor(tonumber(count) or 1)
+        if count < 1 or not coroutine.isyieldable() then return false, Errors.BAD_ARGS end
+        local player = References.player
+        local schematics = player and player:FindFirstChild("Schematics")
+        local net = apiOf("CloverNet")
+        if not (schematics and net) then return false, Errors.NOT_READY end
+        if not schematics:FindFirstChild(key) then return false, Errors.NOT_KNOWN end
+        local made, per = 0, bulk()
+        while made < count do
+            local amount = math.min(per, count - made)
+            local ok, answer = net.callWith(CRAFT, { timeout = ANSWER_WAIT }, "Craft", key, amount, 0)
+            if not ok then return made > 0, made > 0 and made or Errors.NO_ANSWER end
+            if answer ~= true then return made > 0, made > 0 and made or Errors.REFUSED end
+            made = made + amount
+        end
+        return true, made
+    end)
+
+    if base.maid then
+        base.maid:GiveTask(function() closed = true end)
+    end
+
+    return api
+end
+
+return M
+
+end)
+__bundle_register("Api/Crafting/Errors", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- crafting errors: the string codes every crafting verb returns as its failure result
+
+return {
+    NOT_READY  = "crafting/not_ready",
+    BAD_ARGS   = "crafting/bad_args",
+    NOT_KNOWN  = "crafting/not_known",
+    NO_ANSWER  = "crafting/no_answer",
+    REFUSED    = "crafting/refused",
+}
+
+end)
 __bundle_register("Api/Loot", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- loot api: the loot bags lying on the map (live 2026-10-24: a model under Workspace.Objects with a Creator attribute naming whose it is, an Items Configuration of item folders each holding its own take remote, and a 5-stud Prompt), opened by firing that prompt and emptied through the collect-all remote the server hands back on Remotes.LOOT (LootClient.lua:214-277), item by item when collect-all is cooling down; and where your own death bags lie (DeathBag_<id> player attributes, MapService.lua:793-870); shared as ctx.Api.Loot
 local References = require("References")
@@ -27659,7 +28567,7 @@ return {
 
 end)
 __bundle_register("Api/Inventory", function(require, _LOADED, __bundle_register, __bundle_modules)
--- inventory api: what you carry (one Backpack Tool per item, its stock and quality on the matching LocalPlayer.Inventory entry) read against the game's pure-data Items catalog (type, rarity, whether it sells and for how much, Items.lua:36-42), and selling it through Remotes.Player.SellEvent the way the backpack's sell menu does (BackpackClient.lua:1792-1832); live 2026-10-24 the server took a sale with no merchant anywhere near; shared as ctx.Api.Inventory
+-- inventory api: what you carry (one Backpack Tool per item, its stock and quality on the matching LocalPlayer.Inventory entry) read against the game's pure-data Items catalog (type, rarity, whether it sells and for how much, Items.lua:36-42), your weapons by the damage they'd do and equipping one as your fighting style, and selling through Remotes.Player.SellEvent the way the backpack's sell menu does (BackpackClient.lua:1792-1832); live 2026-11-02 the server only takes a sale beside a merchant; shared as ctx.Api.Inventory
 local References = require("References")
 local Services   = require("Services")
 local Api        = require("Api")
@@ -27668,6 +28576,9 @@ local Errors     = require("Api/Inventory/Errors")
 local SELL = "Player/SellEvent"
 local MODES = { SellOne = true, SellHalf = true, SellAll = true }
 local ANSWER_WAIT = 6
+local HOLD_SETTLE = 0.6
+local EQUIP_WAIT = 2
+local EQUIP_TRIES = 2
 
 local M = {}
 
@@ -27811,6 +28722,86 @@ function M.new(ctx)
         end
         table.sort(out)
         return true, out
+    end)
+
+    -- BackpackUtils.lua:301-312: round(round(BaseDamage * (1 + 0.05 * Quality)) + Scale * Mastery * 0.075), Mastery being the player's <MasteryType>Mastery; kept unrounded so two weapons the game shows alike still order
+    local function weaponDamage(def, quality, folder)
+        local base = tonumber(def.BaseDamage) or 0
+        local mastery = folder and type(def.MasteryType) == "string" and tonumber(folder:GetAttribute(def.MasteryType .. "Mastery")) or 0
+        return base * (1 + 0.05 * (tonumber(quality) or 0)) + (tonumber(def.Scale) or 0) * (mastery or 0) * 0.075
+    end
+
+    -- a "<Light|Medium|Heavy> Proficiency" requirement is that mastery's level (every one starts at 1); any other kind is left to the server
+    local function meetsRequirements(def, folder)
+        if type(def.Required) ~= "table" then return true end
+        for key, level in pairs(def.Required) do
+            local kind = type(key) == "string" and string.match(key, "^(%a+) Proficiency$")
+            if kind and folder then
+                local have = tonumber(folder:GetAttribute(kind .. "Mastery")) or 0
+                if have < (tonumber(level) or 0) then return false end
+            end
+        end
+        return true
+    end
+
+    -- (true, list) of the weapons you carry, best first: { key, name, damage, meets, current (your fighting style) }
+    expose("weapons", function()
+        local list = readItems()
+        local mod = items()
+        if not (list and mod) then return false, Errors.NOT_READY end
+        local player = References.player
+        local folder = player and player:FindFirstChild("PlayerFolder")
+        local inventory = player and player:FindFirstChild("Inventory")
+        local style = folder and folder:GetAttribute("FightingStyle")
+        local out = {}
+        for _, item in ipairs(list) do
+            local def = mod.AllItems[item.name]
+            if item.type == "Weapon" and type(def) == "table" then
+                local entry = inventory and inventory:FindFirstChild(item.key)
+                local quality = (entry and entry:GetAttribute("Quality")) or item.tool:GetAttribute("Quality")
+                out[#out + 1] = {
+                    key = item.key, name = item.name, damage = weaponDamage(def, quality, folder),
+                    meets = meetsRequirements(def, folder), current = item.key == style,
+                }
+            end
+        end
+        table.sort(out, function(a, b) return a.damage > b.damage end)
+        return true, out
+    end)
+
+    -- makes a weapon your fighting style the way Backpack.ToolClass does: holds it, then Inventory.Equip with its Inventory entry (live 2026-11-02, the style changed in under 1.5 s); (true) once the style reads it, yields
+    expose("equipWeapon", function(key)
+        if type(key) ~= "string" or key == "" then return false, Errors.BAD_ARGS end
+        if not coroutine.isyieldable() then return false, Errors.BAD_ARGS end
+        local player = References.player
+        local folder = player and player:FindFirstChild("PlayerFolder")
+        local inventory = player and player:FindFirstChild("Inventory")
+        local char = player and player.Character
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        local net = apiOf("CloverNet")
+        if not (folder and inventory and humanoid and net) then return false, Errors.NOT_READY end
+        if folder:GetAttribute("FightingStyle") == key then return true end
+        local entry = inventory:FindFirstChild(key)
+        local backpack = player:FindFirstChild("Backpack")
+        local tool = (backpack and backpack:FindFirstChild(key)) or char:FindFirstChild(key)
+        if not (entry and tool and tool:IsA("Tool")) then return false, Errors.NO_ITEM end
+        -- the server only takes the equip for a tool it already sees held (live 2026-11-02: sent straight after EquipTool it was ignored, 0.6 s later it took), so the hold settles first and the send is tried twice
+        if tool.Parent ~= char then
+            humanoid:EquipTool(tool)
+            task.wait(HOLD_SETTLE)
+        end
+        if tool.Parent ~= char then return false, Errors.FAILED, "the weapon could not be held" end
+        for _ = 1, EQUIP_TRIES do
+            local ok, why = net.send("Inventory", "Equip", { Item = entry })
+            if not ok then return false, Errors.FAILED, why end
+            local deadline = os.clock() + EQUIP_WAIT
+            while os.clock() < deadline do
+                if closed then return false, Errors.NOT_READY end
+                if folder:GetAttribute("FightingStyle") == key then return true end
+                task.wait(0.1)
+            end
+        end
+        return false, Errors.NO_ANSWER
     end)
 
     -- sells every one of an item you carry (mode SellAll, the default) or one or half; (true, marks earned); yields
@@ -31705,6 +32696,23 @@ local M = {}
 -- the more particular place first: a trip to the arena takes the arena's route, not the hall's. roofed: only somewhere under cover counts as inside (the cave's no-fly volume also takes in the mountain's surface over it)
 local LEDGE  = Vector3.new(160, 434, -5580)
 local TUNNEL = Vector3.new(160, 440, -5900)
+-- live 2026-11-02, from the pathfinder's own walk in, simplified to legs a 1.6-stud sphere sweeps clear: the Kamo mines' only mouth is on the west side of the hill, a tunnel runs east to the upper hall (Y ~15), and an elevator shaft at its east end (open, 2 studs clear) drops to the lower hall (Y ~-80); the pathfinder goes down the shaft but never up it
+local MINE_HALL = {
+    Vector3.new(-262, 33, 1332), Vector3.new(-244, 36, 1332), Vector3.new(-195, 34, 1350), Vector3.new(-169, 32, 1348),
+    Vector3.new(-142, 26, 1323), Vector3.new(-134, 24, 1318), Vector3.new(-30, 18, 1300),
+}
+local MINE_SHAFT = { Vector3.new(-12, 18, 1300), Vector3.new(-12, -77, 1300) }
+-- live 2026-11-02: a chasm splits the lower hall (no floor from x ~48 to ~156) and nothing pathfinds across it; the corridor west then east reaches its edge, and a flight at Y -74 crosses clear under the ceiling to the eastern chambers, which have no opening of their own (every ore there pathfinds from the far edge)
+local MINE_CHASM = {
+    Vector3.new(-115, -79, 1291), Vector3.new(-117, -78, 1271), Vector3.new(51, -77, 1248), Vector3.new(51, -74, 1248), Vector3.new(168, -74, 1240),
+}
+local function joined(...)
+    local out = {}
+    for _, list in ipairs({ ... }) do
+        for _, point in ipairs(list) do out[#out + 1] = point end
+    end
+    return out
+end
 M.WAYS = {
     {
         name   = "Arachne's Chamber",
@@ -31723,6 +32731,37 @@ M.WAYS = {
         roofed = true,
         -- live 2026-10-25: the mountain roofs the whole cave; the way in is a ledge at Y 430 in the chasm on its south edge, the tunnel north at Y 440 (pathfinds to the hall, 3 jumps), then the main hall, from where a low flight reaches the chambers round it
         route  = { LEDGE, TUNNEL, Vector3.new(-203, 437, -5997) },
+    },
+    {
+        name   = "Fungite Cave",
+        -- live 2026-11-02: the fungite ores lie in a low cave (roof 30-40 over the floor at ~235) under a mountain rising to 700+; its mouth opens north onto a canyon that is open sky from z -3200 to -3500
+        center = Vector3.new(310, 255, -3645),
+        size   = Vector3.new(320, 90, 290),
+        roofed = true,
+        route  = { Vector3.new(300, 280, -3260), Vector3.new(300, 240, -3300), Vector3.new(316, 239, -3513), Vector3.new(308, 244, -3567) },
+    },
+    {
+        name   = "Kamo Mines (east)",
+        -- the chambers past the chasm (ores down to Y -128); the valley floor over them is at Y -7
+        center = Vector3.new(315, -92, 1360),
+        size   = Vector3.new(330, 96, 520),
+        roofed = true,
+        route  = joined(MINE_HALL, MINE_SHAFT, MINE_CHASM),
+    },
+    {
+        name   = "Kamo Mines (lower)",
+        -- the lower hall west of the chasm, round the shaft's foot
+        center = Vector3.new(-25, -90, 1360),
+        size   = Vector3.new(350, 100, 520),
+        roofed = true,
+        route  = joined(MINE_HALL, MINE_SHAFT),
+    },
+    {
+        name   = "Kamo Mines",
+        center = Vector3.new(-95, 22, 1325),
+        size   = Vector3.new(210, 55, 190),
+        roofed = true,
+        route  = MINE_HALL,
     },
 }
 
@@ -31771,8 +32810,23 @@ function M.route(here, goal, ways, covered, known)
                     if gap < best then at, best = i, gap end
                 end
             end
+            -- leaving for a place whose route this one runs through (the lower mine for the upper hall) stops at that place's end of the route instead of going all the way out and back in
+            local stop = #points
+            if not goalIn then
+                for _, other in ipairs(ways) do
+                    local last = other ~= way and other.route[#other.route] or nil
+                    if last and inside(other, goal, covered, known) then
+                        for i = at, #points do
+                            if (points[i] - last).Magnitude < 0.5 then
+                                stop = i
+                                break
+                            end
+                        end
+                    end
+                end
+            end
             local out = {}
-            for i = at, #points do out[#out + 1] = points[i] end
+            for i = at, stop do out[#out + 1] = points[i] end
             return out, way.name
         end
     end
@@ -32231,6 +33285,7 @@ function M.new(deps)
     local trail, trailAt = { root.Position }, 0
     local climbRate = Tuning.verticalSpeed
     local ending = false
+    local rider = nil
 
     local function finish(ok, why)
         if finished then return end
@@ -32270,7 +33325,6 @@ function M.new(deps)
         return distance(part.Position, goal) >= Tuning.broomLeftover
     end
 
-    local rider = nil
     if deps.broom then
         rider = Broom.rider({ base = base, ctx = deps.ctx, State = State, wanted = wantBroom, adopt = deps.adopt })
         maid:GiveTask(rider.stop)
@@ -35923,6 +36977,10 @@ function M.new(ctx)
     expose("trainers", nil, interactables.trainers)
     expose("cauldrons", nil, interactables.cauldrons)
     expose("sellers", nil, interactables.sellers)
+    expose("allPrompts", function(at, radius)
+        if at == nil then return false end
+        return not isVector(at) or type(radius) ~= "number" or radius ~= radius or radius <= 0
+    end, interactables.allPrompts)
     expose("prompts", function(name, at, radius)
         return type(name) ~= "string" or name == "" or not isVector(at)
             or type(radius) ~= "number" or radius ~= radius or radius <= 0
@@ -36598,7 +37656,7 @@ return {
 
 end)
 __bundle_register("Api/World/Interactables", function(require, _LOADED, __bundle_register, __bundle_modules)
--- world interactables: what a player uses rather than fights — shop items with their price, bankers, trainers, alchemy cauldrons, sell vendors resolved to their npcs, and any prompt by name near a point
+-- world interactables: what a player uses rather than fights — shop items with their price, bankers, trainers, alchemy cauldrons, sell vendors resolved to their npcs, any prompt by name near a point, and every prompt the client has
 
 local Services = require("Services")
 local Errors   = require("Api/World/Errors")
@@ -36764,6 +37822,21 @@ function M.new(env)
             local position = prompt.Parent ~= nil and Read.position(prompt.Parent) or nil
             if position ~= nil and (position - origin).Magnitude <= radius then
                 list[#list + 1] = promptEntry(prompt, position)
+            end
+        end
+        return true, Read.finish(list, nil, origin)
+    end
+
+    -- every prompt on the client, within radius of origin when one is given
+    function interactables.allPrompts(origin, radius)
+        promptWatch.ensure()
+        local list = {}
+        for _, bucket in pairs(byName) do
+            for prompt in pairs(bucket) do
+                local position = prompt.Parent ~= nil and Read.position(prompt.Parent) or nil
+                if position ~= nil and (origin == nil or (position - origin).Magnitude <= radius) then
+                    list[#list + 1] = promptEntry(prompt, position)
+                end
             end
         end
         return true, Read.finish(list, nil, origin)
@@ -38838,10 +39911,10 @@ return {
         "CmdrClient",
     },
 
-    -- namespace -> packet names
+    -- namespace -> packet names; Inventory.Equip came off on 2026-11-02: Backpack.ToolClass (the one script no decompiler reads) sends it when you click while holding a weapon, and that is how the game sets your fighting style
     packets = {
         Tools     = { Horn = true },
-        Inventory = { Tool = true, Equip = true },
+        Inventory = { Tool = true },
     },
 
     -- place id -> remotes the deny list lets through there: the menu place's own scripts call these (the slot list, the wipe confirm, slot data; live 2026-10-25), World's never do
@@ -39676,7 +40749,7 @@ end
 
 end)
 __bundle_register("Features/Navigation/Teleports", function(require, _LOADED, __bundle_register, __bundle_modules)
--- teleports: glides you anywhere in clover rpg through the movement api, the only mover this game's server accepts (an instant jump gets pulled back) — areas, towns and zones, npcs, shops and services, waypoint gates, shrines, points of interest, the nearest mob or resource, your saved spots and wherever you click
+-- teleports: glides you anywhere in clover rpg through the movement api, the only mover this game's server accepts (an instant jump gets pulled back) — areas, towns and zones, npcs, shops and services, waypoint gates, shrines, points of interest, the nearest mob or resource, your saved spots, the pin on your map and wherever you click
 
 local Identity     = require("Utility/Identity")
 local Jobs         = require("Utility/Jobs")
@@ -39684,6 +40757,7 @@ local Log          = require("Utility/Log")
 local Mount        = require("Utility/Mount")
 local Destinations = require("Features/Navigation/Teleports/Destinations")
 local Hunt         = require("Features/Navigation/Teleports/Hunt")
+local MapPin       = require("Features/Navigation/Teleports/MapPin")
 local Places       = require("Features/Navigation/Teleports/Places")
 local Settings     = require("Features/Navigation/Teleports/Settings")
 local Spots        = require("Features/Navigation/Teleports/Spots")
@@ -39695,6 +40769,8 @@ local TICK_MOVING = 0.25
 local TICK_IDLE   = 1
 -- how often the lists look for places and mobs that have streamed in since
 local RELIST_EVERY = 10
+-- how often a new map pin is looked for
+local PIN_EVERY = 0.5
 
 return function(ctx)
     local O = Mount.orchestrator(ctx, "Teleports")
@@ -39716,7 +40792,7 @@ return function(ctx)
     end
 
     -- declared ahead of travel, which tells the places box the moment a trip starts, stops or ends
-    local places, hunt, settings, spots
+    local places, hunt, settings, spots, mapPin
 
     local waypoints = Waypoints.new()
     local destinations = Destinations.new({ Api = Api, Waypoints = waypoints })
@@ -39750,7 +40826,10 @@ return function(ctx)
     hunt = Hunt(deps)
     settings = Settings(deps)
     spots = Spots(deps)
-    local shown = { places, hunt, spots }
+    mapPin = MapPin(deps)
+    local shown = { places, hunt, spots, mapPin }
+
+    if mapPin then O.track(Jobs.interval(PIN_EVERY, mapPin.tick, { name = "Teleports.mapPin" })) end
 
     local nextRelist = os.clock() + RELIST_EVERY
     -- the lines only matter while the menu is open, and every one of them asks the world for something
@@ -40621,6 +41700,103 @@ return function(deps)
         end,
         relist = function() relist(false) end,
         status = status,
+    }
+end
+
+end)
+__bundle_register("Features/Navigation/Teleports/MapPin", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- teleport map pin box: travels to the pin you drop on the game's own map (MapService draws it as a client-only part named Waypoint in the workspace with a WaypointDisplay billboard, MapService.lua:651-687, and clears it once you come within 25 studs), on a button or by itself whenever a new pin goes down
+local Place   = require("UI/Place")
+local Widgets = require("Features/Navigation/Teleports/Widgets")
+
+local PIN = "Waypoint"
+local BILLBOARD = "WaypointDisplay"
+-- the game clears the pin within 25 studs of it on the flat (MapService.lua:769-770), so the trip stops short of that
+local REACH = 20
+-- a pin this far from the last one counts as a new pin
+local MOVED = 10
+
+local function pinIn(workspace)
+    local part = workspace:FindFirstChild(PIN)
+    if part and part:IsA("BasePart") and part:FindFirstChild(BILLBOARD) then return part end
+    return nil
+end
+
+return function(deps)
+    local Travel = deps.Travel
+    local workspace = deps.Env.Services.Workspace
+    local box = Place.groupbox(deps.Env, "Map Pin", "map-pinned", { fallback = "Teleports", side = "Right" })
+    if not box then return nil end
+
+    local auto = false
+    local lastPin = nil
+
+    -- the pin is followed while it lasts (the game re-snaps it to the ground once that streams in), then its last spot is kept
+    local function record(part)
+        local last = part.Position
+        return {
+            label = "your map pin",
+            reach = REACH,
+            where = function()
+                if part.Parent ~= nil then last = part.Position end
+                return last
+            end,
+        }
+    end
+
+    local function go()
+        local part = pinIn(workspace)
+        if not part then
+            deps.notify("Open your map and click somewhere to drop a pin first.")
+            return
+        end
+        lastPin = part.Position
+        Travel.go(record(part))
+    end
+
+    local setAbout = Widgets.line(box, "No pin on your map.")
+
+    box:AddButton({
+        Text    = "Go To Map Pin",
+        Tooltip = "Travel to the pin you dropped on the game's map.",
+        Func    = go,
+    })
+    box:AddToggle("TpMapPinAuto", {
+        Text     = "Go When I Drop A Pin",
+        Default  = false,
+        Tooltip  = "Starts travelling as soon as you drop a new pin on your map.",
+        Callback = function(on)
+            auto = on == true
+            local part = pinIn(workspace)
+            lastPin = part and part.Position or nil
+        end,
+    })
+
+    local function describe()
+        local part = pinIn(workspace)
+        if not part then return setAbout("No pin on your map.") end
+        local character = deps.Env.References.player and deps.Env.References.player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local away = root and (root.Position - part.Position).Magnitude or nil
+        setAbout(away and ("Pin %d studs away."):format(math.floor(away)) or "There's a pin on your map.")
+    end
+
+    -- runs with the menu shut too, so a pin dropped on the map starts the trip by itself
+    local function tick()
+        local part = pinIn(workspace)
+        if not part then
+            lastPin = nil
+            return
+        end
+        if auto and (lastPin == nil or (part.Position - lastPin).Magnitude > MOVED) then
+            lastPin = part.Position
+            Travel.go(record(part))
+        end
+    end
+
+    return {
+        describe = describe,
+        tick     = tick,
     }
 end
 
@@ -42212,21 +43388,21 @@ end
 
 end)
 __bundle_register("Tabs/Farm", function(require, _LOADED, __bundle_register, __bundle_modules)
--- farm tab: autofarm settings heads the left column with the mob, boss and quest farms and the magic reroll under it, the gathering farm heads the right with the broom race farm, auto sell and the farm stats under it, all built through UI/Place over the apis they drive
+-- farm tab: autofarm settings heads the left column with the mob, boss and quest farms and the magic reroll under it, the gathering farm heads the right with the broom race farm, bird missions, auto sell, auto craft and the farm stats under it, all built through UI/Place over the apis they drive
 local Host = require("Tabs/Host")
 local Farm = require("Features/Clover/Farm")
 
 return function(ctx)
     if ctx.Config.Farm then
         Farm(Host.at(ctx, ctx.Tabs.Farm, {
-            ["Autofarm Settings"] = "Left", ["Mob Farm"] = "Left", ["Boss Farm"] = "Left", ["Quest Farm"] = "Left", ["Magic Reroll"] = "Left", ["Auto Sell"] = "Right", ["Gathering Farm"] = "Right", ["Broom Race Farm"] = "Right", ["Farm Stats"] = "Right",
+            ["Autofarm Settings"] = "Left", ["Mob Farm"] = "Left", ["Boss Farm"] = "Left", ["Quest Farm"] = "Left", ["Magic Reroll"] = "Left", ["Auto Sell"] = "Right", ["Auto Craft"] = "Right", ["Gathering Farm"] = "Right", ["Broom Race Farm"] = "Right", ["Bird Missions"] = "Right", ["Farm Stats"] = "Right",
         }))
     end
 end
 
 end)
 __bundle_register("Features/Clover/Farm", function(require, _LOADED, __bundle_register, __bundle_modules)
--- farm orchestrator: builds the autofarm settings, mob farm, boss farm, quest farm, gathering farm, broom race farm, auto sell and farm stats boxes through UI/Place (the tab file decides where each goes), runs whichever farm is switched on through one engine (switching one on switches the others off), and keeps the status and stats lines fresh while the menu is open
+-- farm orchestrator: builds the autofarm settings, mob farm, boss farm, quest farm, gathering farm, broom race farm, bird missions, auto sell and farm stats boxes through UI/Place (the tab file decides where each goes), runs whichever farm is switched on through one engine (switching one on switches the others off), and keeps the status and stats lines fresh while the menu is open
 local Jobs      = require("Utility/Jobs")
 local Log       = require("Utility/Log")
 local Mount     = require("Utility/Mount")
@@ -42241,11 +43417,19 @@ local Mobs      = require("Features/Clover/Farm/Mobs")
 local Nodes     = require("Features/Clover/Farm/Nodes")
 local Quests    = require("Features/Clover/Farm/Quests")
 local Races     = require("Features/Clover/Farm/Races")
+local Missions  = require("Features/Clover/Farm/Missions")
 local Reroll    = require("Features/Clover/Farm/Reroll")
 
 local REFRESH_EVERY = 0.5
 local MOB_FARM, NODE_FARM, RACE_FARM, QUEST_FARM, BOSS_FARM = "Mob Farm", "Gathering Farm", "Broom Race Farm", "Quest Farm", "Boss Farm"
 local REROLL_FARM = "Magic Reroll"
+local MISSION_FARM = "Bird Missions"
+local NODE_RANGE = 750
+local SELL_MINUTES = 10
+local CRAFT_AT = 90
+-- with no farm running, auto sell checks this often whether you stand by a merchant
+local IDLE_SELL_EVERY = 3
+local IDLE_SELL_REACH = 8
 -- the reroll's run outlives each place it visits (World, the menu, World again), so it is kept on disk
 local REROLL_NS, REROLL_KEY = Store.GAME .. "/reroll", "state"
 -- GrimoireRarity.lua:779-812 (weights .22 .22 .20 .15 .15 .05 .01; Spatial is never rolled)
@@ -42259,6 +43443,7 @@ local WEAPONS = { "Dull Gauntlets", "Novice Blade", "Dull Longsword", "Rustic Sp
 local MENU_PLACE = 8248164019
 local DEFAULT_COURSE = "Kamo Broom Blitz"
 local RACE_SPEED = 330
+local RACE_SPEED_MIN = 120
 local STOP_LINES = {
     died  = "The farm stopped because you died too many times in a row.",
     fault = "The farm hit a problem and stopped. Try switching it on again.",
@@ -42299,17 +43484,20 @@ return function(ctx)
     -- the shared settings every farm reads live, and each farm's own
     local settings = {
         autoRespawn = true, stopAfterDeaths = false, maxDeaths = 3, recoverBags = true, autoSell = false, sellItems = {},
+        sellEvery = SELL_MINUTES * 60, autoCraft = false, craftItems = {}, craftAt = CRAFT_AT,
     }
     -- parrying and the instakill are premium: the brain checks the gate itself, since a locked toggle that starts on keeps its value
     local mobCfg = {
         names = {}, heavy = true, skills = true, instakill = true, instakillMode = false, block = true, parry = true, dodge = true,
         locked = Premium.isLocked,
     }
-    local nodeCfg = { items = {}, ownTools = true }
-    -- the race speed is fixed: the user found 330 fast and never pulled back (2026-10-24)
+    -- the gathering range is measured from where the farm was switched on, so it never wanders off to another area (user report 2026-11-02: the mountain farm ended up stuck in the Kamo mines)
+    local nodeCfg = { items = {}, ownTools = true, range = NODE_RANGE }
+    -- the race speed tops out at 330, where the user found it fast and never pulled back (2026-10-24); players racing high ranks got banned at it (2026-11-02), so it can be lowered
     local raceCfg = { course = DEFAULT_COURSE, speed = RACE_SPEED, challenge = true, best = true }
     local questCfg = { givers = {}, best = true }
     local bossCfg = { bosses = {}, loot = true }
+    local missionCfg = { rank = Missions.BEST }
     local rerollState = Store.read(REROLL_NS, REROLL_KEY, nil)
     if type(rerollState) ~= "table" then rerollState = {} end
     local rerollCfg = {
@@ -42329,10 +43517,11 @@ return function(ctx)
         [QUEST_FARM] = Quests.new(questCfg, { mob = mobCfg, node = nodeCfg, race = raceCfg }),
         [BOSS_FARM]  = Bosses.new(bossCfg, { mob = mobCfg }),
         [REROLL_FARM] = Reroll.new(rerollCfg),
+        [MISSION_FARM] = Missions.new(missionCfg, { mob = mobCfg, net = function() return Api.CloverNet end }),
     }
     local toggleOf = {
         [MOB_FARM] = "FarmMobs", [NODE_FARM] = "FarmNodes", [RACE_FARM] = "FarmRaces", [QUEST_FARM] = "FarmQuests", [BOSS_FARM] = "FarmBosses",
-        [REROLL_FARM] = "FarmReroll",
+        [REROLL_FARM] = "FarmReroll", [MISSION_FARM] = "FarmMissions",
     }
     -- the quest picker shows "title (giver)", the farm wants the giver
     local giverOf = {}
@@ -42571,6 +43760,16 @@ return function(ctx)
             Tooltip  = "Skips nodes your pickaxe or sickle isn't strong enough for.",
             Callback = function(on) nodeCfg.ownTools = on == true end,
         })
+        depends:AddSlider("FarmNodeRange", {
+            Text     = "Gather Range",
+            Default  = NODE_RANGE,
+            Min      = 100,
+            Max      = 3000,
+            Rounding = 0,
+            Suffix   = " studs",
+            Tooltip  = "How far from where you switched the farm on it goes looking. Lower it to keep the farm in one area.",
+            Callback = function(value) nodeCfg.range = tonumber(value) or NODE_RANGE end,
+        })
         depends:SetupDependencies({ { Toggles.FarmNodes, true } })
     end
 
@@ -42611,7 +43810,42 @@ return function(ctx)
             Tooltip  = "When your Broom Flying is ready to rank up, takes the rank challenge and races its course for you.",
             Callback = function(on) raceCfg.challenge = on == true end,
         })
+        depends:AddSlider("FarmRaceSpeed", {
+            Premium  = true,
+            Text     = "Race Speed",
+            Default  = RACE_SPEED,
+            Min      = RACE_SPEED_MIN,
+            Max      = RACE_SPEED,
+            Rounding = 0,
+            Tooltip  = "How fast the broom flies in a race. Slower times look more like a real player.",
+            Callback = function(value) raceCfg.speed = tonumber(value) or RACE_SPEED end,
+        })
         depends:SetupDependencies({ { Toggles.FarmRaces, true } })
+    end
+
+    -- ===== bird missions =====
+    local missionBox = Place.groupbox(ctx, MISSION_FARM, "bird", { fallback = "Farm", side = "Right" })
+    if missionBox then
+        missionBox:AddToggle("FarmMissions", {
+            Premium  = true,
+            Text     = MISSION_FARM,
+            Default  = false,
+            Tooltip  = "Calls the Mission Bird, takes a Guild mission, flies to it and fights it with your Mob Farm settings, then takes another while you have mission tokens.",
+            Callback = function(on) switch(MISSION_FARM, on == true) end,
+        }):AddKeyPicker("FarmMissionsKey", { Premium = true, Default = "None", Mode = "Toggle", Text = MISSION_FARM, SyncToggleState = true })
+        local depends = missionBox:AddDependencyBox()
+        labels[MISSION_FARM] = depends:AddLabel("Off", true)
+        depends:AddDropdown("FarmMissionRank", {
+            Premium  = true,
+            Text     = "Mission Rank",
+            Values   = Missions.rankNames(),
+            Default  = Missions.BEST,
+            Tooltip  = "Which rank of mission to ask for. Higher ranks give more XP but need a higher level and mission rank.",
+            Callback = function(value)
+                if type(value) == "string" and value ~= "" then missionCfg.rank = value end
+            end,
+        })
+        depends:SetupDependencies({ { Toggles.FarmMissions, true } })
     end
 
     -- ===== magic reroll =====
@@ -42712,10 +43946,19 @@ return function(ctx)
     local sellPicker
     if sellBox then
         sellBox:AddToggle("FarmAutoSell", {
-            Text     = "Auto Sell While Farming",
+            Text     = "Auto Sell",
             Default  = false,
-            Tooltip  = "Every minute while a farm runs, sells all of the items you pick below. You don't need to be near a merchant. Anything one of your quests is collecting is kept.",
+            Tooltip  = "Sells the items you pick below. While a farm runs it flies to the nearest merchant to sell; otherwise it sells whenever you stand next to one. Anything one of your quests is collecting is kept.",
             Callback = function(on) settings.autoSell = on == true end,
+        })
+        sellBox:AddSlider("FarmSellEvery", {
+            Text     = "Sell Every",
+            Default  = SELL_MINUTES,
+            Min      = 2,
+            Max      = 30,
+            Rounding = 0,
+            Suffix   = " min",
+            Callback = function(value) settings.sellEvery = (tonumber(value) or SELL_MINUTES) * 60 end,
         })
         sellPicker = sellBox:AddDropdown("FarmSellItems", {
             Text       = "Sell These",
@@ -42725,6 +43968,35 @@ return function(ctx)
             Searchable = true,
             Tooltip    = "Which items to sell. Equipped and locked items are never sold.",
             Callback   = function(value) settings.sellItems = asSet(value) end,
+        })
+    end
+
+    -- ===== auto craft =====
+    local craftBox = Place.groupbox(ctx, "Auto Craft", "hammer", { fallback = "Farm", side = "Right" })
+    local craftPicker
+    if craftBox then
+        craftBox:AddToggle("FarmAutoCraft", {
+            Text     = "Auto Craft",
+            Default  = false,
+            Tooltip  = "While a farm runs, when a material for one of the recipes below fills up, flies to the nearest blacksmith and crafts as many as you can afford.",
+            Callback = function(on) settings.autoCraft = on == true end,
+        })
+        craftPicker = craftBox:AddDropdown("FarmCraftItems", {
+            Text       = "Craft These",
+            Values     = {},
+            Default    = {},
+            Multi      = true,
+            Searchable = true,
+            Tooltip    = "Recipes you have learned at the blacksmith. Ingots turn two ores into one.",
+            Callback   = function(value) settings.craftItems = asSet(value) end,
+        })
+        craftBox:AddSlider("FarmCraftAt", {
+            Text     = "Craft When A Material Reaches",
+            Default  = CRAFT_AT,
+            Min      = 10,
+            Max      = 99,
+            Rounding = 0,
+            Callback = function(value) settings.craftAt = tonumber(value) or CRAFT_AT end,
         })
     end
 
@@ -42750,6 +44022,7 @@ return function(ctx)
             lines[#lines + 1] = ("Quests handed in: %s"):format(Ui.commas(s.quests))
             if s.lastQuest then lines[#lines + 1] = ("  Last: %s"):format(Ui.clean(s.lastQuest)) end
         end
+        if (s.missions or 0) > 0 then lines[#lines + 1] = ("Missions done: %s"):format(Ui.commas(s.missions)) end
         if s.races > 0 then
             lines[#lines + 1] = ("Races finished: %s"):format(Ui.commas(s.races))
             if s.lastRace then lines[#lines + 1] = ("  Last: %s"):format(Ui.clean(s.lastRace)) end
@@ -42762,6 +44035,7 @@ return function(ctx)
             if s.lastBoss then lines[#lines + 1] = ("  Last: %s"):format(Ui.clean(s.lastBoss)) end
         end
         if s.looted > 0 then lines[#lines + 1] = ("Drops picked up: %s"):format(Ui.commas(s.looted)) end
+        if (s.crafted or 0) > 0 then lines[#lines + 1] = ("Items crafted: %s"):format(Ui.commas(s.crafted)) end
         if s.sold > 0 then lines[#lines + 1] = ("Items sold: %s for %s Marks"):format(Ui.commas(s.sold), Ui.commas(s.marks)) end
         lines[#lines + 1] = ("Deaths: %s"):format(Ui.commas(s.deaths))
         if s.recovered > 0 then lines[#lines + 1] = ("  Items got back from your bag: %s"):format(Ui.commas(s.recovered)) end
@@ -42771,6 +44045,7 @@ return function(ctx)
     -- the lists are read again until they fill, since the registries may still be replicating at mount
     local mobsLoaded, itemsLoaded, coursesLoaded, questsLoaded = mobPicker == nil, itemPicker == nil, coursePicker == nil, questPicker == nil
     local bossesLoaded, sellLoaded = bossPicker == nil, sellPicker == nil
+    local craftLoaded = craftPicker == nil
     local function loadLists()
         local World, Professions, Racing, QuestApi, Inventory = Api.World, Api.Professions, Api.Racing, Api.Quests, Api.Inventory
         if not bossesLoaded and type(World) == "table" then
@@ -42784,6 +44059,16 @@ return function(ctx)
                 -- asking once starts the mob index, so boss spots are learned from boot, farm or no farm
                 World.bossSpots(names[1] or "")
                 bossesLoaded = true
+            end
+        end
+        local Crafting = Api.Crafting
+        if not craftLoaded and type(Crafting) == "table" then
+            local ok, recipes = Crafting.recipes()
+            if ok and type(recipes) == "table" and #recipes > 0 then
+                local names = {}
+                for _, recipe in ipairs(recipes) do names[#names + 1] = recipe.key end
+                Ui.values(craftPicker, names)
+                craftLoaded = true
             end
         end
         if not sellLoaded and type(Inventory) == "table" then
@@ -42861,7 +44146,7 @@ return function(ctx)
 
     loadLists()
     O.track(Scheduler.heartbeat(function()
-        if not (mobsLoaded and itemsLoaded and coursesLoaded and questsLoaded and bossesLoaded and sellLoaded) then loadLists() end
+        if not (mobsLoaded and itemsLoaded and coursesLoaded and questsLoaded and bossesLoaded and sellLoaded and craftLoaded) then loadLists() end
         if Library and not Library.Toggled then return end
         refresh()
     end, { name = "Farm.refresh", interval = REFRESH_EVERY, deferrable = true }))
@@ -42915,6 +44200,23 @@ return function(ctx)
             Ui.set(Toggles.FarmReroll, true)
         end
     end
+
+    -- no farm running: whatever you picked sells whenever you stand by a merchant, the way the server now wants it
+    O.track(Jobs.interval(IDLE_SELL_EVERY, function()
+        if not settings.autoSell or engine.running() then return end
+        local State = Api.State
+        if type(State) ~= "table" then return end
+        local okRoot, root = State.root()
+        if not okRoot or not root then return end
+        local merchant, gap = engine.nearestMerchant(root.Position)
+        if not merchant or gap > IDLE_SELL_REACH then return end
+        local items = engine.toSell()
+        if #items == 0 then return end
+        engine.sellAll(items, function(count, earned)
+            engine.stats.sold = (engine.stats.sold or 0) + count
+            if type(earned) == "number" and earned > 0 then engine.stats.marks = (engine.stats.marks or 0) + earned end
+        end)
+    end, { name = "Farm.idleSell" }))
 
     O.onUnload(function() engine.stop("unload") end)
     O.finalize()
@@ -43879,18 +45181,32 @@ return M
 
 end)
 __bundle_register("Features/Clover/Farm/Nodes", function(require, _LOADED, __bundle_register, __bundle_modules)
--- gathering farm brain: latches onto the nearest ready node of the chosen resources that your tools can gather until it is gathered, flies over on the broom, lands beside it and plays the gather through the professions api (its solver answers the minigame), and heads back to where it was gathering when nothing nearby is ready
+-- gathering farm brain: latches onto the nearest ready node of the chosen resources that your tools can gather (within the range of where the farm was switched on) until it is gathered, flies over on the broom, lands beside it and plays the gather through the professions api (its solver answers the minigame), sets a node it can't gather aside for longer each time, and heads back to where it was gathering when nothing nearby is ready
 local M = {}
 
 local KINDS = { "Ore", "Harvest" }
+-- with no range set, nodes this far from the character are looked at
 local SEARCH = 3000
--- the gather prompt is fired from here; a node it could not gather twice is left alone for a while
-local REACH = 5
+-- every node's prompt sits on its centre with a 7-stud range (live 2026-11-02): a 14-stud fungite rock has no standing spot within 5, so a 5-stud trip never arrived and flew in and out of the cave, while a 6-stud trip to a 3-stud crop stopped 6.3 out, on the prompt's edge; so the trip aims just past the node's own edge, and being close enough is the prompt's own reach, never a fixed distance
+local REACH = 6
+local MIN_REACH = 3.5
+local EDGE = 1
+-- trips per pick before the gather's own range check decides, so a trip that ends on top of the rock never loops
+local TRIPS = 2
+-- a node a trip can't reach (under a canopy, planned from over it) is gone into from open ground beside it: flown to this high over that ground, landed, then tried again
+local OPEN_ABOVE = 20
+-- a node that failed this often is set aside, for longer each time it is set aside again
 local FAILS = 2
-local SKIP_FOR = 90
+local SKIP_FOR = 60
+local SKIP_MAX = 900
 local WAIT = 3
 local GATHER_TIMEOUT = 40
 local HOME_FAR = 300
+-- a minigame the game still has open is waited on this long, then cancelled
+local BUSY_LIMIT = 8
+local BUSY_PAUSE = 0.5
+-- this many nodes failed in a row with nothing gathered sends the farm back to where it last gathered
+local STREAK_HOME = 4
 
 local function distance(a, b)
     return (a - b).Magnitude
@@ -43911,14 +45227,25 @@ local function describe(list)
     return "the resources you picked"
 end
 
--- cfg is the live settings table the menu writes: items (a set) and ownTools
+local function promptPosition(prompt)
+    local parent = prompt.Parent
+    if parent == nil then return nil end
+    if parent:IsA("Attachment") then return parent.WorldPosition end
+    if parent:IsA("BasePart") then return parent.Position end
+    return nil
+end
+
+-- cfg is the live settings table the menu writes: items (a set), ownTools and range (studs from where the farm started; nil for anywhere)
 function M.new(cfg)
     local brain = {}
-    local node = nil
-    local skipped, failures = {}, {}
+    local node, anchor = nil, nil
+    local skipped, failures, strikes = {}, {}, {}
+    local streak, busyFor = 0, 0
 
     function brain.begin()
-        node, skipped, failures = nil, {}, {}
+        node, anchor = nil, nil
+        skipped, failures, strikes = {}, {}, {}
+        streak, busyFor = 0, 0
     end
 
     local function codeName(Professions, code)
@@ -43927,6 +45254,12 @@ function M.new(cfg)
         for name, value in pairs(errors) do
             if value == code then return name end
         end
+        return nil
+    end
+
+    local function range()
+        local value = tonumber(cfg.range)
+        if value and value > 0 then return value end
         return nil
     end
 
@@ -43940,8 +45273,14 @@ function M.new(cfg)
         for name, on in pairs(cfg.items) do
             if on then wanted[name] = true end
         end
+        local limit = range()
         for _, kind in ipairs(KINDS) do
-            local filter = { kind = kind, items = wanted, available = true, origin = here, maxDistance = SEARCH, limit = 8 }
+            local filter = { kind = kind, items = wanted, available = true }
+            if limit and anchor then
+                filter.origin, filter.maxDistance = anchor, limit
+            else
+                filter.origin, filter.maxDistance = here, SEARCH
+            end
             local usable = true
             if cfg.ownTools then
                 local okPower, power = Professions.toolPower(kind)
@@ -43957,8 +45296,8 @@ function M.new(cfg)
                     for _, entry in ipairs(list) do
                         local skipUntil = skipped[entry.record]
                         if not skipUntil or skipUntil < now then
+                            entry.distance = distance(here, entry.position)
                             if not best or entry.distance < best.distance then best = entry end
-                            break
                         end
                     end
                 end
@@ -43967,13 +45306,52 @@ function M.new(cfg)
         return best
     end
 
+    -- set aside for SKIP_FOR, doubling each time the same node is set aside again
+    local function setAside(entry)
+        local count = (strikes[entry.record] or 0) + 1
+        strikes[entry.record] = count
+        skipped[entry.record] = os.clock() + math.min(SKIP_FOR * 2 ^ (count - 1), SKIP_MAX)
+        failures[entry.record] = nil
+    end
+
     local function fail(entry)
         failures[entry.record] = (failures[entry.record] or 0) + 1
-        if failures[entry.record] >= FAILS then
-            skipped[entry.record] = os.clock() + SKIP_FOR
-            failures[entry.record] = nil
-        end
+        if failures[entry.record] >= FAILS then setAside(entry) end
+        streak = streak + 1
+        busyFor = 0
         node = nil
+    end
+
+    -- the node's own prompt decides when the character is close enough; before it streams in, the plain distance does
+    local function inReach(Professions, entry, here)
+        local ok, _, prompt = Professions.nodeModel(entry)
+        if ok and typeof(prompt) == "Instance" then
+            local at = promptPosition(prompt)
+            if at then return distance(here, at) <= prompt.MaxActivationDistance end
+        end
+        return distance(here, entry.position) <= REACH
+    end
+
+    -- just past the node's edge once its model has streamed in, else the widest reach
+    local function approach(Professions, entry)
+        local ok, model = Professions.nodeModel(entry)
+        if ok and typeof(model) == "Instance" then
+            local okBox, _, size = pcall(model.GetBoundingBox, model)
+            if okBox and typeof(size) == "Vector3" then
+                return math.clamp(math.max(size.X, size.Z) / 2 + EDGE, MIN_REACH, REACH)
+            end
+        end
+        return REACH
+    end
+
+    local function goHome(kit, why)
+        local home, here = kit.home() or anchor, kit.position()
+        if home and here and distance(home, here) > HOME_FAR then
+            kit.status(why)
+            kit.travel(home, { reach = 20 })
+            return true
+        end
+        return false
     end
 
     function brain.step(kit)
@@ -43989,17 +45367,23 @@ function M.new(cfg)
             kit.sleep(1)
             return
         end
+        if not anchor then anchor = kit.position() end
         if node and not cfg.items[node.item] then node = nil end
+        if streak >= STREAK_HOME then
+            streak = 0
+            node = nil
+            if goHome(kit, "Nothing worked here, so heading back to where you were gathering.") then return end
+        end
         if not node then
             node = pick(kit, Professions)
             if not node then
-                local home, here = kit.home(), kit.position()
-                if home and here and distance(home, here) > HOME_FAR then
-                    kit.status("Heading back to where you were gathering.")
-                    kit.travel(home, { reach = 20 })
-                    return
+                if goHome(kit, "Heading back to where you were gathering.") then return end
+                local limit = range()
+                if limit then
+                    kit.status(("No %s ready within %d studs. Waiting for one to grow back."):format(describe(items), limit))
+                else
+                    kit.status(("No %s ready nearby. Waiting for one to grow back."):format(describe(items)))
                 end
-                kit.status(("No %s ready nearby. Waiting for one to grow back."):format(describe(items)))
                 kit.sleep(WAIT)
                 return
             end
@@ -44007,16 +45391,37 @@ function M.new(cfg)
 
         local here = kit.position()
         if not here then return end
-        local gap = distance(here, node.position)
-        if gap > REACH + 1 then
+        node.trips = node.trips or 0
+        if node.trips < TRIPS and not inReach(Professions, node, here) then
+            local gap = distance(here, node.position)
             kit.status(("Flying to %s (%d studs away)."):format(node.item, math.floor(gap)))
-            local ok, why = kit.travel(node.position, { reach = REACH })
-            if not ok and why ~= "stopped" then fail(node) end
+            node.trips = node.trips + 1
+            local ok, why = kit.travel(node.position, { reach = approach(Professions, node) })
+            if not ok and why ~= "stopped" then
+                -- a trip that gave up beside the rock may still have left it in reach
+                local after = kit.position()
+                if after and inReach(Professions, node, after) then return end
+                if not node.viaOpen and type(kit.openGround) == "function" then
+                    node.viaOpen = true
+                    local open = kit.openGround(node.position)
+                    if open then
+                        kit.status(("Finding a way in to %s."):format(node.item))
+                        local okAir = kit.travel(open + Vector3.new(0, OPEN_ABOVE, 0), { reach = REACH, air = true })
+                        if okAir then
+                            kit.land()
+                            node.trips = 0
+                            return
+                        end
+                    end
+                end
+                fail(node)
+            end
             return
         end
         if kit.flying() then
             kit.status("Landing to gather.")
             kit.land()
+            node.trips = TRIPS
             return
         end
         kit.setHome(node.position)
@@ -44029,23 +45434,798 @@ function M.new(cfg)
                     if type(count) == "number" and count > 0 then kit.addItem(item, count) end
                 end
             end
-            failures[node.record] = nil
+            failures[node.record], strikes[node.record] = nil, nil
+            streak, busyFor = 0, 0
             node = nil
             return
         end
         local why = codeName(Professions, result)
         if why == "BUSY" then
-            kit.sleep(0.5)
+            -- a minigame the game never closed (its window shut under it) would answer busy for good
+            busyFor = busyFor + BUSY_PAUSE
+            if busyFor >= BUSY_LIMIT then
+                pcall(Professions.cancel)
+                fail(node)
+                return
+            end
+            kit.sleep(BUSY_PAUSE)
         elseif why == "NONE" then
             -- an emptied node the registry still lists would be picked again straight away
-            skipped[node.record] = os.clock() + SKIP_FOR
-            failures[node.record] = nil
+            setAside(node)
             node = nil
         else
             -- a node with no prompt from right beside it counts as a miss too, or the farm stands on it for good
             fail(node)
             kit.sleep(0.5)
         end
+    end
+
+    return brain
+end
+
+return M
+
+end)
+__bundle_register("Features/Clover/Farm/Missions", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- bird mission farm brain: the Guild's missions through the Mission Bird (BirdClient.lua): summons the bird, asks for a mission of the rank you pick (the best your level and mission rank allow by default), flies to the marker the server sends, fights everything around it with the mob farm's fighting until the server reports the result, then goes again while you have mission tokens (QueueData.lua:518-544; one every 7 minutes, 4 at most)
+local Services = require("Services")
+local Jobs     = require("Utility/Jobs")
+local Mobs     = require("Features/Clover/Farm/Mobs")
+
+local M = {}
+
+M.BEST = "Best I Can Take"
+
+-- BirdClient.lua:278-283: the server sets BirdSpawned once the bird comes; a request the server never matches is cancelled and asked again after QUEUE_WAIT
+local SUMMON_WAIT = 5
+local ASK_TIMEOUT = 10
+local QUEUE_WAIT = 300
+-- the marker is reached to this close, and everything hostile this close to it is the mission's
+local MARK_REACH = 30
+local FIGHT_RADIUS = 250
+-- the results screen holds for a moment before the next request (BirdClient.lua:440-475)
+local RESULT_PAUSE = 4
+-- Basic.lua:15-16
+local TOKEN_EVERY = 420
+local WAIT = 1
+
+local function distance(a, b)
+    return (a - b).Magnitude
+end
+
+local function minutes(seconds)
+    seconds = math.max(0, math.floor(seconds))
+    return ("%d:%02d"):format(seconds // 60, seconds % 60)
+end
+
+-- ReplicatedStorage.Modules.QueueData: pure data, the ranks in order F, E, D, C, B
+local function queueData()
+    local modules = Services.ReplicatedStorage:FindFirstChild("Modules")
+    local instance = modules and modules:FindFirstChild("QueueData")
+    if not instance then return nil end
+    local ok, data = pcall(require, instance)
+    if ok and type(data) == "table" and type(data.Ranks) == "table" then return data end
+    return nil
+end
+
+function M.rankNames()
+    local data = queueData()
+    local out = { M.BEST }
+    if data then
+        for _, rank in ipairs(data.Ranks) do
+            if type(rank.index) == "string" then out[#out + 1] = rank.index end
+        end
+    end
+    return out
+end
+
+-- cfg is the live settings table the menu writes: rank (a rank letter or BEST); shared.mob is the mob farm's settings, so missions fight the same way
+function M.new(cfg, shared)
+    local brain = {}
+    local mobCfg = setmetatable({ names = {}, proper = true, stayPut = true }, { __index = shared.mob })
+    local fighter = Mobs.new(mobCfg)
+    local mission = { mark = nil, name = nil, results = nil, askedAt = nil }
+    local wired = false
+
+    function brain.begin()
+        mission = { mark = nil, name = nil, results = nil, askedAt = nil }
+        wired = false
+        fighter.begin()
+    end
+
+    local function folder()
+        local player = Services.Players.LocalPlayer
+        return player and player:FindFirstChild("PlayerFolder") or nil
+    end
+
+    local function stat(name)
+        local f = folder()
+        return f and f:GetAttribute(name) or nil
+    end
+
+    -- the server drives a mission over three packets (BirdClient.lua:353-487); each is heard for as long as the farm runs
+    local function wire(kit)
+        if wired then return end
+        local net = kit.api("CloverNet")
+        if not net then return end
+        wired = true
+        local function hear(name, fn)
+            local ok, handle = net.listen("Systems", name, fn)
+            if ok then kit.track(handle) end
+        end
+        hear("MissionClient", function(data)
+            if type(data) ~= "table" then return end
+            if data.Action == "MarkMission" and typeof(data.Pos) == "CFrame" then
+                mission.mark = data.Pos.Position
+            end
+        end)
+        hear("ShowDetails", function(data)
+            if type(data) == "table" then mission.name = data.Mission end
+        end)
+        hear("ShowResults", function(data)
+            mission.results = type(data) == "table" and data or {}
+        end)
+    end
+
+    -- the best rank this character may take (QueueData.CanDoMission), F only while it is still the first rank (BirdClient.lua:110-118)
+    local function pickRank(data)
+        local level, rank = tonumber(stat("Level")) or 0, tonumber(stat("MissionRank")) or 1
+        local wanted = cfg.rank
+        local best = nil
+        for index, def in ipairs(data.Ranks) do
+            local req = type(def.requirements) == "table" and def.requirements or {}
+            local allowed = (tonumber(req.level) or 0) <= level and (tonumber(req.rank) or 0) <= rank
+            if index == 1 and rank ~= 1 then allowed = false end
+            if allowed then
+                if wanted == def.index then return index, def end
+                best = { index, def }
+            end
+        end
+        if wanted ~= nil and wanted ~= M.BEST then return nil end
+        if best then return best[1], best[2] end
+        return nil
+    end
+
+    local function waitFor(kit, test, seconds)
+        local limit = os.clock() + seconds
+        while os.clock() < limit do
+            if test() then return true end
+            if not kit.sleep(0.25) then return false end
+        end
+        return test()
+    end
+
+    local function fight(kit)
+        local here = kit.position()
+        if not here then return end
+        if distance(here, mission.mark) > MARK_REACH + FIGHT_RADIUS * 0.5 then
+            kit.status(("Flying to your mission (%d studs away)."):format(math.floor(distance(here, mission.mark))))
+            kit.travel(mission.mark, { reach = MARK_REACH })
+            return
+        end
+        local World = kit.api("World")
+        local names, any = {}, false
+        if World then
+            local ok, mobs = World.mobs({ alive = true, origin = mission.mark, maxDistance = FIGHT_RADIUS })
+            if ok and type(mobs) == "table" then
+                for _, mob in ipairs(mobs) do
+                    names[mob.name] = true
+                    any = true
+                end
+            end
+        end
+        mobCfg.names = names
+        if not any then
+            kit.status("Waiting for the mission's enemies to show up.")
+            kit.sleep(WAIT)
+            return
+        end
+        kit.setHome(mission.mark)
+        fighter.step(kit)
+    end
+
+    function brain.step(kit)
+        wire(kit)
+        if stat("MissionsUnlocked") ~= true then
+            kit.status("Missions aren't unlocked on this character yet.")
+            kit.sleep(5)
+            return
+        end
+        if mission.results then
+            local result = mission.results
+            mission.results, mission.mark, mission.name, mission.askedAt = nil, nil, nil, nil
+            if result.status then
+                kit.add("missions")
+                kit.status(("Mission done: %s XP."):format(tostring(result.xp or 0)))
+            else
+                kit.status("The mission failed. Asking for another.")
+            end
+            kit.sleep(RESULT_PAUSE)
+            return
+        end
+        if mission.mark then return fight(kit) end
+
+        local player = Services.Players.LocalPlayer
+        local queued = player and player:GetAttribute("QueuingMission")
+        if queued or (mission.askedAt and os.clock() - mission.askedAt < QUEUE_WAIT) then
+            local since = mission.askedAt and os.clock() - mission.askedAt or 0
+            kit.status(("Waiting for a mission (%s)."):format(minutes(since)))
+            kit.sleep(WAIT)
+            return
+        end
+
+        local net, data = kit.api("CloverNet"), queueData()
+        if not (net and data) then
+            kit.status("Missions aren't ready yet.")
+            kit.sleep(WAIT)
+            return
+        end
+        local index, def = pickRank(data)
+        if not index then
+            kit.status("You can't take that mission rank yet.")
+            kit.sleep(5)
+            return
+        end
+        if def.TicketRequired and (tonumber(stat("MissionTickets")) or 0) < 1 then
+            local started = tonumber(stat("TicketRegenStart")) or 0
+            local State = kit.api("State")
+            local okNow, now = false, nil
+            if State then okNow, now = State.serverTime() end
+            local left = (okNow and type(now) == "number" and started > 0) and (started + TOKEN_EVERY - now) or TOKEN_EVERY
+            kit.status(("Out of mission tokens. The next one comes in %s."):format(minutes(left)))
+            kit.sleep(5)
+            return
+        end
+        if not (player and player:GetAttribute("BirdSpawned")) then
+            kit.status("Calling the Mission Bird.")
+            net.send("Systems", "Summon", { Action = "Summon" })
+            if not waitFor(kit, function() return player:GetAttribute("BirdSpawned") == true end, SUMMON_WAIT) then
+                kit.status("The Mission Bird didn't come. Trying again soon.")
+                kit.sleep(10)
+                return
+            end
+        end
+        kit.status(("Asking for a rank %s mission."):format(tostring(def.index)))
+        local ok = net.invoke("Systems", "RequestMission", { Action = "Request", Rank = index }, ASK_TIMEOUT)
+        mission.askedAt = ok and os.clock() or nil
+        if not ok then kit.sleep(5) end
+    end
+
+    -- a queued request is cancelled and the bird sent off, the way the bird's own buttons do (BirdClient.lua:274-286)
+    function brain.stop()
+        local net = nil
+        local ctxNet = shared.net
+        if type(ctxNet) == "function" then net = ctxNet() end
+        if not net then return end
+        local player = Services.Players.LocalPlayer
+        if player and player:GetAttribute("QueuingMission") then
+            -- leak:allow — one cancel that answers or times out within ASK_TIMEOUT
+            Jobs.spawn(function() net.invoke("Systems", "RequestMission", { Action = "Cancel" }, ASK_TIMEOUT) end, { name = "Missions.cancel" })
+        end
+        if player and player:GetAttribute("BirdSpawned") then net.send("Systems", "Summon", { Action = "Close" }) end
+    end
+
+    return brain
+end
+
+return M
+
+end)
+__bundle_register("Features/Clover/Farm/Mobs", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- mob farm brain: picks the mob of the chosen kinds it can best take (near, alone, already hurt) and stays on it until it dies, flies over on the broom and lands beside it to fight on foot (the game refuses swings and casts on a broom); with parrying on it fights around the parry: no swing is started that a strike due from the parry api would catch mid-swing (a swinging character's parry is refused), heavies go into the windows the mob's own state attributes say it cannot strike in (stunned, or CantStrike after its attack) and right after a parry lands, lights fill the rest; it watches every frame after a hit for the moment the mob is handed over to finish it with the instakill; without parrying it blocks between swings instead; it never backs off, however low its health
+local M = {}
+
+local SEARCH      = 2500
+-- further than this it flies; a flight lands this far short of the mob so the landing never ends on top of it
+local FIGHT_RANGE = 30
+local APPROACH    = 12
+-- swings registered from up to about 9 studs live (6.2 seen landing on a wolf); it swings from this far, so a mob shuffling about is not chased after every hit, and chases to this close
+local MELEE       = 8
+local CHASE_REACH = 4
+-- live 2026-10-24 (a level 6 with gauntlets on a wolf): a held block soaked every hit for 12 s but one, a block break with its 1.2 s stun
+local GUARD_EVERY = 2
+local GUARD_TIME  = 0.9
+local WAIT_GUARD  = 0.15
+-- the frames after a swing the server is likeliest to hand the mob over in
+local LAND_TIME   = 0.35
+-- in instakill mode a mob gone this soon after the first instakill on it was the instakill's doing; slower, it was worn down
+local EXECUTE_CREDIT = 1
+-- a mob it hasn't hurt in this long (out of reach, or shrugging every hit off) is left alone for a while; a long fight that is still landing hits goes on (live 2026-10-24: a 90 s cap on the whole fight walked away from Holda at 22%, and she healed)
+local TARGET_TIME = 40
+local SKIP_FOR    = 30
+-- the trip failures that mean a mob can't be reached from here
+local UNREACHABLE = { ["movement/no_path"] = true, ["movement/timed_out"] = true, ["movement/blocked"] = true }
+-- picking: each other mob this close to a candidate counts against it as this many studs, and a hurt one is worth this much nearer
+local CROWD_GAP   = 25
+local CROWD_COST  = 60
+local HURT_BONUS  = 80
+local HOME_FAR    = 300
+-- StateManager.displayTags.lua: the state the heavy attack leaves while it recharges
+local HEAVY_COOLDOWN = "HeavyAttackCooldown"
+-- the parry api parries what the mobs wind up within this range; the mob is open for a moment after a parry lands, so the guard drops and every swing goes in
+local PARRY_RANGE = 30
+local PUNISH_TIME = 1
+-- how long a swing keeps the character busy (live 2026-10-24: a light held State_Attacking 0.57 s; a heavy is slower), so one is only started with that long left before a strike, plus a margin
+local SWING_TIME   = { light = 0.6, heavy = 0.95 }
+-- how long a cast keeps the character busy (live 2026-10-24: Scorching Barrage held its state for several seconds of hits)
+local SKILL_TIME   = 2
+-- spells reach from here, so one is thrown before closing in (live 2026-10-25: a magic power 39 mage left its spell unused through a 70 s Raven Blackwood fight it lost on punches)
+local SPELL_RANGE  = 40
+local STRIKE_SLACK = 0.12
+local HOLD_POLL    = 0.03
+
+local function distance(a, b)
+    return (a - b).Magnitude
+end
+
+local function healthAlive(mob)
+    local ok, living = pcall(function()
+        return mob.model.Parent ~= nil and mob.humanoid.Parent ~= nil and mob.root.Parent ~= nil and mob.humanoid.Health > 0
+    end)
+    return ok and living
+end
+
+local function rootOf(mob)
+    local ok, position = pcall(function() return mob.root.Position end)
+    if ok then return position end
+    return nil
+end
+
+-- how long the mob cannot strike for, off the attributes it carries (live 2026-10-24 on a wolf: State_Stunned 0.75 s after our hit, State_CantStrike 3 s after it finishes an attack, each with a StateEnd_ server-time stamp)
+local function freeFor(mob, now)
+    if not now then return 0 end
+    local ok, free = pcall(function()
+        local model = mob.model
+        local out = 0
+        for _, name in ipairs({ "Stunned", "CantStrike" }) do
+            local until_ = model:GetAttribute("StateEnd_" .. name)
+            if model:GetAttribute("State_" .. name) == true and type(until_) == "number" then out = math.max(out, until_ - now) end
+        end
+        return out
+    end)
+    if ok then return free end
+    return 0
+end
+
+-- the mob is winding up or throwing an attack (live 2026-10-24: every hit a Dire Wolf landed came in its SkillActive with HyperArmor, which our hits don't interrupt, most while we were mid-combo or channelling a spell, when no parry or block can be pressed)
+local function attacking(mob)
+    local ok, on = pcall(function()
+        local model = mob.model
+        return model:GetAttribute("State_SkillActive") == true or model:GetAttribute("State_Swinging") == true
+    end)
+    return ok and on
+end
+
+local function healthShare(mob)
+    local ok, share = pcall(function() return mob.humanoid.Health / math.max(mob.humanoid.MaxHealth, 1) end)
+    if ok then return share end
+    return 1
+end
+
+local function chosenList(names)
+    local out = {}
+    for name, on in pairs(names) do
+        if on then out[#out + 1] = name end
+    end
+    table.sort(out)
+    return out
+end
+
+local function describe(list)
+    if #list == 1 then return list[1] end
+    return list[1] .. " or " .. list[2]
+end
+
+-- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry, dodge (roll through specials), plus locked() for the premium gate, and the boss farm's proper (names that take no "a" or "the") and stayPut (no flying home when nothing's about)
+function M.new(cfg)
+    local function called(name, article)
+        if cfg.proper then return name end
+        if article == "a" and name:match("^[AEIOUaeiou]") then article = "an" end
+        return article .. " " .. name
+    end
+
+    -- parrying and the instakill are premium: the gate only no-ops a locked toggle's callback, so the on-by-default ones are checked here too
+    local function unlocked()
+        return not (type(cfg.locked) == "function" and cfg.locked())
+    end
+    local function parryOn() return cfg.parry == true and unlocked() end
+    local function instakillOn() return cfg.instakill == true and unlocked() end
+    local function instakillMode() return cfg.instakillMode == true and unlocked() end
+
+    -- mobs our own instakill zeroed here, and when it first was: their health reads 0 on this client whether or not the server took it
+    local zeroed = setmetatable({}, { __mode = "k" })
+
+    -- in instakill mode a mob lives until its instance leaves the world (the user, 2026-10-24: judge it by the instance, not by health), so one zeroed here is fought on until it is really gone
+    local function alive(mob)
+        if not instakillMode() then return healthAlive(mob) end
+        local ok, present = pcall(function() return mob.model.Parent ~= nil and mob.root.Parent ~= nil end)
+        if not ok or not present then return false end
+        if zeroed[mob.model] then return true end
+        return healthAlive(mob)
+    end
+
+    local brain = {}
+    local target = nil
+    local skipped = {}
+    local guarding = false
+    -- the special the current mob is winding up, and every special's wind-up as measured so far
+    local punishUntil = 0
+
+    function brain.begin()
+        target, skipped, guarding, punishUntil = nil, {}, false, 0
+        brain.aimed, brain.wired, brain.parryToken = false, false, nil
+    end
+
+    function brain.target()
+        return target and target.mob or nil
+    end
+
+    local function has(kit, state)
+        local State = kit.api("State")
+        if not State then return false end
+        local ok, on = State.has(state)
+        return ok and on == true
+    end
+
+    local function serverNow(kit)
+        local State = kit.api("State")
+        if not State then return nil end
+        local ok, now = State.serverTime()
+        if ok and type(now) == "number" then return now end
+        return nil
+    end
+
+    -- the soonest strike the parry api expects, in seconds, or nil
+    local function strikeIn(kit)
+        if not parryOn() then return nil end
+        local Parry = kit.api("Parry")
+        if not Parry then return nil end
+        local ok, due = Parry.incoming()
+        if ok and type(due) == "table" then return due.strikeIn end
+        return nil
+    end
+
+    local function canSwing(kit)
+        local State = kit.api("State")
+        if not State then return false end
+        local ok, can = State.can("combat")
+        return ok and can == true
+    end
+
+    local function guard(kit, on)
+        if guarding == on then return end
+        local Combat = kit.api("Combat")
+        if not Combat then return end
+        if Combat.block(on) == true or not on then guarding = on end
+    end
+
+    -- the nearest is not always the best: a mob with others round it brings them along, and a hurt one is nearly done
+    local function pick(kit, names)
+        local World = kit.api("World")
+        local here = kit.position()
+        if not (World and here) then return nil end
+        local living = true
+        if instakillMode() then living = nil end
+        local ok, list = World.mobs({ names = names, alive = living, origin = here, maxDistance = SEARCH, limit = 20 })
+        if not ok or type(list) ~= "table" then return nil end
+        if instakillMode() then
+            local kept = {}
+            for _, entry in ipairs(list) do
+                if entry.alive or zeroed[entry.model] then kept[#kept + 1] = entry end
+            end
+            list = kept
+        end
+        local okAll, everyone = World.mobs({ alive = true, origin = here, maxDistance = SEARCH, limit = 80 })
+        if not okAll or type(everyone) ~= "table" then everyone = list end
+        local now = os.clock()
+        local best, bestScore = nil, math.huge
+        for _, entry in ipairs(list) do
+            local skipUntil = skipped[entry.model]
+            if not skipUntil or skipUntil < now then
+                local crowd = 0
+                for _, other in ipairs(everyone) do
+                    if other.model ~= entry.model and distance(other.position, entry.position) <= CROWD_GAP then crowd = crowd + 1 end
+                end
+                local score = entry.distance + crowd * CROWD_COST - (1 - healthShare(entry)) * HURT_BONUS
+                if score < bestScore then best, bestScore = entry, score end
+            end
+        end
+        return best
+    end
+
+    local function skip(mob)
+        skipped[mob.model] = os.clock() + SKIP_FOR
+        target = nil
+    end
+
+    -- a mob that died while we were on it counts as ours
+    local function settle(kit)
+        if target and not alive(target.mob) then
+            if target.fought then
+                kit.add("kills")
+                local first = zeroed[target.mob.model]
+                if instakillMode() and type(first) == "number" and os.clock() - first <= EXECUTE_CREDIT then kit.add("executes") end
+            end
+            target = nil
+        end
+    end
+
+    -- the instakill, every frame it is in reach: in instakill mode tried whatever ownership says and judged later by the instance leaving; otherwise only on a mob the server has handed over, judged at once
+    local function tryExecute(kit, Combat, mob)
+        if instakillMode() then
+            if Combat.execute(mob.model, { force = true }) == true and not zeroed[mob.model] then zeroed[mob.model] = os.clock() end
+            return false
+        end
+        if instakillOn() and Combat.execute(mob.model) == true and not alive(mob) then
+            kit.add("executes")
+            return true
+        end
+        return false
+    end
+
+    local function aim(kit, Combat)
+        if brain.aimed then return end
+        local ok = Combat.setAim(function()
+            local current = target and target.mob
+            local position = current and rootOf(current)
+            if position then return position, current.root end
+            return nil
+        end)
+        if ok == true then
+            brain.aimed = true
+            kit.aiming(true)
+        end
+    end
+
+    local function castReady(kit, Combat)
+        local ok, skills = Combat.skills()
+        if not ok or type(skills) ~= "table" then return false end
+        for _, skill in ipairs(skills) do
+            if skill.ready then
+                aim(kit, Combat)
+                if Combat.cast(skill.name) == true then return true end
+            end
+        end
+        return false
+    end
+
+    -- the parry api runs while the farm fights and the player wants parries, and every landed parry opens the mob up
+    local function syncParry(kit)
+        local Parry = kit.api("Parry")
+        if not Parry then return end
+        if parryOn() and not brain.parryToken then
+            local ok, token = Parry.request("Mob Farm", { range = PARRY_RANGE, block = cfg.block ~= false, dodge = cfg.dodge ~= false })
+            if not ok then return end
+            brain.parryToken, brain.parryDodge = token, cfg.dodge ~= false
+            kit.track({ Disconnect = function()
+                if brain.parryToken == token then
+                    Parry.release(token)
+                    brain.parryToken = nil
+                end
+            end })
+        elseif not parryOn() and brain.parryToken then
+            Parry.release(brain.parryToken)
+            brain.parryToken = nil
+        elseif brain.parryToken and brain.parryDodge ~= (cfg.dodge ~= false) then
+            brain.parryDodge = cfg.dodge ~= false
+            Parry.adjust(brain.parryToken, { dodge = brain.parryDodge })
+        end
+    end
+
+    local function wire(kit)
+        syncParry(kit)
+        if brain.wired then return end
+        brain.wired = true
+        local Parry = kit.api("Parry")
+        if Parry then
+            kit.track(Parry.onParry.Connect(function()
+                punishUntil = os.clock() + PUNISH_TIME
+                kit.add("parries")
+            end))
+        end
+    end
+
+    -- the frames right after a hit, when the server is likeliest to hand the mob over, are watched one by one
+    local function watchLanding(kit, Combat, mob)
+        local untilAt = os.clock() + LAND_TIME
+        while os.clock() < untilAt do
+            if not alive(mob) then return end
+            if tryExecute(kit, Combat, mob) then return end
+            if not kit.sleep(0) then return end
+        end
+    end
+
+    local function fight(kit, mob, gap)
+        local Combat = kit.api("Combat")
+        if not Combat then
+            kit.status("Combat isn't ready yet.")
+            kit.sleep(1)
+            return
+        end
+        local okWeapon, weapon = Combat.weapon()
+        if not okWeapon then
+            kit.status("You don't have a weapon to fight with.")
+            kit.sleep(2)
+            return
+        end
+        if not weapon.equipped then
+            guard(kit, false)
+            kit.status("Drawing your weapon.")
+            Combat.equipWeapon()
+            return
+        end
+        if gap > MELEE then
+            guard(kit, false)
+            local due = strikeIn(kit)
+            if cfg.skills and gap <= SPELL_RANGE and (due == nil or due - STRIKE_SLACK >= SKILL_TIME) then
+                local at = rootOf(mob)
+                if at then kit.face(at) end
+                if castReady(kit, Combat) then
+                    target.fought = true
+                    kit.status(("Casting at %s."):format(called(mob.name, "the")))
+                    watchLanding(kit, Combat, mob)
+                    return
+                end
+            end
+            kit.status(("Closing in on %s."):format(called(mob.name, "the")))
+            kit.travel(function() return rootOf(mob) end, { reach = CHASE_REACH, broom = false, watch = function() return not alive(mob) end })
+            return
+        end
+        local at = rootOf(mob)
+        if at then kit.face(at) end
+        target.fought = true
+        if instakillMode() then
+            kit.status(("Fighting %s, instakilling it until it's gone."):format(called(mob.name, "a")))
+        else
+            kit.status(("Fighting %s (%d%% health left)."):format(called(mob.name, "a"), math.floor(healthShare(mob) * 100)))
+        end
+        if tryExecute(kit, Combat, mob) then return end
+
+        -- right after a parry the mob is open: no guard, every swing in
+        local punishing = os.clock() < punishUntil
+        if punishing then target.swings = 0 end
+
+        -- with parrying on, the parry api owns the defence: nothing is started that a strike due before it finishes would catch
+        if parryOn() then
+            guard(kit, false)
+            local due = strikeIn(kit)
+            if due and due < SWING_TIME.light + STRIKE_SLACK then
+                kit.status(("Waiting to parry %s."):format(called(mob.name, "the")))
+                kit.sleep(HOLD_POLL)
+                return
+            end
+            if not canSwing(kit) then
+                kit.sleep(HOLD_POLL)
+                return
+            end
+            -- room for a heavy: a window the mob cannot strike in, a parry just landed, or the next strike far enough off
+            local free = freeFor(mob, serverNow(kit))
+            if punishing then free = math.max(free, SWING_TIME.heavy) end
+            -- an attack under way is never swung into: the parry api's block or parry is all that answers it
+            if attacking(mob) and free <= 0 then
+                kit.status(("Waiting out %s's attack."):format(mob.name))
+                kit.sleep(HOLD_POLL)
+                return
+            end
+            local room = math.huge
+            if due then room = due - STRIKE_SLACK end
+            local heavyFits = free >= SWING_TIME.heavy and room >= SWING_TIME.heavy
+            local swung = false
+            -- a spell channels for seconds with no parry or block, so it goes in when no strike is due before it ends, or into a window the mob can't strike in
+            if cfg.skills and (free >= SKILL_TIME or punishing or room >= SKILL_TIME) then swung = castReady(kit, Combat) end
+            if not swung and cfg.heavy and heavyFits and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
+            if not swung then swung = Combat.attack("light") == true end
+            if swung then
+                target.swings = (target.swings or 0) + 1
+                watchLanding(kit, Combat, mob)
+            else
+                kit.sleep(HOLD_POLL)
+            end
+            return
+        end
+
+        -- a short guard every couple of swings, so its next hit lands on the block
+        if cfg.block and not punishing and (target.swings or 0) >= GUARD_EVERY then
+            guard(kit, true)
+            local untilAt = os.clock() + GUARD_TIME
+            while os.clock() < untilAt and alive(mob) do
+                local now = rootOf(mob)
+                if now then kit.face(now) end
+                if not kit.sleep(0.1) then return end
+            end
+            target.swings = 0
+            return
+        end
+
+        -- the game would refuse a swing now (mid swing, debounce, stunned): block it out instead of wasting the press
+        if not canSwing(kit) then
+            if cfg.block and not punishing then guard(kit, true) end
+            kit.sleep(WAIT_GUARD)
+            return
+        end
+        guard(kit, false)
+
+        local swung = false
+        if cfg.skills then swung = castReady(kit, Combat) end
+        if not swung and cfg.heavy and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
+        if not swung then swung = Combat.attack("light") == true end
+        if swung then
+            target.swings = (target.swings or 0) + 1
+            watchLanding(kit, Combat, mob)
+        else
+            kit.sleep(WAIT_GUARD)
+        end
+    end
+
+    function brain.step(kit)
+        wire(kit)
+        local names = chosenList(cfg.names)
+        if #names == 0 then
+            guard(kit, false)
+            kit.status("Pick the monsters to farm.")
+            kit.sleep(1)
+            return
+        end
+        settle(kit)
+
+        if target and not cfg.names[target.mob.name] and not cfg.names[target.mob.baseName] then target = nil end
+        if not target then
+            guard(kit, false)
+            local entry = pick(kit, names)
+            if not entry then
+                local home, here = kit.home(), kit.position()
+                -- the boss farm picks its own next spot, so it never flies back to the last fight (live 2026-10-25: twice 1,500 studs back to Raven's den after Holda's house had no way in)
+                if home and here and not cfg.stayPut and distance(home, here) > HOME_FAR then
+                    kit.status("Heading back to where you were farming.")
+                    kit.travel(home, { reach = 20 })
+                    return
+                end
+                if #names > 2 then
+                    kit.status("None of the monsters you picked are around. Waiting for one to show up.")
+                else
+                    kit.status(("No %s around. Waiting for one to show up."):format(describe(names)))
+                end
+                kit.sleep(1.5)
+                return
+            end
+            target = { mob = entry, since = os.clock(), swings = 0 }
+        end
+
+        local mob = target.mob
+        local share = healthShare(mob)
+        if not target.share or share < target.share - 0.005 then target.share, target.since = share, os.clock() end
+        if os.clock() - target.since > TARGET_TIME then
+            guard(kit, false)
+            return skip(mob)
+        end
+        local here, at = kit.position(), rootOf(mob)
+        if not (here and at) then
+            settle(kit)
+            return
+        end
+        local gap = distance(here, at)
+        if gap > FIGHT_RANGE then
+            -- the clock on hurting it only runs within reach (live 2026-10-25: a death and the flight back used up its 40 s, and a full-health Raven Blackwood was benched on arrival)
+            target.since = os.clock()
+            guard(kit, false)
+            kit.status(("Flying to %s (%d studs away)."):format(called(mob.name, "a"), math.floor(gap)))
+            local ok, why = kit.travel(function() return rootOf(mob) end, { reach = APPROACH, watch = function() return not alive(mob) end })
+            -- only a route that can't be had leaves the mob for a while; a respawn, a server teleport or a death mid-flight is just tried again (live 2026-10-24: a boss left alone for 30 s over a trip begun while the character loaded)
+            if not ok and UNREACHABLE[why] then
+                local after, now = kit.position(), rootOf(mob)
+                if after and now and distance(after, now) > FIGHT_RANGE then skip(mob) end
+            end
+            return
+        end
+        kit.setHome(at)
+        if kit.flying() then
+            guard(kit, false)
+            kit.status("Landing to fight.")
+            kit.land()
+            return
+        end
+        fight(kit, mob, gap)
+        settle(kit)
     end
 
     return brain
@@ -44620,531 +46800,9 @@ end
 return M
 
 end)
-__bundle_register("Features/Clover/Farm/Mobs", function(require, _LOADED, __bundle_register, __bundle_modules)
--- mob farm brain: picks the mob of the chosen kinds it can best take (near, alone, already hurt) and stays on it until it dies, flies over on the broom and lands beside it to fight on foot (the game refuses swings and casts on a broom); with parrying on it fights around the parry: no swing is started that a strike due from the parry api would catch mid-swing (a swinging character's parry is refused), heavies go into the windows the mob's own state attributes say it cannot strike in (stunned, or CantStrike after its attack) and right after a parry lands, lights fill the rest; it watches every frame after a hit for the moment the mob is handed over to finish it with the instakill; without parrying it blocks between swings instead; it never backs off, however low its health
-local M = {}
-
-local SEARCH      = 2500
--- further than this it flies; a flight lands this far short of the mob so the landing never ends on top of it
-local FIGHT_RANGE = 30
-local APPROACH    = 12
--- swings registered from up to about 9 studs live (6.2 seen landing on a wolf); it swings from this far, so a mob shuffling about is not chased after every hit, and chases to this close
-local MELEE       = 8
-local CHASE_REACH = 4
--- live 2026-10-24 (a level 6 with gauntlets on a wolf): a held block soaked every hit for 12 s but one, a block break with its 1.2 s stun
-local GUARD_EVERY = 2
-local GUARD_TIME  = 0.9
-local WAIT_GUARD  = 0.15
--- the frames after a swing the server is likeliest to hand the mob over in
-local LAND_TIME   = 0.35
--- in instakill mode a mob gone this soon after the first instakill on it was the instakill's doing; slower, it was worn down
-local EXECUTE_CREDIT = 1
--- a mob it hasn't hurt in this long (out of reach, or shrugging every hit off) is left alone for a while; a long fight that is still landing hits goes on (live 2026-10-24: a 90 s cap on the whole fight walked away from Holda at 22%, and she healed)
-local TARGET_TIME = 40
-local SKIP_FOR    = 30
--- the trip failures that mean a mob can't be reached from here
-local UNREACHABLE = { ["movement/no_path"] = true, ["movement/timed_out"] = true, ["movement/blocked"] = true }
--- picking: each other mob this close to a candidate counts against it as this many studs, and a hurt one is worth this much nearer
-local CROWD_GAP   = 25
-local CROWD_COST  = 60
-local HURT_BONUS  = 80
-local HOME_FAR    = 300
--- StateManager.displayTags.lua: the state the heavy attack leaves while it recharges
-local HEAVY_COOLDOWN = "HeavyAttackCooldown"
--- the parry api parries what the mobs wind up within this range; the mob is open for a moment after a parry lands, so the guard drops and every swing goes in
-local PARRY_RANGE = 30
-local PUNISH_TIME = 1
--- how long a swing keeps the character busy (live 2026-10-24: a light held State_Attacking 0.57 s; a heavy is slower), so one is only started with that long left before a strike, plus a margin
-local SWING_TIME   = { light = 0.6, heavy = 0.95 }
--- how long a cast keeps the character busy (live 2026-10-24: Scorching Barrage held its state for several seconds of hits)
-local SKILL_TIME   = 2
--- spells reach from here, so one is thrown before closing in (live 2026-10-25: a magic power 39 mage left its spell unused through a 70 s Raven Blackwood fight it lost on punches)
-local SPELL_RANGE  = 40
-local STRIKE_SLACK = 0.12
-local HOLD_POLL    = 0.03
-
-local function distance(a, b)
-    return (a - b).Magnitude
-end
-
-local function healthAlive(mob)
-    local ok, living = pcall(function()
-        return mob.model.Parent ~= nil and mob.humanoid.Parent ~= nil and mob.root.Parent ~= nil and mob.humanoid.Health > 0
-    end)
-    return ok and living
-end
-
-local function rootOf(mob)
-    local ok, position = pcall(function() return mob.root.Position end)
-    if ok then return position end
-    return nil
-end
-
--- how long the mob cannot strike for, off the attributes it carries (live 2026-10-24 on a wolf: State_Stunned 0.75 s after our hit, State_CantStrike 3 s after it finishes an attack, each with a StateEnd_ server-time stamp)
-local function freeFor(mob, now)
-    if not now then return 0 end
-    local ok, free = pcall(function()
-        local model = mob.model
-        local out = 0
-        for _, name in ipairs({ "Stunned", "CantStrike" }) do
-            local until_ = model:GetAttribute("StateEnd_" .. name)
-            if model:GetAttribute("State_" .. name) == true and type(until_) == "number" then out = math.max(out, until_ - now) end
-        end
-        return out
-    end)
-    if ok then return free end
-    return 0
-end
-
--- the mob is winding up or throwing an attack (live 2026-10-24: every hit a Dire Wolf landed came in its SkillActive with HyperArmor, which our hits don't interrupt, most while we were mid-combo or channelling a spell, when no parry or block can be pressed)
-local function attacking(mob)
-    local ok, on = pcall(function()
-        local model = mob.model
-        return model:GetAttribute("State_SkillActive") == true or model:GetAttribute("State_Swinging") == true
-    end)
-    return ok and on
-end
-
-local function healthShare(mob)
-    local ok, share = pcall(function() return mob.humanoid.Health / math.max(mob.humanoid.MaxHealth, 1) end)
-    if ok then return share end
-    return 1
-end
-
-local function chosenList(names)
-    local out = {}
-    for name, on in pairs(names) do
-        if on then out[#out + 1] = name end
-    end
-    table.sort(out)
-    return out
-end
-
-local function describe(list)
-    if #list == 1 then return list[1] end
-    return list[1] .. " or " .. list[2]
-end
-
--- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry, dodge (roll through specials), plus locked() for the premium gate, and the boss farm's proper (names that take no "a" or "the") and stayPut (no flying home when nothing's about)
-function M.new(cfg)
-    local function called(name, article)
-        if cfg.proper then return name end
-        if article == "a" and name:match("^[AEIOUaeiou]") then article = "an" end
-        return article .. " " .. name
-    end
-
-    -- parrying and the instakill are premium: the gate only no-ops a locked toggle's callback, so the on-by-default ones are checked here too
-    local function unlocked()
-        return not (type(cfg.locked) == "function" and cfg.locked())
-    end
-    local function parryOn() return cfg.parry == true and unlocked() end
-    local function instakillOn() return cfg.instakill == true and unlocked() end
-    local function instakillMode() return cfg.instakillMode == true and unlocked() end
-
-    -- mobs our own instakill zeroed here, and when it first was: their health reads 0 on this client whether or not the server took it
-    local zeroed = setmetatable({}, { __mode = "k" })
-
-    -- in instakill mode a mob lives until its instance leaves the world (the user, 2026-10-24: judge it by the instance, not by health), so one zeroed here is fought on until it is really gone
-    local function alive(mob)
-        if not instakillMode() then return healthAlive(mob) end
-        local ok, present = pcall(function() return mob.model.Parent ~= nil and mob.root.Parent ~= nil end)
-        if not ok or not present then return false end
-        if zeroed[mob.model] then return true end
-        return healthAlive(mob)
-    end
-
-    local brain = {}
-    local target = nil
-    local skipped = {}
-    local guarding = false
-    -- the special the current mob is winding up, and every special's wind-up as measured so far
-    local punishUntil = 0
-
-    function brain.begin()
-        target, skipped, guarding, punishUntil = nil, {}, false, 0
-        brain.aimed, brain.wired, brain.parryToken = false, false, nil
-    end
-
-    function brain.target()
-        return target and target.mob or nil
-    end
-
-    local function has(kit, state)
-        local State = kit.api("State")
-        if not State then return false end
-        local ok, on = State.has(state)
-        return ok and on == true
-    end
-
-    local function serverNow(kit)
-        local State = kit.api("State")
-        if not State then return nil end
-        local ok, now = State.serverTime()
-        if ok and type(now) == "number" then return now end
-        return nil
-    end
-
-    -- the soonest strike the parry api expects, in seconds, or nil
-    local function strikeIn(kit)
-        if not parryOn() then return nil end
-        local Parry = kit.api("Parry")
-        if not Parry then return nil end
-        local ok, due = Parry.incoming()
-        if ok and type(due) == "table" then return due.strikeIn end
-        return nil
-    end
-
-    local function canSwing(kit)
-        local State = kit.api("State")
-        if not State then return false end
-        local ok, can = State.can("combat")
-        return ok and can == true
-    end
-
-    local function guard(kit, on)
-        if guarding == on then return end
-        local Combat = kit.api("Combat")
-        if not Combat then return end
-        if Combat.block(on) == true or not on then guarding = on end
-    end
-
-    -- the nearest is not always the best: a mob with others round it brings them along, and a hurt one is nearly done
-    local function pick(kit, names)
-        local World = kit.api("World")
-        local here = kit.position()
-        if not (World and here) then return nil end
-        local living = true
-        if instakillMode() then living = nil end
-        local ok, list = World.mobs({ names = names, alive = living, origin = here, maxDistance = SEARCH, limit = 20 })
-        if not ok or type(list) ~= "table" then return nil end
-        if instakillMode() then
-            local kept = {}
-            for _, entry in ipairs(list) do
-                if entry.alive or zeroed[entry.model] then kept[#kept + 1] = entry end
-            end
-            list = kept
-        end
-        local okAll, everyone = World.mobs({ alive = true, origin = here, maxDistance = SEARCH, limit = 80 })
-        if not okAll or type(everyone) ~= "table" then everyone = list end
-        local now = os.clock()
-        local best, bestScore = nil, math.huge
-        for _, entry in ipairs(list) do
-            local skipUntil = skipped[entry.model]
-            if not skipUntil or skipUntil < now then
-                local crowd = 0
-                for _, other in ipairs(everyone) do
-                    if other.model ~= entry.model and distance(other.position, entry.position) <= CROWD_GAP then crowd = crowd + 1 end
-                end
-                local score = entry.distance + crowd * CROWD_COST - (1 - healthShare(entry)) * HURT_BONUS
-                if score < bestScore then best, bestScore = entry, score end
-            end
-        end
-        return best
-    end
-
-    local function skip(mob)
-        skipped[mob.model] = os.clock() + SKIP_FOR
-        target = nil
-    end
-
-    -- a mob that died while we were on it counts as ours
-    local function settle(kit)
-        if target and not alive(target.mob) then
-            if target.fought then
-                kit.add("kills")
-                local first = zeroed[target.mob.model]
-                if instakillMode() and type(first) == "number" and os.clock() - first <= EXECUTE_CREDIT then kit.add("executes") end
-            end
-            target = nil
-        end
-    end
-
-    -- the instakill, every frame it is in reach: in instakill mode tried whatever ownership says and judged later by the instance leaving; otherwise only on a mob the server has handed over, judged at once
-    local function tryExecute(kit, Combat, mob)
-        if instakillMode() then
-            if Combat.execute(mob.model, { force = true }) == true and not zeroed[mob.model] then zeroed[mob.model] = os.clock() end
-            return false
-        end
-        if instakillOn() and Combat.execute(mob.model) == true and not alive(mob) then
-            kit.add("executes")
-            return true
-        end
-        return false
-    end
-
-    local function aim(kit, Combat)
-        if brain.aimed then return end
-        local ok = Combat.setAim(function()
-            local current = target and target.mob
-            local position = current and rootOf(current)
-            if position then return position, current.root end
-            return nil
-        end)
-        if ok == true then
-            brain.aimed = true
-            kit.aiming(true)
-        end
-    end
-
-    local function castReady(kit, Combat)
-        local ok, skills = Combat.skills()
-        if not ok or type(skills) ~= "table" then return false end
-        for _, skill in ipairs(skills) do
-            if skill.ready then
-                aim(kit, Combat)
-                if Combat.cast(skill.name) == true then return true end
-            end
-        end
-        return false
-    end
-
-    -- the parry api runs while the farm fights and the player wants parries, and every landed parry opens the mob up
-    local function syncParry(kit)
-        local Parry = kit.api("Parry")
-        if not Parry then return end
-        if parryOn() and not brain.parryToken then
-            local ok, token = Parry.request("Mob Farm", { range = PARRY_RANGE, block = cfg.block ~= false, dodge = cfg.dodge ~= false })
-            if not ok then return end
-            brain.parryToken, brain.parryDodge = token, cfg.dodge ~= false
-            kit.track({ Disconnect = function()
-                if brain.parryToken == token then
-                    Parry.release(token)
-                    brain.parryToken = nil
-                end
-            end })
-        elseif not parryOn() and brain.parryToken then
-            Parry.release(brain.parryToken)
-            brain.parryToken = nil
-        elseif brain.parryToken and brain.parryDodge ~= (cfg.dodge ~= false) then
-            brain.parryDodge = cfg.dodge ~= false
-            Parry.adjust(brain.parryToken, { dodge = brain.parryDodge })
-        end
-    end
-
-    local function wire(kit)
-        syncParry(kit)
-        if brain.wired then return end
-        brain.wired = true
-        local Parry = kit.api("Parry")
-        if Parry then
-            kit.track(Parry.onParry.Connect(function()
-                punishUntil = os.clock() + PUNISH_TIME
-                kit.add("parries")
-            end))
-        end
-    end
-
-    -- the frames right after a hit, when the server is likeliest to hand the mob over, are watched one by one
-    local function watchLanding(kit, Combat, mob)
-        local untilAt = os.clock() + LAND_TIME
-        while os.clock() < untilAt do
-            if not alive(mob) then return end
-            if tryExecute(kit, Combat, mob) then return end
-            if not kit.sleep(0) then return end
-        end
-    end
-
-    local function fight(kit, mob, gap)
-        local Combat = kit.api("Combat")
-        if not Combat then
-            kit.status("Combat isn't ready yet.")
-            kit.sleep(1)
-            return
-        end
-        local okWeapon, weapon = Combat.weapon()
-        if not okWeapon then
-            kit.status("You don't have a weapon to fight with.")
-            kit.sleep(2)
-            return
-        end
-        if not weapon.equipped then
-            guard(kit, false)
-            kit.status("Drawing your weapon.")
-            Combat.equipWeapon()
-            return
-        end
-        if gap > MELEE then
-            guard(kit, false)
-            local due = strikeIn(kit)
-            if cfg.skills and gap <= SPELL_RANGE and (due == nil or due - STRIKE_SLACK >= SKILL_TIME) then
-                local at = rootOf(mob)
-                if at then kit.face(at) end
-                if castReady(kit, Combat) then
-                    target.fought = true
-                    kit.status(("Casting at %s."):format(called(mob.name, "the")))
-                    watchLanding(kit, Combat, mob)
-                    return
-                end
-            end
-            kit.status(("Closing in on %s."):format(called(mob.name, "the")))
-            kit.travel(function() return rootOf(mob) end, { reach = CHASE_REACH, broom = false, watch = function() return not alive(mob) end })
-            return
-        end
-        local at = rootOf(mob)
-        if at then kit.face(at) end
-        target.fought = true
-        if instakillMode() then
-            kit.status(("Fighting %s, instakilling it until it's gone."):format(called(mob.name, "a")))
-        else
-            kit.status(("Fighting %s (%d%% health left)."):format(called(mob.name, "a"), math.floor(healthShare(mob) * 100)))
-        end
-        if tryExecute(kit, Combat, mob) then return end
-
-        -- right after a parry the mob is open: no guard, every swing in
-        local punishing = os.clock() < punishUntil
-        if punishing then target.swings = 0 end
-
-        -- with parrying on, the parry api owns the defence: nothing is started that a strike due before it finishes would catch
-        if parryOn() then
-            guard(kit, false)
-            local due = strikeIn(kit)
-            if due and due < SWING_TIME.light + STRIKE_SLACK then
-                kit.status(("Waiting to parry %s."):format(called(mob.name, "the")))
-                kit.sleep(HOLD_POLL)
-                return
-            end
-            if not canSwing(kit) then
-                kit.sleep(HOLD_POLL)
-                return
-            end
-            -- room for a heavy: a window the mob cannot strike in, a parry just landed, or the next strike far enough off
-            local free = freeFor(mob, serverNow(kit))
-            if punishing then free = math.max(free, SWING_TIME.heavy) end
-            -- an attack under way is never swung into: the parry api's block or parry is all that answers it
-            if attacking(mob) and free <= 0 then
-                kit.status(("Waiting out %s's attack."):format(mob.name))
-                kit.sleep(HOLD_POLL)
-                return
-            end
-            local room = math.huge
-            if due then room = due - STRIKE_SLACK end
-            local heavyFits = free >= SWING_TIME.heavy and room >= SWING_TIME.heavy
-            local swung = false
-            -- a spell channels for seconds with no parry or block, so it goes in when no strike is due before it ends, or into a window the mob can't strike in
-            if cfg.skills and (free >= SKILL_TIME or punishing or room >= SKILL_TIME) then swung = castReady(kit, Combat) end
-            if not swung and cfg.heavy and heavyFits and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
-            if not swung then swung = Combat.attack("light") == true end
-            if swung then
-                target.swings = (target.swings or 0) + 1
-                watchLanding(kit, Combat, mob)
-            else
-                kit.sleep(HOLD_POLL)
-            end
-            return
-        end
-
-        -- a short guard every couple of swings, so its next hit lands on the block
-        if cfg.block and not punishing and (target.swings or 0) >= GUARD_EVERY then
-            guard(kit, true)
-            local untilAt = os.clock() + GUARD_TIME
-            while os.clock() < untilAt and alive(mob) do
-                local now = rootOf(mob)
-                if now then kit.face(now) end
-                if not kit.sleep(0.1) then return end
-            end
-            target.swings = 0
-            return
-        end
-
-        -- the game would refuse a swing now (mid swing, debounce, stunned): block it out instead of wasting the press
-        if not canSwing(kit) then
-            if cfg.block and not punishing then guard(kit, true) end
-            kit.sleep(WAIT_GUARD)
-            return
-        end
-        guard(kit, false)
-
-        local swung = false
-        if cfg.skills then swung = castReady(kit, Combat) end
-        if not swung and cfg.heavy and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
-        if not swung then swung = Combat.attack("light") == true end
-        if swung then
-            target.swings = (target.swings or 0) + 1
-            watchLanding(kit, Combat, mob)
-        else
-            kit.sleep(WAIT_GUARD)
-        end
-    end
-
-    function brain.step(kit)
-        wire(kit)
-        local names = chosenList(cfg.names)
-        if #names == 0 then
-            guard(kit, false)
-            kit.status("Pick the monsters to farm.")
-            kit.sleep(1)
-            return
-        end
-        settle(kit)
-
-        if target and not cfg.names[target.mob.name] and not cfg.names[target.mob.baseName] then target = nil end
-        if not target then
-            guard(kit, false)
-            local entry = pick(kit, names)
-            if not entry then
-                local home, here = kit.home(), kit.position()
-                -- the boss farm picks its own next spot, so it never flies back to the last fight (live 2026-10-25: twice 1,500 studs back to Raven's den after Holda's house had no way in)
-                if home and here and not cfg.stayPut and distance(home, here) > HOME_FAR then
-                    kit.status("Heading back to where you were farming.")
-                    kit.travel(home, { reach = 20 })
-                    return
-                end
-                if #names > 2 then
-                    kit.status("None of the monsters you picked are around. Waiting for one to show up.")
-                else
-                    kit.status(("No %s around. Waiting for one to show up."):format(describe(names)))
-                end
-                kit.sleep(1.5)
-                return
-            end
-            target = { mob = entry, since = os.clock(), swings = 0 }
-        end
-
-        local mob = target.mob
-        local share = healthShare(mob)
-        if not target.share or share < target.share - 0.005 then target.share, target.since = share, os.clock() end
-        if os.clock() - target.since > TARGET_TIME then
-            guard(kit, false)
-            return skip(mob)
-        end
-        local here, at = kit.position(), rootOf(mob)
-        if not (here and at) then
-            settle(kit)
-            return
-        end
-        local gap = distance(here, at)
-        if gap > FIGHT_RANGE then
-            -- the clock on hurting it only runs within reach (live 2026-10-25: a death and the flight back used up its 40 s, and a full-health Raven Blackwood was benched on arrival)
-            target.since = os.clock()
-            guard(kit, false)
-            kit.status(("Flying to %s (%d studs away)."):format(called(mob.name, "a"), math.floor(gap)))
-            local ok, why = kit.travel(function() return rootOf(mob) end, { reach = APPROACH, watch = function() return not alive(mob) end })
-            -- only a route that can't be had leaves the mob for a while; a respawn, a server teleport or a death mid-flight is just tried again (live 2026-10-24: a boss left alone for 30 s over a trip begun while the character loaded)
-            if not ok and UNREACHABLE[why] then
-                local after, now = kit.position(), rootOf(mob)
-                if after and now and distance(after, now) > FIGHT_RANGE then skip(mob) end
-            end
-            return
-        end
-        kit.setHome(at)
-        if kit.flying() then
-            guard(kit, false)
-            kit.status("Landing to fight.")
-            kit.land()
-            return
-        end
-        fight(kit, mob, gap)
-        settle(kit)
-    end
-
-    return brain
-end
-
-return M
-
-end)
 __bundle_register("Features/Clover/Farm/Engine", function(require, _LOADED, __bundle_register, __bundle_modules)
--- farm engine: runs one farm at a time on its own job; it holds the mover's claim while the farm runs, hands the farm's brain a kit of guarded verbs (travel, land, face, wait), brings a fallen character back through the respawn api and goes back for the bag it dropped so the brain can head back to where it was farming, sells what the player picked every so often, and gives everything back the moment the farm stops
+-- farm engine: runs one farm at a time on its own job; it holds the mover's claim while the farm runs, hands the farm's brain a kit of guarded verbs (travel, land, face, wait), brings a fallen character back through the respawn api and goes back for the bag it dropped so the brain can head back to where it was farming, flies to the nearest merchant every so often to sell what the player picked and to a blacksmith to craft what has filled up, and gives everything back the moment the farm stops
+local Services  = require("Services")
 local Jobs      = require("Utility/Jobs")
 local Scheduler = require("Utility/Scheduler")
 
@@ -45156,16 +46814,33 @@ local FAULT_PAUSE  = 1
 local MAX_FAULTS   = 5
 -- deaths this close together stop the farm when the player asked for that, so it never feeds a character to the same mobs all night
 local DEATH_WINDOW = 300
--- auto sell runs this often while a farm runs; a death bag is looked for this close to where the game says it lies
-local SELL_EVERY = 60
+-- a death bag is looked for this close to where the game says it lies
 local BAG_SEARCH = 25
+-- open ground near a spot under a canopy: the nearest point within OPEN_SEARCH whose top surface (nothing over it) is within OPEN_HEIGHT of the spot's height, looked for in rings OPEN_STEP apart
+local OPEN_SEARCH = 160
+local OPEN_STEP = 15
+local OPEN_HEIGHT = 25
+local OPEN_FROM = 1200
+-- live 2026-11-02 the server stopped taking a sale from afar (SellEvent answers false) and takes one beside a merchant with no dialogue open; the merchants are ClientNPCS.Sell's, two of them found live, the others used once they stream in
+local MERCHANTS = {
+    { name = "Gracia", position = Vector3.new(-257, 87, 1958) },
+    { name = "Glowy",  position = Vector3.new(-19, 333, -3926) },
+    { name = "Aerion" },
+    { name = "Lance" },
+}
+local SELL_REACH = 8
+local SELL_TRIP_REACH = 5
+local SELL_EVERY = 600
+-- auto craft looks this often whether a picked recipe's materials have filled up (Items:GetMaxStock is 99 for materials, Basic.lua:38); the server only takes a craft beside a blacksmith (live 2026-11-02)
+local CRAFT_EVERY = 30
+local CRAFT_AT = 90
 
 local M = {}
 
 local function newStats()
     return {
         startedAt = nil, kills = 0, gathered = 0, deaths = 0, items = {}, executes = 0, parries = 0, races = 0, lastRace = nil,
-        quests = 0, lastQuest = nil, bosses = 0, lastBoss = nil, looted = 0, recovered = 0, sold = 0, marks = 0,
+        quests = 0, lastQuest = nil, bosses = 0, lastBoss = nil, looted = 0, recovered = 0, sold = 0, marks = 0, missions = 0, crafted = 0,
     }
 end
 
@@ -45350,6 +47025,24 @@ function M.new(deps)
             return handle
         end
 
+        -- live 2026-11-02: a crop under a giant mushroom cap was never reached from over the canopy (no_path, 4 s, not a stud moved) and was reached in 2 s by flying to open ground beside it, landing, and going in from there
+        function kit.openGround(position)
+            local params = RaycastParams.new()
+            params.RespectCanCollide = true
+            local root = kit.root()
+            params.FilterDescendantsInstances = root and { root.Parent } or {}
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            for radius = OPEN_STEP, OPEN_SEARCH, OPEN_STEP do
+                for degrees = 0, 330, 30 do
+                    local angle = math.rad(degrees)
+                    local x, z = position.X + math.cos(angle) * radius, position.Z + math.sin(angle) * radius
+                    local hit = Services.Workspace:Raycast(Vector3.new(x, position.Y + OPEN_FROM, z), Vector3.new(0, -(OPEN_FROM + OPEN_HEIGHT * 2), 0), params)
+                    if hit and math.abs(hit.Position.Y - position.Y) <= OPEN_HEIGHT then return hit.Position end
+                end
+            end
+            return nil
+        end
+
         function kit.land()
             return follow(function(Movement, args) return Movement.land(args) end, {})
         end
@@ -45465,12 +47158,12 @@ function M.new(deps)
         end
     end
 
-    -- what the player picked to sell goes every SELL_EVERY seconds, apart from anything a quest they have is collecting
-    local function sellPass(kit)
+    -- every stack of what the player picked to sell, apart from anything a quest they have is collecting
+    function engine.toSell()
         local Inventory = api("Inventory")
-        if not Inventory or type(settings.sellItems) ~= "table" or next(settings.sellItems) == nil then return end
+        if not Inventory or type(settings.sellItems) ~= "table" or next(settings.sellItems) == nil then return {} end
         local ok, list = Inventory.items()
-        if not ok or type(list) ~= "table" then return end
+        if not ok or type(list) ~= "table" then return {} end
         local keep = {}
         local Quests = api("Quests")
         if Quests then
@@ -45483,15 +47176,123 @@ function M.new(deps)
                 end
             end
         end
+        local out = {}
         for _, item in ipairs(list) do
-            if item.sellable and settings.sellItems[item.name] and not keep[item.name] and item.stock > 0 then
-                local okSell, earned = Inventory.sell(item.name, "SellAll")
-                if okSell then
-                    kit.add("sold", item.stock)
-                    if type(earned) == "number" and earned > 0 then kit.add("marks", earned) end
+            if item.sellable and settings.sellItems[item.name] and not keep[item.name] and item.stock > 0 then out[#out + 1] = item end
+        end
+        return out
+    end
+
+    -- the nearest merchant: a streamed one where it stands, else the spots found live
+    function engine.nearestMerchant(from)
+        local World = api("World")
+        local best, bestGap = nil, math.huge
+        for _, merchant in ipairs(MERCHANTS) do
+            local position = merchant.position
+            if World then
+                local ok, entry = World.npc(merchant.name)
+                if ok and type(entry) == "table" and typeof(entry.position) == "Vector3" then position = entry.position end
+            end
+            if position then
+                local gap = (position - from).Magnitude
+                if gap < bestGap then best, bestGap = { name = merchant.name, position = position }, gap end
+            end
+        end
+        return best, bestGap
+    end
+
+    -- each stack goes by its own key: several stacks share a name, and selling by name sold only the last one
+    function engine.sellAll(items, onSold)
+        local Inventory = api("Inventory")
+        if not Inventory then return 0 end
+        local sold = 0
+        for _, item in ipairs(items) do
+            local okSell, earned = Inventory.sell(item.key, "SellAll")
+            if okSell then
+                sold = sold + item.stock
+                if onSold then onSold(item.stock, earned) end
+            end
+        end
+        return sold
+    end
+
+    -- the picked recipes you can make whose materials have filled up: any one of them at the threshold or more
+    function engine.craftDue()
+        local Crafting = api("Crafting")
+        if not Crafting or type(settings.craftItems) ~= "table" or next(settings.craftItems) == nil then return {} end
+        local ok, list = Crafting.recipes()
+        if not ok or type(list) ~= "table" then return {} end
+        local at = tonumber(settings.craftAt) or CRAFT_AT
+        local out = {}
+        for _, recipe in ipairs(list) do
+            if settings.craftItems[recipe.key] and recipe.affordable > 0 then
+                for material in pairs(recipe.materials) do
+                    local okStock, have = Crafting.stock(material)
+                    if okStock and have >= at then
+                        out[#out + 1] = recipe
+                        break
+                    end
                 end
             end
         end
+        return out
+    end
+
+    local function nearestSmith(from)
+        local Crafting = api("Crafting")
+        if not Crafting then return nil end
+        local ok, list = Crafting.smiths()
+        if not ok or type(list) ~= "table" then return nil end
+        local best, bestGap = nil, math.huge
+        for _, smith in ipairs(list) do
+            local gap = (smith.position - from).Magnitude
+            if gap < bestGap then best, bestGap = smith, gap end
+        end
+        return best, bestGap
+    end
+
+    -- flies to the nearest blacksmith and makes as many of each filled-up recipe as you can afford
+    local function craftPass(kit)
+        local due = engine.craftDue()
+        if #due == 0 then return end
+        local here = kit.position()
+        if not here then return end
+        local smith, gap = nearestSmith(here)
+        if not smith then return end
+        if gap > SELL_REACH then
+            kit.status(("Flying to %s to craft."):format(smith.name))
+            local ok = kit.travel(smith.position, { reach = SELL_TRIP_REACH })
+            local after = kit.position()
+            if not ok or not after or (after - smith.position).Magnitude > SELL_REACH then return end
+        end
+        local Crafting = api("Crafting")
+        for _, recipe in ipairs(due) do
+            if kit.stopped() then return end
+            kit.status(("Crafting %s."):format(recipe.key))
+            local ok, made = Crafting.craft(recipe.key, recipe.affordable)
+            if ok and type(made) == "number" then kit.add("crafted", made) end
+        end
+    end
+
+    -- flies to the nearest merchant to sell, then the brain carries on from there and heads back to its farm
+    local function sellPass(kit)
+        local items = engine.toSell()
+        if #items == 0 then return end
+        local here = kit.position()
+        if not here then return end
+        local merchant, gap = engine.nearestMerchant(here)
+        if not merchant then return end
+        if gap > SELL_REACH then
+            kit.status(("Flying to %s to sell."):format(merchant.name))
+            local ok = kit.travel(merchant.position, { reach = SELL_TRIP_REACH })
+            local after = kit.position()
+            if not ok or not after or (after - merchant.position).Magnitude > SELL_REACH then return end
+        end
+        kit.status(("Selling to %s."):format(merchant.name))
+        engine.sellAll(items, function(count, earned)
+            kit.add("sold", count)
+            if type(earned) == "number" and earned > 0 then kit.add("marks", earned) end
+        end)
     end
 
     -- the brain's step does one piece of work (a fight, a trip, a gather) and returns; the loop around it handles death and faults
@@ -45511,9 +47312,14 @@ function M.new(deps)
                 if not kit.sleep(1) then return end
             else
                 if settings.autoSell and os.clock() >= (r.nextSell or 0) then
-                    r.nextSell = os.clock() + SELL_EVERY
+                    r.nextSell = os.clock() + (tonumber(settings.sellEvery) or SELL_EVERY)
                     local okSell, sellErr = pcall(sellPass, kit)
                     if not okSell and deps.warn then deps.warn("auto sell threw: %s", tostring(sellErr)) end
+                end
+                if settings.autoCraft and os.clock() >= (r.nextCraft or 0) then
+                    r.nextCraft = os.clock() + CRAFT_EVERY
+                    local okCraft, craftErr = pcall(craftPass, kit)
+                    if not okCraft and deps.warn then deps.warn("auto craft threw: %s", tostring(craftErr)) end
                 end
                 local ok, err = pcall(r.brain.step, kit)
                 if kit.stopped() then return end
@@ -45540,7 +47346,11 @@ function M.new(deps)
         if not Movement then return false, "no_movement" end
         local ok, token = Movement.claim(name)
         if not ok then return false, token end
-        local r = { name = name, brain = brain, token = token, deathTimes = {}, hooks = {}, status = "Starting..." }
+        -- the first sale waits a full interval, so switching a farm on never starts with a flight to a merchant
+        local r = {
+            name = name, brain = brain, token = token, deathTimes = {}, hooks = {}, status = "Starting...",
+            nextSell = os.clock() + (tonumber(settings.sellEvery) or SELL_EVERY),
+        }
         run = r
         if not engine.stats.startedAt then engine.stats.startedAt = os.clock() end
         if brain.begin then pcall(brain.begin) end
@@ -46385,9 +48195,11 @@ return {
     Gathering   = true,
     Instakill   = true,
     AutoParry   = true,
+    Weapon      = true,
     Movement    = true,
     PlayerUtils = true,
     CloverUtils = true,
+    Broom       = true,
     AutoStat    = true,
     Visuals     = true,
     Aimbot      = true,
