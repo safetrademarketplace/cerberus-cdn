@@ -16082,7 +16082,9 @@ return function(ctx)
 
     -- the game's own utilities head the right column, so they mount first
     if Config.CloverUtils then
-        CloverUtils(Host.at(ctx, ctx.Tabs.Player, "Right"))
+        local sub = Host.at(ctx, ctx.Tabs.Player, "Right")
+        sub.quickReset = ctx.Helpers.quickReset
+        CloverUtils(sub)
     end
     if Config.PlayerUtils then
         local sub = Host.at(ctx, ctx.Tabs.Player, "Right")
@@ -16296,8 +16298,9 @@ return function(ctx)
     local quickReset = ctx.quickReset
 
     UtilsGroup:AddButton({
-        Text = "Quick Reset",
-        Func = function()
+        Text    = "Quick Reset",
+        Tooltip = "Resets your character right away, without the game's 10 minute reset wait.",
+        Func    = function()
             if quickReset then quickReset() end
         end,
     })
@@ -17257,7 +17260,7 @@ end
 
 end)
 __bundle_register("Features/Clover/PlayerUtils", function(require, _LOADED, __bundle_register, __bundle_modules)
--- clover utils orchestrator: one box built through UI/Place holding the clover-only player toggles (no fall damage, no slowdown, anti knockback, no dash cooldown, no slide cooldown, air dash, noclip), so the tab file decides where it goes
+-- clover utils orchestrator: one box built through UI/Place holding the clover-only player toggles (no fall damage, no slowdown, anti knockback, no dash cooldown, no slide cooldown, air dash, noclip, reset if stuck under the map), so the tab file decides where it goes
 local Mount           = require("Utility/Mount")
 local Place           = require("UI/Place")
 local AirDash         = require("Features/Clover/PlayerUtils/AirDash")
@@ -17267,6 +17270,7 @@ local NoFallDamage    = require("Features/Clover/PlayerUtils/NoFallDamage")
 local Noclip          = require("Features/Clover/PlayerUtils/Noclip")
 local NoSlideCooldown = require("Features/Clover/PlayerUtils/NoSlideCooldown")
 local NoSlowdown      = require("Features/Clover/PlayerUtils/NoSlowdown")
+local Unstuck         = require("Features/Clover/PlayerUtils/Unstuck")
 
 return function(ctx)
     local O = Mount.orchestrator(ctx, "CloverUtils")
@@ -17275,7 +17279,7 @@ return function(ctx)
     -- every sub-module reads its box as ctx.CloverGroup; O.mount registers each returned cleanup with the unloader
     local box = Place.groupbox(ctx, "Clover Utils", "sparkles", { fallback = "Player", side = "Right" })
     if box then
-        local uCtx = O.subCtx({ CloverGroup = box })
+        local uCtx = O.subCtx({ CloverGroup = box, quickReset = ctx.quickReset })
         O.mount(NoFallDamage, uCtx)
         O.mount(NoSlowdown, uCtx)
         O.mount(AntiKnockback, uCtx)
@@ -17283,9 +17287,80 @@ return function(ctx)
         O.mount(NoSlideCooldown, uCtx)
         O.mount(AirDash, uCtx)
         O.mount(Noclip, uCtx)
+        O.mount(Unstuck, uCtx)
     end
 
     O.finalize()
+end
+
+end)
+__bundle_register("Features/Clover/PlayerUtils/Unstuck", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- stuck-under-the-map sub-module of clover utils: a character that has slipped through the map (nothing to stand on below, the map overhead, not on the broom and not getting anywhere) for a few seconds is reset at once, skipping the game's own 10 minute reset wait (live 2026-11-03: workspace.FallenPartsDestroyHeight is -50000 and nothing collidable lies under the map, so a fall never ends on its own)
+local Services  = require("Services")
+local Scheduler = require("Utility/Scheduler")
+
+local CHECK_EVERY = 1
+local STUCK_FOR = 5
+-- under the map reads as nothing within DOWN below and something within UP above (live: standing indoors reads floor and roof, flying over the sea reads void and sky)
+local DOWN, UP = 2000, 1000
+-- a trip across a covered chasm moves on; a body pinned or falling under the map barely drifts sideways
+local DRIFT = 60
+local AFTER_RESET = 15
+
+return function(ctx)
+    local References = ctx.References
+    local reset = ctx.quickReset
+    local on = true
+    local since, from, quietUntil = nil, nil, 0
+
+    local function stuckAt(root, char)
+        local params = RaycastParams.new()
+        params.RespectCanCollide = true
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { char }
+        local below = Services.Workspace:Raycast(root.Position, Vector3.new(0, -DOWN, 0), params)
+        if below then return false end
+        return Services.Workspace:Raycast(root.Position, Vector3.new(0, UP, 0), params) ~= nil
+    end
+
+    local function check()
+        if not on or type(reset) ~= "function" or os.clock() < quietUntil then return end
+        local char = References.character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        if not (root and humanoid) or humanoid.Health <= 0 or char:GetAttribute("Flying") or not stuckAt(root, char) then
+            since, from = nil, nil
+            return
+        end
+        local here = root.Position
+        if since == nil then
+            since, from = os.clock(), here
+            return
+        end
+        if Vector3.new(here.X - from.X, 0, here.Z - from.Z).Magnitude > DRIFT then
+            since, from = os.clock(), here
+            return
+        end
+        if os.clock() - since < STUCK_FOR then return end
+        since, from, quietUntil = nil, nil, os.clock() + AFTER_RESET
+        reset()
+    end
+
+    local watcher = Scheduler.heartbeat(check, { name = "CloverUnstuck", interval = CHECK_EVERY })
+
+    ctx.CloverGroup:AddToggle("CloverUnstuck", {
+        Text     = "Reset If Stuck Under Map",
+        Default  = true,
+        Tooltip  = "If you fall through the map and can't get out, your character is reset right away instead of waiting out the game's 10 minute reset timer.",
+        Callback = function(value) on = value == true end,
+    })
+
+    return {
+        cleanup = function()
+            on = false
+            watcher:Disconnect()
+        end,
+    }
 end
 
 end)
@@ -18696,7 +18771,7 @@ end
 
 end)
 __bundle_register("Features/Clover/AutoParry", function(require, _LOADED, __bundle_register, __bundle_modules)
--- auto parry box: switches the parry api on for any mob (and, picked, any player facing you) that attacks within the range you set, with a timing nudge, the roll and block fallbacks for a parry the game refuses, and a line of what it has parried and how many attacks it has learned
+-- auto parry box: switches the parry api on for any mob (and, picked, any player facing you) that attacks within the range you set, with a timing nudge, the override that holds back your own attacks and block so a due parry goes out, the roll and block fallbacks for a parry the game refuses, and a line of what it has parried and how many attacks it has learned
 local Log       = require("Utility/Log")
 local Mount     = require("Utility/Mount")
 local Scheduler = require("Utility/Scheduler")
@@ -18720,7 +18795,7 @@ return function(ctx)
     local box = Place.groupbox(ctx, "Auto Parry", "shield", { fallback = "Combat", side = "Left" })
     if not box then return end
 
-    local opts = { range = 30, roll = true, block = true, dodge = true }
+    local opts = { range = 30, roll = true, block = true, dodge = true, override = true }
     local token = nil
 
     local function switch(on)
@@ -18771,6 +18846,16 @@ return function(ctx)
         Suffix   = " ms",
         Tooltip  = "Parries this much earlier (above 0) or later (below 0) than it has learned. Leave it at 0 unless parries keep landing a touch early or late.",
         Callback = function(value) Parry.configure({ offset = (tonumber(value) or 0) / 1000 }) end,
+    })
+    depends:AddToggle("APOverride", {
+        Premium  = true,
+        Text     = "Parry Over My Input",
+        Default  = true,
+        Tooltip  = "Holds back your own attacks and block for a moment when a parry is coming, so the parry always goes out.",
+        Callback = function(on)
+            opts.override = on == true
+            adjust()
+        end,
     })
     depends:AddToggle("APPlayers", {
         Premium  = true,
@@ -18855,6 +18940,7 @@ __bundle_register("Features/Main/Instakill", function(require, _LOADED, __bundle
 local CoreServices = require("Services")
 local Executor     = require("Utility/Executor")
 local Mount        = require("Utility/Mount")
+local Ownership    = require("Utility/Ownership")
 local Scheduler    = require("Utility/Scheduler")
 local Place        = require("UI/Place")
 local Ui           = require("Features/Clover/Gathering/Ui")
@@ -18935,10 +19021,10 @@ return function(ctx)
         return h, r
     end
 
+    -- an executor that calls every loose body ours is not believed (Utility/Ownership), or a health write would only fool this client
     local function owned(part)
         if not isOwnerFn then return false end
-        local ok, value = pcall(isOwnerFn, part)
-        return ok and value == true
+        return Ownership.owns(part) == true
     end
 
     -- a kill is an enemy that left the world soon after a window; one still there has had its chance
@@ -19237,6 +19323,67 @@ return function(ctx)
 
     return {}
 end
+
+end)
+__bundle_register("Utility/Ownership", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- network ownership: the executor's isnetworkowner, trusted only while it answers false for a body that can't be ours, a mob or another player's character farther off than any simulation radius (live 2026-11-03 on MacSploit: true for every loose mob, bandits 1,656 studs away included, so the farm's instakill zeroed each target's health on this client only and the farm took it for dead and flew on to the next)
+local References = require("References")
+local Services   = require("Services")
+local Executor   = require("Utility/Executor")
+
+local FAR = 1000
+local RECHECK = 30
+local CONTROLS = { "FightableNPCS", "pCharacters" }
+
+local M = {}
+
+local verdict, checkedAt = nil, -math.huge
+
+local function ask(part)
+    local isOwner = Executor.get("isnetworkowner")
+    if type(isOwner) ~= "function" then return nil end
+    local ok, value = pcall(isOwner, part)
+    if not ok then return nil end
+    return value == true
+end
+
+-- a loose body farther than FAR from ours, which no honest answer can call ours
+local function control(here)
+    for _, folderName in ipairs(CONTROLS) do
+        local folder = Services.Workspace:FindFirstChild(folderName)
+        if folder then
+            for _, model in ipairs(folder:GetChildren()) do
+                local root = model:FindFirstChild("HumanoidRootPart")
+                if root and root:IsA("BasePart") and not root.Anchored and (root.Position - here).Magnitude > FAR then return root end
+            end
+        end
+    end
+    return nil
+end
+
+-- true while the executor's answer can be believed; with nothing far enough off to test it against, the last verdict stands
+function M.honest()
+    local now = os.clock()
+    if now - checkedAt < RECHECK and verdict ~= nil then return verdict end
+    local root = References.humanoidRootPart
+    if not root then return verdict == true end
+    local part = control(root.Position)
+    if not part then return verdict == true end
+    local answer = ask(part)
+    checkedAt = now
+    verdict = answer == false
+    return verdict
+end
+
+-- true when this client simulates part, false when it doesn't, nil when the executor can't be asked or can't be believed
+function M.owns(part)
+    local answer = ask(part)
+    if answer == nil then return nil end
+    if not M.honest() then return nil end
+    return answer
+end
+
+return M
 
 end)
 __bundle_register("Features/Combat/Aimbot", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -20814,6 +20961,8 @@ local LOADERS = {
     { name = "Slots",   load = function() return require("Api/Slots") end },
     -- races are flown by features through Movement; the api only talks to the race server
     { name = "Racing",  load = function() return require("Api/Racing") end },
+    -- the map's locations you have found and the sphinx riddles, through World and CloverNet
+    { name = "Exploration", load = function() return require("Api/Exploration") end },
     -- after Combat, whose parry, roll and block it presses, and World, whose mobs it watches
     { name = "Parry",   load = function() return require("Api/Parry") end },
     { name = "Attach",  load = function() return require("Api/Attach") end },
@@ -25973,6 +26122,16 @@ local LABEL_AFTER = 0.15
 local WATCH_EVERY = 0.4
 local WATCH_SLACK = 30
 local WATCH_LIMIT = 30
+-- an asker with override holds back the player's own attacks from this long before a press until its strike lands, so none starts under it (StateManager.lua:497-510: Attacking refuses a parry); their held block is held back too and lifted for the press, since a held block suppresses the parry
+local OVERRIDE_AHEAD = 0.7
+-- a swing of theirs already under way is feinted out of when the feint can finish first (live 2026-11-03: a feint 0.1 s into a light cleared Attacking 0.23 s later, MisdirectActive then held 0.55 s, and a parry pressed under it only began as it ended)
+local FEINT_TIME = 0.6
+local ATTACKING = "State_Attacking"
+local OVERRIDE_PACKETS = { "AttackInput", "MisdirectInput" }
+local FEINT_PACKET = "MisdirectInput"
+local BLOCK_PACKET, BLOCK_INPUT, END_BLOCK = "BlockInput", "Block Input", "End Block"
+-- the game's key handler sends Block Input every frame while the key is down (CombatClient.lua:90-108), so a send this recent means it is still held
+local USER_BLOCK_FRESH = 0.2
 -- other players' attacks are learned under this one kind; a swing only counts when the swinger faces us this squarely (cosine of ~60 degrees)
 local PLAYER_KIND = "Player"
 local PLAYER_FACING = 0.5
@@ -25998,7 +26157,7 @@ function M.new(ctx)
     local offset = 0
     local moves = {}
     local dirty, savedAt = false, os.clock()
-    local stats = { pressed = 0, parried = 0, rolled = 0, blocked = 0, hits = 0, guarded = 0, ignored = 0 }
+    local stats = { pressed = 0, parried = 0, rolled = 0, blocked = 0, hits = 0, guarded = 0, ignored = 0, held = 0, feinted = 0 }
     local watched, watchCount = {}, 0
     local threats = {}
     local history = {}
@@ -26010,6 +26169,11 @@ function M.new(ctx)
     local lastPress = -math.huge
     local health = { humanoid = nil, conn = nil, last = nil, char = nil, struckConn = nil }
     local parrySignal = base.signal()
+    -- the override: the gates on the player's own combat sends, until when they are held back, when their block key last sent, and whether a release of theirs was held back and is owed once the hold ends
+    local gateHandles = {}
+    local holdUntil = nil
+    local userBlockAt = -math.huge
+    local owedRelease = false
 
     local function apiOf(name)
         local found = ctx.Api and ctx.Api[name]
@@ -26155,11 +26319,12 @@ function M.new(ctx)
                 end
                 if fits then
                     if not merged then
-                        merged = { name = request.name, range = request.range, roll = request.roll, block = request.block, dodge = request.dodge }
+                        merged = { name = request.name, range = request.range, roll = request.roll, block = request.block, dodge = request.dodge, override = request.override }
                     else
                         merged.roll = merged.roll or request.roll
                         merged.block = merged.block or request.block
                         merged.dodge = merged.dodge or request.dodge
+                        merged.override = merged.override or request.override
                     end
                 end
             end
@@ -26171,6 +26336,105 @@ function M.new(ctx)
         local ok, value = pcall(function() return References.player:GetNetworkPing() end)
         if ok and finite(value) and value > 0 then return math.min(value, PING_CAP) end
         return 0
+    end
+
+    -- ===== the override: the player's own combat sends held back around a press =====
+
+    local function holding()
+        return holdUntil ~= nil and os.clock() < holdUntil
+    end
+
+    local function holdAttack()
+        if not holding() then return true end
+        stats.held = stats.held + 1
+        return false
+    end
+
+    local function holdBlock(data)
+        local action = type(data) == "table" and data.Action or nil
+        if action == BLOCK_INPUT then userBlockAt = os.clock() end
+        if not holding() then return true end
+        if action == END_BLOCK then owedRelease = true elseif action == BLOCK_INPUT then owedRelease = false end
+        return false
+    end
+
+    local function userBlocking()
+        return os.clock() - userBlockAt < USER_BLOCK_FRESH
+    end
+
+    local function wantsOverride()
+        for _, request in pairs(requests) do
+            if request.override then return true end
+        end
+        return false
+    end
+
+    local function ungate()
+        for _, handle in ipairs(gateHandles) do handle:Disconnect() end
+        gateHandles = {}
+        holdUntil = nil
+    end
+
+    -- the gates go up while the engine runs for an asker that wants the override, retried each watch tick until the packets have loaded
+    local function syncGates()
+        if not (running and wantsOverride()) then
+            if #gateHandles > 0 then ungate() end
+            return
+        end
+        if #gateHandles > 0 then return end
+        local CloverNet = apiOf("CloverNet")
+        if not (CloverNet and type(CloverNet.gate) == "function") then return end
+        local installed = {}
+        for _, name in ipairs(OVERRIDE_PACKETS) do
+            local ok, handle = CloverNet.gate("Combat", name, holdAttack)
+            if ok then installed[#installed + 1] = handle end
+        end
+        local okBlock, blockHandle = CloverNet.gate("Combat", BLOCK_PACKET, holdBlock)
+        if okBlock then installed[#installed + 1] = blockHandle end
+        if #installed < #OVERRIDE_PACKETS + 1 then
+            for _, handle in ipairs(installed) do handle:Disconnect() end
+            return
+        end
+        gateHandles = installed
+    end
+
+    -- the hold is worked out afresh each frame from the threats still to land; once it ends, a release the player made under it goes out, so a block they let go of is not left held on the server
+    local function settleHold(nextHold)
+        local was = holdUntil ~= nil
+        holdUntil = nextHold
+        if nextHold ~= nil or not was or not owedRelease then return end
+        owedRelease = false
+        local CloverNet = apiOf("CloverNet")
+        if CloverNet then CloverNet.send("Combat", BLOCK_PACKET, { Action = END_BLOCK }) end
+    end
+
+    -- until when one threat holds the player's own sends back, or nil: OVERRIDE_AHEAD before its press (at once for an attack nothing is known of) until its strike has landed
+    local function holdFor(threat, now, lag)
+        if not threat.request.override or threat.outcome ~= nil or now - threat.tell > THREAT_LIFE then return nil end
+        local delay, spread = timingOf(threat)
+        local due = threat.tell + delay
+        local dodging = threat.kind == "SkillActive" and threat.request.dodge and not threat.noDodge
+        if not known(threat) and not dodging then
+            if threat.learned then return nil end
+            return threat.tell + GUARD_LIMIT
+        end
+        if threat.learned and now >= due + BLOCK_HOLD then return nil end
+        local lead = lag + offset + OVERRIDE_AHEAD + (dodging and ROLL_LEAD or (spread + LEAD))
+        if now < due - lead then return nil end
+        return due + BLOCK_HOLD, due
+    end
+
+    -- a swing of the player's under way when a known strike's hold opens is feinted out of, once, while there is time for the feint to end before the press
+    local function feintFor(threat, now, lag, due)
+        if threat.feinted or not due or threat.pressed then return end
+        local char = character()
+        local okAttacking, attacking = pcall(function() return char and char:GetAttribute(ATTACKING) == true end)
+        if not (okAttacking and attacking) then return end
+        threat.feinted = true
+        local _, spread = timingOf(threat)
+        if due - spread - LEAD - offset - now < FEINT_TIME + lag then return end
+        local CloverNet = apiOf("CloverNet")
+        if CloverNet and CloverNet.send("Combat", FEINT_PACKET, { Action = true }) == true then stats.feinted = stats.feinted + 1 end
     end
 
     -- ===== tells =====
@@ -26378,7 +26642,7 @@ function M.new(ctx)
                 return
             end
         end
-        if Combat.parry({ window = PRESS_HOLD }) == true then
+        if Combat.parry({ window = PRESS_HOLD, letGo = threat.request.override == true and userBlocking() }) == true then
             sinceParry = now
             stats.pressed = stats.pressed + 1
             return
@@ -26444,6 +26708,15 @@ function M.new(ctx)
             if Combat then Combat.block(false) end
         end
         local lag = ping()
+        if #gateHandles > 0 then
+            local nextHold = nil
+            for _, threat in ipairs(threats) do
+                local ends, due = holdFor(threat, now, lag)
+                if ends and (nextHold == nil or ends > nextHold) then nextHold = ends end
+                if ends then feintFor(threat, now, lag, due) end
+            end
+            settleHold(nextHold)
+        end
         for i = #threats, 1, -1 do
             local threat = threats[i]
             if now - threat.tell > THREAT_LIFE then
@@ -26491,9 +26764,11 @@ function M.new(ctx)
         hooks[#hooks + 1] = Scheduler.heartbeat(function()
             bindHealth()
             refreshWatch()
+            syncGates()
         end, { name = "Parry.watch", interval = WATCH_EVERY })
         bindHealth()
         refreshWatch()
+        syncGates()
     end
 
     local function stop()
@@ -26506,6 +26781,12 @@ function M.new(ctx)
         if health.struckConn then health.struckConn:Disconnect() end
         health.humanoid, health.conn, health.last, health.char, health.struckConn = nil, nil, nil, nil, nil
         threats = {}
+        ungate()
+        if owedRelease then
+            owedRelease = false
+            local CloverNet = apiOf("CloverNet")
+            if CloverNet then CloverNet.send("Combat", BLOCK_PACKET, { Action = END_BLOCK }) end
+        end
         if blockUntil then
             blockUntil = nil
             local Combat = apiOf("Combat")
@@ -26542,10 +26823,14 @@ function M.new(ctx)
             if type(opts.players) ~= "boolean" then return nil end
             request.players = opts.players
         end
+        if opts.override ~= nil then
+            if type(opts.override) ~= "boolean" then return nil end
+            request.override = opts.override
+        end
         return request
     end
 
-    -- name says who asked; range in studs (30), roll and block as the fallbacks to a refused parry (both on), dodge to roll through specials instead of parrying them (off), filter(model) to narrow which mobs, players to parry other players' attacks too (off)
+    -- name says who asked; range in studs (30), roll and block as the fallbacks to a refused parry (both on), dodge to roll through specials instead of parrying them (off), filter(model) to narrow which mobs, players to parry other players' attacks too (off), override to hold back the player's own attacks and block around each press (off)
     expose("request", function(name, opts)
         if type(name) ~= "string" or name == "" then return false, Errors.BAD_ARGS end
         local request = readRequest(name, opts)
@@ -26554,23 +26839,25 @@ function M.new(ctx)
         local token = { id = tokens, name = name }
         requests[token] = request
         start()
+        syncGates()
         return true, token
     end)
 
     expose("adjust", function(token, opts)
         local request = requests[token]
         if not request then return false, Errors.NO_TOKEN end
-        if not readRequest(request.name, opts, { name = request.name, range = request.range, roll = request.roll, block = request.block, dodge = request.dodge, filter = request.filter, players = request.players }) then
+        if not readRequest(request.name, opts, { name = request.name, range = request.range, roll = request.roll, block = request.block, dodge = request.dodge, filter = request.filter, players = request.players, override = request.override }) then
             return false, Errors.BAD_ARGS
         end
         readRequest(request.name, opts, request)
+        syncGates()
         return true
     end)
 
     expose("release", function(token)
         if not requests[token] then return false, Errors.NO_TOKEN end
         requests[token] = nil
-        if next(requests) == nil then stop() end
+        if next(requests) == nil then stop() else syncGates() end
         return true
     end)
 
@@ -26596,7 +26883,8 @@ function M.new(ctx)
         for _ in pairs(moves) do learned = learned + 1 end
         return true, {
             pressed = stats.pressed, parried = stats.parried, rolled = stats.rolled, blocked = stats.blocked, hits = stats.hits,
-            guarded = stats.guarded, ignored = stats.ignored, watching = watchCount, learned = learned,
+            guarded = stats.guarded, ignored = stats.ignored, held = stats.held, feinted = stats.feinted, watching = watchCount, learned = learned,
+            overriding = holding(),
         }
     end)
 
@@ -26671,6 +26959,165 @@ return {
     NOT_READY = "parry/not_ready",
     BAD_ARGS  = "parry/bad_args",
     NO_TOKEN  = "parry/no_token",
+}
+
+end)
+__bundle_register("Api/Exploration", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- exploration api: the map's significant locations and which of them the server has you down as having found, read and reported the way MapService.lua:873-990 and LocationClient.lua:381-395 do (DiscoverMap "Locations" lists them, "AddLocation" reports the zone you stand in, DiscoverMap.Client confirms a new one with how much of the map you have found); shared as ctx.Api.Exploration
+local Api    = require("Api")
+local Errors = require("Api/Exploration/Errors")
+
+local DISCOVER, CONFIRMED = "DiscoverMap", "DiscoverMap/Client"
+-- the server's list is asked for again this often at most, and a report waits this long for its answer
+local REFRESH_EVERY = 30
+local ANSWER_WAIT = 8
+
+local M = {}
+
+-- MapService.lua:873-887: the profile comes back keyed by name or as a list of names
+local function readProfile(result)
+    local out = {}
+    if type(result) ~= "table" then return out end
+    for key, value in pairs(result) do
+        if type(key) == "string" and value then
+            out[key] = true
+        elseif type(value) == "string" then
+            out[value] = true
+        end
+    end
+    return out
+end
+
+function M.new(ctx)
+    local base = Api.define("Exploration", ctx)
+    local api = { Errors = Errors }
+    local closed = false
+    local found = nil
+    local fetchedAt = -math.huge
+    local share = nil
+    local hook = nil
+    local confirmSignal = base.signal()
+
+    local function apiOf(name)
+        local value = ctx.Api and ctx.Api[name]
+        if type(value) == "table" then return value end
+        return nil
+    end
+
+    local function settle(label, ok, ...)
+        if ok then return ... end
+        base.warn("%s threw: %s", label, tostring((...)))
+        return false, Errors.NOT_READY
+    end
+
+    local function expose(name, fn)
+        local label = "Exploration." .. name
+        api[name] = function(...)
+            if closed then return false, Errors.NOT_READY end
+            return settle(label, pcall(fn, ...))
+        end
+    end
+
+    local function onConfirmed(name, percentage)
+        if type(name) ~= "string" then return end
+        if found then found[name] = true end
+        if type(percentage) == "number" then share = percentage end
+        confirmSignal:Fire(name, percentage)
+    end
+
+    local function ensure()
+        if hook then return true end
+        local net = apiOf("CloverNet")
+        if not net then return false end
+        local ok, handle = net.on(CONFIRMED, onConfirmed)
+        if not ok or not handle then return false end
+        hook = handle
+        if base.maid then base.maid:GiveTask(handle) end
+        return true
+    end
+
+    -- the names the server has you down as having found, asked for again once REFRESH_EVERY has passed or when forced
+    local function discovered(force)
+        ensure()
+        if found and not force and os.clock() - fetchedAt < REFRESH_EVERY then return found end
+        local net = apiOf("CloverNet")
+        if not net then return nil end
+        local ok, result = net.callWith(DISCOVER, { timeout = ANSWER_WAIT }, "Locations")
+        if not ok then return found end
+        found, fetchedAt = readProfile(result), os.clock()
+        return found
+    end
+
+    -- every significant location (a _Locations zone marked MapLocation) with whether it has been found
+    expose("locations", function(opts)
+        if opts ~= nil and type(opts) ~= "table" then return false, Errors.BAD_ARGS end
+        local World = apiOf("World")
+        if not World then return false, Errors.NOT_READY end
+        local okZones, zones = World.locations()
+        if not okZones or type(zones) ~= "table" then return false, Errors.NOT_READY end
+        local known = discovered(opts ~= nil and opts.refresh == true)
+        if not known then return false, Errors.NOT_READY end
+        local out = {}
+        for _, zone in ipairs(zones) do
+            if zone.mapLocation then
+                out[#out + 1] = {
+                    name = zone.name, displayName = zone.displayName, position = zone.position, size = zone.size,
+                    priority = zone.priority, noFlight = zone.noFlight, discovered = known[zone.name] == true,
+                }
+            end
+        end
+        return true, out
+    end)
+
+    -- found and total significant locations, and the share of the map the server last said you had found
+    expose("progress", function()
+        local ok, list = api.locations()
+        if not ok then return false, list end
+        local done = 0
+        for _, entry in ipairs(list) do
+            if entry.discovered then done = done + 1 end
+        end
+        return true, { found = done, total = #list, share = share }
+    end)
+
+    -- the report LocationClient sends as you enter a zone; true once the server has you down for it
+    expose("report", function(name)
+        if type(name) ~= "string" or name == "" then return false, Errors.BAD_ARGS end
+        ensure()
+        local net = apiOf("CloverNet")
+        if not net then return false, Errors.NOT_READY end
+        local ok = net.callWith(DISCOVER, { timeout = ANSWER_WAIT }, "AddLocation", name)
+        if not ok then return false, Errors.NO_ANSWER end
+        local known = discovered(true)
+        return true, known ~= nil and known[name] == true
+    end)
+
+    api.onDiscovered = {
+        Connect = function(_, fn)
+            if type(fn) ~= "function" or closed then return { Disconnect = function() end, Destroy = function() end } end
+            ensure()
+            local inner = confirmSignal:Connect(fn)
+            local function disconnect() inner:Disconnect() end
+            return { Disconnect = disconnect, Destroy = disconnect }
+        end,
+    }
+
+    if base.maid then base.maid:GiveTask(function() closed = true end) end
+
+    return api
+end
+
+return M
+
+end)
+__bundle_register("Api/Exploration/Errors", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- exploration errors: the string codes every exploration verb returns as its failure result
+
+return {
+    NOT_READY   = "explore/not_ready",
+    BAD_ARGS    = "explore/bad_args",
+    NO_ANSWER   = "explore/no_answer",
+    UNKNOWN     = "explore/unknown",
 }
 
 end)
@@ -31046,6 +31493,7 @@ local Services   = require("Services")
 local References = require("References")
 local Executor   = require("Utility/Executor")
 local Jobs       = require("Utility/Jobs")
+local Ownership  = require("Utility/Ownership")
 local Api        = require("Api")
 local Aim        = require("Api/Combat/Aim")
 local Errors     = require("Api/Combat/Errors")
@@ -31413,12 +31861,13 @@ function M.new(ctx)
             if not validWindow(opts.window) then return false, Errors.BAD_ARGS end
             window = opts.window
         end
+        local letGo = opts ~= nil and opts.letGo == true
         if guard.parrying() then return false, Errors.BUSY end
         local can, reason = read("can", "parry")
         if can == nil then return false, Errors.NOT_READY end
-        -- our own held block is let go first, so the game's Blocking refusal does not stand against this press
-        if not can and not (BLOCKING[reason] and guard.holding()) then return false, Errors.CANT_ACT, reason end
-        local ok, fatal = guard.tap(window)
+        -- our own held block is let go first, so the game's Blocking refusal does not stand against this press; letGo does the same for a block the player is holding
+        if not can and not (BLOCKING[reason] and (guard.holding() or letGo)) then return false, Errors.CANT_ACT, reason end
+        local ok, fatal = guard.tap(window, letGo)
         if ok then return true end
         if fatal then return false, Errors.NOT_READY end
         return false, Errors.SEND_FAILED
@@ -31622,10 +32071,10 @@ function M.new(ctx)
         if humanoid == nil or root == nil then return false, Errors.BAD_ARGS end
         if humanoid.Health <= 0 and not force then return true end
         if not force then
-            local isOwner = Executor.get("isnetworkowner")
-            if type(isOwner) ~= "function" then return false, Errors.NOT_READY end
-            local okOwn, owned = pcall(isOwner, root)
-            if not (okOwn and owned == true) then return false, Errors.NOT_OWNER end
+            -- an executor that calls every loose body ours can't be believed, or each target would only die on this client
+            local owned = Ownership.owns(root)
+            if owned == nil then return false, Errors.NOT_READY end
+            if not owned then return false, Errors.NOT_OWNER end
         end
         pcall(function() humanoid:TakeDamage(humanoid.MaxHealth * 10 + 1000) end)
         pcall(function() humanoid.Health = 0 end)
@@ -32093,12 +32542,18 @@ function M.new(deps)
         return true
     end
 
-    function guard.tap(window)
+    -- letGo also lifts a block held by the game's own key handler: the release goes out now and the fresh press from the next frame
+    function guard.tap(window, letGo)
         if closed then return false, true end
         local char = deps.character()
         if char == nil then return false, true end
-        if press == nil then return begin(char, window) end
-        finish(true)
+        if press == nil and not letGo then return begin(char, window) end
+        if press ~= nil then
+            finish(true)
+        else
+            local ok, fatal = deps.send(END_BLOCK)
+            if not ok then return false, fatal end
+        end
         press = { char = char, window = window, fresh = true }
         startBeat()
         return true
@@ -32419,6 +32874,31 @@ function M.new(ctx)
         return owner ~= nil and token ~= nil and rawequal(token, owner)
     end
 
+    -- a standing character's turn is only sent once it moves (live 2026-11-03 in Volleyball Legends 2, the same engine: the server swung along a facing 0.4 s old), so a big grounded turn holds a small upward speed a moment, never adding to it, which carries the turn out without lifting the character
+    local WAKE_TURN, WAKE_TIME, WAKE_SPEED = math.rad(20), 0.15, 1
+    local wake = { beat = nil, untilAt = 0, root = nil }
+    local function stopWake()
+        if wake.beat then wake.beat:Disconnect() end
+        wake.beat, wake.root = nil, nil
+    end
+    local function holdWake(root)
+        wake.untilAt, wake.root = os.clock() + WAKE_TIME, root
+        if wake.beat then return end
+        wake.beat = Scheduler.heartbeat(function()
+            local r = wake.root
+            local state = State()
+            local okRoot, current = false, nil
+            if state then okRoot, current = state.root() end
+            if not r or not okRoot or current ~= r or os.clock() >= wake.untilAt or active then
+                stopWake()
+                return
+            end
+            local v = r.AssemblyLinearVelocity
+            if v.Y < WAKE_SPEED then r.AssemblyLinearVelocity = Vector3.new(v.X, WAKE_SPEED, v.Z) end
+        end, { name = "Movement.faceWake" })
+    end
+    if base.maid then base.maid:GiveTask(stopWake) end
+
     local function dropIdle()
         local rig = idleRig
         idleRig = nil
@@ -32612,7 +33092,14 @@ function M.new(ctx)
         local here = root.Position
         local flat = Vector3.new(target.X, here.Y, target.Z)
         if Probe.distance(here, flat) < 0.05 then return true end
-        root.CFrame = CFrame.lookAt(here, flat)
+        local before = root.CFrame.LookVector
+        local after = CFrame.lookAt(here, flat)
+        root.CFrame = after
+        local okHum, humanoid = state.humanoid()
+        local grounded = okHum and humanoid and humanoid.FloorMaterial ~= Enum.Material.Air
+        local from, to = Vector3.new(before.X, 0, before.Z).Unit, Vector3.new(after.LookVector.X, 0, after.LookVector.Z).Unit
+        local turn = math.acos(math.clamp(from.X * to.X + from.Z * to.Z, -1, 1))
+        if grounded and turn > WAKE_TURN then holdWake(root) end
         return true
     end)
 
@@ -37933,7 +38420,8 @@ local function mobEntry(model, beasts)
     if root ~= nil then entry.position = root.Position end
     if humanoid ~= nil then
         entry.health, entry.maxHealth = humanoid.Health, humanoid.MaxHealth
-        entry.alive = entry.health > 0
+        -- a health of 0 written on this client never reaches the server, and a mob the server killed shows it in its replicated Dead state (live 2026-11-03: every wolf a lying isnetworkowner let the instakill zero read 0 health while it ran about)
+        entry.alive = entry.health > 0 or humanoid:GetState() ~= Enum.HumanoidStateType.Dead
     end
     return entry
 end
@@ -39232,7 +39720,7 @@ return {
 
 end)
 __bundle_register("Api/CloverNet", function(require, _LOADED, __bundle_register, __bundle_modules)
--- clovernet api: the fork's one way onto the network — packets and queries through the game's live ByteNetMax Packets module, loose remotes by path, a honeypot deny list, a per-second packet cap and restorable server-to-client callback wraps; shared as ctx.Api.CloverNet
+-- clovernet api: the fork's one way onto the network — packets and queries through the game's live ByteNetMax Packets module, loose remotes by path, a honeypot deny list, a per-second packet cap, restorable server-to-client callback wraps and gates that hold back the game's own sends of a packet while ours go through; shared as ctx.Api.CloverNet
 
 local Services = require("Services")
 local Executor = require("Utility/Executor")
@@ -39326,6 +39814,8 @@ local function fireRemote(remote, ...) remote:FireServer(...) end
 local function invokeRemote(remote, ...) return remote:InvokeServer(...) end
 local function disconnectConnection(conn) conn:Disconnect() end
 local function sendPacket(packet, data) packet.send(data) end
+local function setSend(packet, fn) packet.send = fn end
+local function readSend(packet) return packet.send end
 local function invokeQuery(query, data) return query.invoke(data) end
 local function listenPacket(packet, fn) packet.listen(fn) end
 local function packetListeners(packet) return packet.getListeners() end
@@ -39375,6 +39865,9 @@ function M.new(ctx)
     local packetsModule, remotesFolder, lastRequireError
     local found = setmetatable({}, { __mode = "v" })
     local wraps = {}
+    local gates = {}
+    -- true while one of our own sends is on the wire, so a gate in front of that packet lets it through
+    local ownSend = false
     local closed = false
 
     local sendCap, defaultTimeout = DEFAULT_SEND_CAP, DEFAULT_TIMEOUT
@@ -39384,7 +39877,7 @@ function M.new(ctx)
     local counters = {
         sends = 0, fires = 0, invokes = 0, calls = 0,
         refused = 0, denied = 0, failed = 0, timeouts = 0,
-        listeners = 0, connections = 0, wraps = 0,
+        listeners = 0, connections = 0, wraps = 0, gates = 0, gated = 0,
     }
 
     local function hold(item)
@@ -39568,7 +40061,9 @@ function M.new(ctx)
             counters.refused = counters.refused + 1
             return false, Errors.RATE_LIMITED
         end
+        ownSend = true
         local ok, sendErr = pcall(sendPacket, packet, data)
+        ownSend = false
         if not ok then
             counters.failed = counters.failed + 1
             base.warn("send %s.%s failed: %s", ns, name, tostring(sendErr))
@@ -39802,6 +40297,70 @@ function M.new(ctx)
 
         wraps[key] = handle
         counters.wraps = counters.wraps + 1
+        slot = hold(handle)
+        return true, handle
+    end
+
+    -- filter(data) answering false drops one of the game's own sends of that packet (CombatClient.lua:40-108 indexes packet.send at every call, so a field swap reaches them all); our own sends always go through, and a filter that throws lets the send through
+    function api.gate(ns, name, filter)
+        if type(filter) ~= "function" then return false, Errors.BAD_ARGS end
+        local packet, err = member("packets", ns, name)
+        if packet == nil then return false, err end
+        local key = ns .. "." .. name
+        local entry = gates[key]
+        if entry == nil then
+            local okRead, original = pcall(readSend, packet)
+            if not okRead or type(original) ~= "function" then return false, Errors.NO_ORIGINAL end
+            entry = { packet = packet, original = original, filters = {} }
+            function entry.gated(...)
+                if ownSend or closed then return entry.original(...) end
+                local data = ...
+                for _, fn in pairs(entry.filters) do
+                    local ok, pass = pcall(fn, data)
+                    if ok and pass == false then
+                        counters.gated = counters.gated + 1
+                        return nil
+                    end
+                end
+                return entry.original(...)
+            end
+            local okSet, setErr = pcall(setSend, packet, entry.gated)
+            if not okSet then
+                local setreadonly = Executor.get("setreadonly")
+                if type(setreadonly) == "function" then
+                    okSet, setErr = pcall(function()
+                        setreadonly(packet, false)
+                        setSend(packet, entry.gated)
+                    end)
+                end
+            end
+            if not okSet then
+                base.warn("gate %s install failed: %s", key, tostring(setErr))
+                return false, Errors.NO_CALLBACK_API, tostring(setErr)
+            end
+            gates[key] = entry
+        end
+
+        local handle = { active = true }
+        local slot
+        entry.filters[handle] = filter
+        counters.gates = counters.gates + 1
+
+        -- the original goes back once the last filter leaves, and only while ours is still the one installed
+        function handle.Disconnect()
+            if not handle.active then return end
+            handle.active = false
+            entry.filters[handle] = nil
+            counters.gates = counters.gates - 1
+            if next(entry.filters) == nil and gates[key] == entry then
+                gates[key] = nil
+                local okNow, current = pcall(readSend, entry.packet)
+                if okNow and current == entry.gated then base.safe("gate " .. key .. " restore", setSend, entry.packet, entry.original) end
+            end
+            release(slot, handle)
+        end
+        handle.Destroy = handle.Disconnect
+
         slot = hold(handle)
         return true, handle
     end
@@ -43419,11 +43978,13 @@ local Quests    = require("Features/Clover/Farm/Quests")
 local Races     = require("Features/Clover/Farm/Races")
 local Missions  = require("Features/Clover/Farm/Missions")
 local Reroll    = require("Features/Clover/Farm/Reroll")
+local Explore   = require("Features/Clover/Farm/Explore")
 
 local REFRESH_EVERY = 0.5
 local MOB_FARM, NODE_FARM, RACE_FARM, QUEST_FARM, BOSS_FARM = "Mob Farm", "Gathering Farm", "Broom Race Farm", "Quest Farm", "Boss Farm"
 local REROLL_FARM = "Magic Reroll"
 local MISSION_FARM = "Bird Missions"
+local EXPLORE_FARM = "Discover Areas"
 local NODE_RANGE = 750
 local SELL_MINUTES = 10
 local CRAFT_AT = 90
@@ -43498,6 +44059,7 @@ return function(ctx)
     local questCfg = { givers = {}, best = true }
     local bossCfg = { bosses = {}, loot = true }
     local missionCfg = { rank = Missions.BEST }
+    local exploreCfg = {}
     local rerollState = Store.read(REROLL_NS, REROLL_KEY, nil)
     if type(rerollState) ~= "table" then rerollState = {} end
     local rerollCfg = {
@@ -43516,12 +44078,13 @@ return function(ctx)
         [RACE_FARM]  = Races.new(raceCfg),
         [QUEST_FARM] = Quests.new(questCfg, { mob = mobCfg, node = nodeCfg, race = raceCfg }),
         [BOSS_FARM]  = Bosses.new(bossCfg, { mob = mobCfg }),
-        [REROLL_FARM] = Reroll.new(rerollCfg),
+        [REROLL_FARM] = Reroll.new(rerollCfg, { mob = mobCfg, nodeRange = NODE_RANGE }),
         [MISSION_FARM] = Missions.new(missionCfg, { mob = mobCfg, net = function() return Api.CloverNet end }),
+        [EXPLORE_FARM] = Explore.new(exploreCfg),
     }
     local toggleOf = {
         [MOB_FARM] = "FarmMobs", [NODE_FARM] = "FarmNodes", [RACE_FARM] = "FarmRaces", [QUEST_FARM] = "FarmQuests", [BOSS_FARM] = "FarmBosses",
-        [REROLL_FARM] = "FarmReroll", [MISSION_FARM] = "FarmMissions",
+        [REROLL_FARM] = "FarmReroll", [MISSION_FARM] = "FarmMissions", [EXPLORE_FARM] = "FarmExplore",
     }
     -- the quest picker shows "title (giver)", the farm wants the giver
     local giverOf = {}
@@ -43848,6 +44411,25 @@ return function(ctx)
         depends:SetupDependencies({ { Toggles.FarmMissions, true } })
     end
 
+    -- ===== exploration =====
+    local exploreBox = Place.groupbox(ctx, "Exploration", "compass", { fallback = "Farm", side = "Left" })
+    if exploreBox then
+        exploreBox:AddToggle("FarmExplore", {
+            Text     = EXPLORE_FARM,
+            Default  = false,
+            Tooltip  = "Flies to every place on the map you haven't discovered yet, nearest first, for the discovery XP.",
+            Callback = function(on) switch(EXPLORE_FARM, on == true) end,
+        }):AddKeyPicker("FarmExploreKey", { Default = "None", Mode = "Toggle", Text = EXPLORE_FARM, SyncToggleState = true })
+        local depends = exploreBox:AddDependencyBox()
+        labels[EXPLORE_FARM] = depends:AddLabel("Off", true)
+        depends:SetupDependencies({ { Toggles.FarmExplore, true } })
+    end
+    -- the area farm switches itself off once there is nothing left to find
+    exploreCfg.onDone = function(found, total)
+        Ui.notify(Library, ("Every place you can reach is discovered (%d of %d)."):format(found, total))
+        if Toggles.FarmExplore and Toggles.FarmExplore.Value then Ui.set(Toggles.FarmExplore, false) end
+    end
+
     -- ===== magic reroll =====
     local rerollBox = Place.groupbox(ctx, REROLL_FARM, "dices", { fallback = "Farm", side = "Left" })
     local rerollLine
@@ -43858,7 +44440,7 @@ return function(ctx)
         return table.concat(lines, "\n")
     end
     if rerollBox then
-        rerollBox:AddLabel("Takes a new character to level 15, gets its grimoire, and if it isn't a magic you picked, wipes the character and goes again. It does the starter quests and races for you.", true)
+        rerollBox:AddLabel("Takes a new character to level 15, gets its grimoire, and if it isn't a magic you picked, wipes the character and goes again. It does the starter quests, then levels by discovering places and doing quests.", true)
         rerollBox:AddToggle("FarmReroll", {
             Premium  = true,
             Text     = REROLL_FARM,
@@ -44023,6 +44605,7 @@ return function(ctx)
             if s.lastQuest then lines[#lines + 1] = ("  Last: %s"):format(Ui.clean(s.lastQuest)) end
         end
         if (s.missions or 0) > 0 then lines[#lines + 1] = ("Missions done: %s"):format(Ui.commas(s.missions)) end
+        if (s.areas or 0) > 0 then lines[#lines + 1] = ("Places discovered: %s"):format(Ui.commas(s.areas)) end
         if s.races > 0 then
             lines[#lines + 1] = ("Races finished: %s"):format(Ui.commas(s.races))
             if s.lastRace then lines[#lines + 1] = ("  Last: %s"):format(Ui.clean(s.lastRace)) end
@@ -44223,10 +44806,225 @@ return function(ctx)
 end
 
 end)
+__bundle_register("Features/Clover/Farm/Explore", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- area discovery farm brain: flies into each significant location you haven't found yet, nearest first, to a spot the game itself counts as inside it (no smaller zone over it), so the game reports it as you arrive; one it hasn't reported after a moment is reported the way the game does, a place off the main map (an instance's arena) is never tried, and one it can't get into is set aside for the run with the reason
+local Services = require("Services")
+
+local M = {}
+
+-- an open spot is flown to this high over the ground inside its zone, a roofed one stood on, and either counted reached this close
+local HOVER = 8
+local STAND = 3
+local REACH = 6
+-- the game checks your zone once a second (LocationClient.lua:930-939), so its own report gets this long before ours goes out
+local CONFIRM_WAIT = 3
+local MAX_TRIPS = 2
+local MAX_REPORTS = 2
+-- spots tried across a zone, as fractions of its half size from the centre
+local SAMPLES = { { 0, 0 }, { 0.5, 0 }, { -0.5, 0 }, { 0, 0.5 }, { 0, -0.5 }, { 0.5, 0.5 }, { -0.5, -0.5 }, { 0.5, -0.5 }, { -0.5, 0.5 } }
+local STREAM_WAIT = 4
+-- live 2026-11-03: a zone 12,000 studs off never streamed in from a request, so a place with no spot found from afar is flown over first, this high over its surface, and looked at again from there
+local NEAR = 400
+local APPROACH_ABOVE = 40
+local SURFACE_FROM = 3000
+
+-- cfg: onDone(found, total) when nothing is left to find
+function M.new(cfg)
+    local brain = {}
+    local skipped, trips, reports = {}, {}, {}
+    local target = nil
+
+    function brain.begin()
+        skipped, trips, reports, target = {}, {}, {}, nil
+    end
+
+    -- the places set aside this run and why, for anyone looking in
+    function brain.skipped()
+        local out = {}
+        for name, why in pairs(skipped) do out[name] = why end
+        return out
+    end
+
+    local function params()
+        local p = RaycastParams.new()
+        p.RespectCanCollide = true
+        p.FilterType = Enum.RaycastFilterType.Exclude
+        local char = Services.Players.LocalPlayer and Services.Players.LocalPlayer.Character
+        p.FilterDescendantsInstances = char and { char } or {}
+        return p
+    end
+
+    local function floorAt(x, z, top, bottom)
+        local hit = Services.Workspace:Raycast(Vector3.new(x, top, z), Vector3.new(0, bottom - top, 0), params())
+        return hit and hit.Position.Y or nil
+    end
+
+    local function roofed(point, height)
+        return Services.Workspace:Raycast(point, Vector3.new(0, height, 0), params()) ~= nil
+    end
+
+    -- the first sampled spot the game would call this zone: stood on under a roof, else hovering over its floor, else (with nothing under it) in its middle; indoor says it is roofed
+    local function standingSpot(kit, zone)
+        local World = kit.api("World")
+        if not World then return nil end
+        World.streamAround(zone.position, STREAM_WAIT)
+        local half = zone.size / 2
+        local top, bottom = zone.position.Y + half.Y, zone.position.Y - half.Y
+        for _, sample in ipairs(SAMPLES) do
+            local x, z = zone.position.X + half.X * sample[1], zone.position.Z + half.Z * sample[2]
+            local floor = floorAt(x, z, top, bottom)
+            local spot, indoor = nil, false
+            if floor then
+                indoor = roofed(Vector3.new(x, floor + STAND, z), top - floor + 50)
+                spot = Vector3.new(x, indoor and floor + STAND or math.min(floor + HOVER, top - 1), z)
+            elseif not zone.noFlight then
+                spot = Vector3.new(x, zone.position.Y, z)
+            end
+            if spot then
+                local ok, name = World.locationAt(spot)
+                if ok and name == zone.name then return spot, indoor end
+            end
+        end
+        return nil
+    end
+
+    -- open sky over the zone's middle, to fly to so it streams in
+    local function above(zone)
+        local x, z = zone.position.X, zone.position.Z
+        local surface = floorAt(x, z, SURFACE_FROM, -SURFACE_FROM)
+        local floorY = surface or (zone.position.Y + zone.size.Y / 2)
+        return Vector3.new(x, math.max(floorY, zone.position.Y + zone.size.Y / 2) + APPROACH_ABOVE, z)
+    end
+
+    local function here(kit, zone)
+        local World = kit.api("World")
+        local at = kit.position()
+        if not (World and at) then return false end
+        local ok, name = World.locationAt(at)
+        return ok and name == zone.name
+    end
+
+    local function onMap(kit, zone)
+        local World = kit.api("World")
+        if not World then return true end
+        local ok, region = World.regionAt(zone.position)
+        return not ok or region ~= nil
+    end
+
+    local function pick(kit, list)
+        local at = kit.position()
+        local best, bestGap = nil, math.huge
+        for _, zone in ipairs(list) do
+            if not zone.discovered and not skipped[zone.name] then
+                if not onMap(kit, zone) then
+                    skipped[zone.name] = "off the main map"
+                else
+                    local gap = at and (zone.position - at).Magnitude or 0
+                    if gap < bestGap then best, bestGap = zone, gap end
+                end
+            end
+        end
+        return best
+    end
+
+    local function setAside(zone, why)
+        skipped[zone.name] = why
+        target = nil
+    end
+
+    function brain.step(kit)
+        local Exploration = kit.api("Exploration")
+        if not Exploration then
+            kit.status("Exploration isn't ready yet.")
+            kit.sleep(1)
+            return
+        end
+        local ok, list = Exploration.locations()
+        if not ok then
+            kit.status("Waiting for your map.")
+            kit.sleep(2)
+            return
+        end
+        local found = 0
+        for _, zone in ipairs(list) do
+            if zone.discovered then found = found + 1 end
+            if target and zone.name == target.zone.name and zone.discovered then
+                kit.add("areas")
+                target = nil
+            end
+        end
+        if target and skipped[target.zone.name] then target = nil end
+        if not target then
+            local zone = pick(kit, list)
+            if not zone then
+                kit.status(("Found %d of %d places. Nothing left you can reach."):format(found, #list))
+                if cfg.onDone then cfg.onDone(found, #list) end
+                kit.sleep(2)
+                return
+            end
+            target = { zone = zone }
+        end
+
+        local zone = target.zone
+        local label = zone.displayName or zone.name
+        if not target.spot then
+            kit.status(("Looking for a way into %s."):format(label))
+            target.spot, target.indoor = standingSpot(kit, zone)
+            if not target.spot then
+                local at = kit.position()
+                if target.approached or (at and (at - zone.position).Magnitude <= NEAR) then
+                    setAside(zone, "no spot inside it")
+                    return
+                end
+                target.approached = true
+                kit.status(("Flying over %s to look for a way in."):format(label))
+                kit.travel(above(zone), { reach = REACH * 3, air = true })
+                return
+            end
+        end
+
+        if not here(kit, zone) then
+            trips[zone.name] = (trips[zone.name] or 0) + 1
+            if trips[zone.name] > MAX_TRIPS then
+                setAside(zone, target.why or "couldn't get there")
+                return
+            end
+            kit.status(("Flying to %s (%d of %d found)."):format(label, found, #list))
+            local arrived, why = kit.travel(target.spot, { reach = REACH, air = not target.indoor and not zone.noFlight })
+            if not arrived and why ~= "stopped" then target.why = tostring(why) end
+            return
+        end
+
+        kit.status(("Discovering %s."):format(label))
+        local limit = os.clock() + CONFIRM_WAIT
+        while os.clock() < limit do
+            if not kit.sleep(0.5) then return end
+            local okNow, now = Exploration.locations()
+            if okNow then
+                for _, entry in ipairs(now) do
+                    if entry.name == zone.name and entry.discovered then return end
+                end
+            end
+        end
+        reports[zone.name] = (reports[zone.name] or 0) + 1
+        if reports[zone.name] > MAX_REPORTS then
+            setAside(zone, "the game wouldn't count it")
+            return
+        end
+        Exploration.report(zone.name)
+    end
+
+    return brain
+end
+
+return M
+
+end)
 __bundle_register("Features/Clover/Farm/Reroll", function(require, _LOADED, __bundle_register, __bundle_modules)
--- magic reroll farm brain: takes a fresh character from its weapon pick to its grimoire and judges the magic it got: the starter quests up to Johan's broom (Chief Farris, Vulcan, Eira's bamboo, Johan's cloth and wood), broom races to level 15, then Merlin and the ceremony; a magic you picked ends the farm, any other sends you to the menu, where Farm/init wipes the slot and brings you back to go again
-local Nodes = require("Features/Clover/Farm/Nodes")
-local Races = require("Features/Clover/Farm/Races")
+-- magic reroll farm brain: takes a fresh character from its weapon pick to its grimoire and judges the magic it got: the starter quests up to Johan's broom (Chief Farris, Vulcan, Eira's bamboo, Johan's cloth and wood), then to level 15 on the places it discovers and the quest farm once those run out (broom races stopped paying xp), then Merlin and the ceremony; a magic you picked ends the farm, any other sends you to the menu, where Farm/init wipes the slot and brings you back to go again
+local Explore = require("Features/Clover/Farm/Explore")
+local Nodes   = require("Features/Clover/Farm/Nodes")
+local Quests  = require("Features/Clover/Farm/Quests")
 
 local M = {}
 
@@ -44240,7 +45038,6 @@ local CEREMONY_WAIT = 90
 -- the wood Johan wants is sold in Kamo; nothing gathers it
 local WOOD = "Wood"
 local WOOD_NEEDED = 2
-local BROOM = "Initiates Broom"
 -- after asking for the menu, this long before asking again
 local MENU_RETRY = 15
 -- a kept roll tries this many steps at most (the trip there counts) to get back to Merlin before the farm leaves the rest of the grimoire quest to you
@@ -44274,25 +45071,33 @@ local function taskDone(player, key, taskName)
     return type(progress) == "number" and type(max) == "number" and progress >= max
 end
 
--- cfg is the live settings table the menu writes: wanted (a set of magics), variants (a set, empty means any), weapon, allowWipe, maxLevel, plus state (the saved run: rolls, last) with save(state) and onKept(magic, variant)
-function M.new(cfg)
+-- cfg is the live settings table the menu writes: wanted (a set of magics), variants (a set, empty means any), weapon, allowWipe, maxLevel, plus state (the saved run: rolls, last) with save(state) and onKept(magic, variant); shared.mob is the mob farm's settings, which the quest farm fights with
+function M.new(cfg, shared)
     local brain = {}
     local nodeCfg = { items = {}, ownTools = true }
-    -- the short course by Kamo, kept to: the best-course picker tries every course first, and flew a level 12 9,000 studs to sample one (live 2026-10-25)
-    local raceCfg = { course = "Kamo Broom Blitz", speed = 330, challenge = true, best = false }
+    -- live 2026-11-03: two broom races in a row paid 0 xp, while each place discovered paid about 430 at level 73, so a new character levels on the map first and on quests once nothing is left to find
+    local explored = false
+    local explore = Explore.new({ onDone = function() explored = true end })
+    local quests = Quests.new({ givers = {}, best = true }, {
+        mob = shared.mob,
+        node = { items = {}, ownTools = true, range = shared.nodeRange },
+        race = { course = nil, speed = 330, challenge = false, best = false },
+    })
     local gather = Nodes.new(nodeCfg)
-    local race = Races.new(raceCfg)
     local menuAskedAt = nil
     local merlinVisits = 0
+    local leveling = nil
 
     function brain.begin()
         gather.begin()
-        race.begin()
+        explore.begin()
+        quests.begin()
+        explored, leveling = false, nil
         menuAskedAt, merlinVisits = nil, 0
     end
 
     function brain.stop(why)
-        if race.stop then pcall(race.stop, why) end
+        if quests.stop then pcall(quests.stop, why) end
     end
 
     local function player()
@@ -44594,15 +45399,587 @@ function M.new(cfg)
 
         local level = tonumber(f:GetAttribute("Level")) or 0
         if level < GRIMOIRE_LEVEL then
-            if stock(p, BROOM) < 1 then
-                kit.status("You need a broom to race. Finish Johan's quest first.")
-                kit.sleep(2)
+            if not explored then
+                leveling = "explore"
+                explore.step(kit)
                 return
             end
-            race.step(kit)
+            if leveling ~= "quests" then
+                leveling = "quests"
+                quests.begin()
+            end
+            quests.step(kit)
             return
         end
+        if leveling == "quests" and quests.stop then pcall(quests.stop, "leveled") end
+        leveling = nil
         grimoire(kit)
+    end
+
+    return brain
+end
+
+return M
+
+end)
+__bundle_register("Features/Clover/Farm/Quests", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- quest farm brain: works through the repeatable quests you pick: takes one whose giver is off cooldown (nearest first), does its tasks with the farm's own brains (the gathering farm for a gather, the mob farm for a hunt where the quest points, the race farm for a race) or by hand (a 'Hit the ...' task, struck with light attacks; an item no node gives, bought at a shop), hands it in at the giver and goes on, waiting out the cooldowns when every quest is resting; a quest it has no way to do is left alone
+local Services = require("Services")
+local Mobs     = require("Features/Clover/Farm/Mobs")
+local Nodes    = require("Features/Clover/Farm/Nodes")
+local Races    = require("Features/Clover/Farm/Races")
+
+local M = {}
+
+-- live 2026-10-24: accepting and handing in both answered from beside the giver with no dialogue open
+local GIVER_REACH = 8
+-- a giver's cooldown is asked again no sooner than this, and a giver that would not give is left this long
+local RECHECK = 30
+local GIVE_UP = 120
+-- monsters for a hunt are looked for within this of where the quest points; further than that it flies there first
+local AREA = 250
+-- a hunt with none of its monsters about for this long (Night Charmers only come out after dark) is set aside this long while other quests go on
+local NO_MOB_WAIT = 45
+local SET_ASIDE = 300
+-- monsters that only come out after dark (live 2026-10-24: Night Charmers), whose hunts wait out the day rather than fly over to find nothing; the game's night by Lighting.ClockTime
+local NIGHT_ONLY = { ["Night Charmer"] = true }
+local DUSK, DAWN = 18, 6
+-- picking the best quests itself: what each pays (its XP, and a Mark counted as this much XP) over a guess at its time, travel at this speed plus each task's own, worked out again this often
+local MARK_WORTH = 2
+local GUESS_SPEED = 250
+local GUESS = { collect = 10, buy = 8, kill = 45, boss = 150, race = 15, hit = 0.9, handIn = 5 }
+local RANK_EVERY = 30
+local WAIT = 5
+-- a "Hit the ..." task (Captain Hayes' Whack-a-Dummy, live 2026-10-24: 35 hits on any of three Training Dummies in the Kamo Encampment) is struck from this close, one light attack at a time, looking for the target this far round where the quest points
+local HIT_REACH = 5
+local HIT_AREA = 60
+local HIT_GAP = 0.35
+
+local function distance(a, b)
+    return (a - b).Magnitude
+end
+
+local function chosenList(set)
+    local out = {}
+    for name, on in pairs(set) do
+        if on then out[#out + 1] = name end
+    end
+    table.sort(out)
+    return out
+end
+
+-- a quest title that ends in its own "!" or "?" (Boar Hunt!) takes no full stop after it
+local function say(kit, fmt, ...)
+    local text = fmt:format(...):gsub("([!?])%.", "%1")
+    kit.status(text)
+end
+
+local function minutes(seconds)
+    if seconds < 60 then return ("%ds"):format(math.ceil(seconds)) end
+    return ("%dm %02ds"):format(math.floor(seconds / 60), math.floor(seconds % 60))
+end
+
+-- cfg is the live settings table the menu writes (givers, a set); shared holds the mob, gathering and race farms' own settings, which the quests borrow
+function M.new(cfg, shared)
+    local brain = {}
+    local mobCfg = setmetatable({ names = {} }, { __index = shared.mob })
+    local nodeCfg = setmetatable({ items = {} }, { __index = shared.node })
+    local raceCfg = setmetatable({ course = nil, challenge = false, best = false }, { __index = shared.race })
+    local subs = { kill = Mobs.new(mobCfg), collect = Nodes.new(nodeCfg), race = Races.new(raceCfg) }
+    local using = nil
+    local readyAt, askedAt, skipped, unable = {}, {}, {}, {}
+    local aside, emptySince = {}, nil
+    local gatherable = nil
+    -- best mode's ranking of the quests, kept for RANK_EVERY
+    local ranked, rankedAt = nil, -math.huge
+
+    function brain.begin()
+        using, readyAt, askedAt, skipped, unable, gatherable = nil, {}, {}, {}, {}, nil
+        ranked, rankedAt = nil, -math.huge
+        aside, emptySince = {}, nil
+        for _, sub in pairs(subs) do
+            if sub.begin then sub.begin() end
+        end
+    end
+
+    function brain.stop(why)
+        for _, sub in pairs(subs) do
+            if sub.stop then pcall(sub.stop, why) end
+        end
+    end
+
+    local function switch(kit, kind)
+        if using == kind then return subs[kind] end
+        local previous = using and subs[using] or nil
+        if previous and previous.stop then pcall(previous.stop, "switched") end
+        -- a block the hunt was holding is let go before anything else is tried
+        local Combat = kit.api("Combat")
+        if Combat then pcall(Combat.block, false) end
+        using = kind
+        if subs[kind].begin then subs[kind].begin() end
+        return subs[kind]
+    end
+
+    -- the nodes that give an item: a plant is its own node, an ore drops from rocks of other names (live 2026-10-24: Silver from Pebble and Stone Cluster); nil when nothing the gathering farm reaches gives it (Wood and Stone come from no node)
+    local function nodesFor(kit, item)
+        if gatherable == nil then
+            local Professions = kit.api("Professions")
+            if not Professions then return nil end
+            local map = {}
+            for _, kind in ipairs({ "Ore", "Harvest" }) do
+                local ok, list = Professions.nodes({ kind = kind })
+                if ok and type(list) == "table" then
+                    for _, entry in ipairs(list) do
+                        local gives = entry.drop or entry.item
+                        if type(gives) == "string" and type(entry.item) == "string" then
+                            map[gives] = map[gives] or {}
+                            map[gives][entry.item] = true
+                        end
+                    end
+                end
+            end
+            if next(map) == nil then return nil end
+            gatherable = map
+        end
+        return gatherable[item]
+    end
+
+    local function mobsFor(kit, Quests, stem)
+        local World = kit.api("World")
+        if not World then return {} end
+        local ok, names = World.mobNames()
+        if not ok or type(names) ~= "table" then return {} end
+        return Quests.matchMobs(stem, names)
+    end
+
+    local function giverModel(kit, name)
+        local World = kit.api("World")
+        if not World then return nil end
+        local ok, entry = World.npc(name)
+        if ok and type(entry) == "table" then return entry.model end
+        return nil
+    end
+
+    -- stands by the giver; answers its model once there
+    local function reachGiver(kit, name, at)
+        local here = kit.position()
+        if not here then return nil end
+        local model = giverModel(kit, name)
+        local spot = (model and model:GetPivot().Position) or at
+        if not spot then return nil end
+        if distance(here, spot) > GIVER_REACH + 2 then
+            say(kit, "Flying to %s (%d studs away).", name, math.floor(distance(here, spot)))
+            kit.travel(spot, { reach = GIVER_REACH })
+            return nil
+        end
+        if kit.flying() then
+            kit.land()
+            return nil
+        end
+        return model or giverModel(kit, name)
+    end
+
+    local function handIn(kit, Quests, quest, template)
+        local model = reachGiver(kit, quest.giver, (template and template.position) or quest.returnAt)
+        if not model then return end
+        say(kit, "Handing in %s.", quest.title)
+        local ok = Quests.turnIn(quest.key)
+        if not ok then
+            -- the game's own dialogue hands it in on opening (DM.lua:93-106) when the plain send was not taken
+            local Interact = kit.api("Interact")
+            if Interact then
+                Interact.talk(model)
+                kit.sleep(1)
+                pcall(Interact.close)
+            end
+            local okNow, now = Quests.quest(quest.key)
+            ok = not okNow or (type(now) == "table" and now.completed)
+        end
+        if ok then
+            kit.add("quests")
+            kit.stats.lastQuest = quest.title
+            local cooldown = template and template.cooldown or 600
+            readyAt[quest.key] = os.clock() + cooldown
+        else
+            skipped[quest.key] = os.clock() + GIVE_UP
+        end
+    end
+
+    -- the nearest model named like the task's target ("Hit the Training Dummy") that has a Humanoid, round where the quest points
+    local function hitTarget(task)
+        local wanted = string.match(task.name or "", "^Hit the (.+)$") or string.match(task.name or "", "^Hit (.+)$")
+        if not (wanted and task.position) then return nil end
+        local okParts, parts = pcall(function() return Services.Workspace:GetPartBoundsInRadius(task.position, HIT_AREA) end)
+        if not okParts then return nil, wanted end
+        local best, bestGap, seen = nil, math.huge, {}
+        for _, part in ipairs(parts) do
+            local model = part:FindFirstAncestorOfClass("Model")
+            if model and not seen[model] and model.Name == wanted and model:FindFirstChildOfClass("Humanoid") then
+                seen[model] = true
+                local okAt, at = pcall(function() return model:GetPivot().Position end)
+                if okAt and distance(at, task.position) < bestGap then best, bestGap = { model = model, position = at }, distance(at, task.position) end
+            end
+        end
+        return best, wanted
+    end
+
+    -- answers false when the task isn't one it knows how to hit
+    local function hit(kit, quest, task)
+        local target, wanted = hitTarget(task)
+        if not wanted then return false end
+        local here = kit.position()
+        if not here then return true end
+        if not target then
+            if task.position and distance(here, task.position) > HIT_REACH * 4 then
+                say(kit, "Flying to the %s for %s.", wanted, quest.title)
+                kit.travel(task.position, { reach = 10 })
+            else
+                kit.sleep(1)
+            end
+            return true
+        end
+        if distance(here, target.position) > HIT_REACH + 2 then
+            kit.travel(target.position, { reach = HIT_REACH })
+            return true
+        end
+        if kit.flying() then
+            kit.land()
+            return true
+        end
+        local Combat = kit.api("Combat")
+        if not Combat then
+            kit.sleep(1)
+            return true
+        end
+        local okWeapon, weapon = Combat.weapon()
+        if not okWeapon then
+            unable[quest.key] = ("%s needs a weapon to hit the %s with."):format(quest.title, wanted)
+            return true
+        end
+        if not weapon.equipped then
+            Combat.equipWeapon()
+            kit.sleep(0.5)
+            return true
+        end
+        kit.face(target.position)
+        Combat.attack("light")
+        kit.sleep(HIT_GAP)
+        return true
+    end
+
+    -- an item no node gives but a shop sells (live 2026-10-24: Wood at 5 Marks in Kamo): what's still missing is bought there; answers false when no shop is known for it
+    local function buyFor(kit, quest, task)
+        local Shop = kit.api("Shop")
+        local here = kit.position()
+        if not (Shop and here and task.target) then return false end
+        local ok, list = Shop.find(task.target, here)
+        if not ok or type(list) ~= "table" or #list == 0 then return false end
+        local listing = list[1]
+        local need = math.max((task.max or 1) - (task.progress or 0), 1)
+        local count = math.min(need, Shop.MAX_BUY)
+        local State = kit.api("State")
+        local okProfile, profile = false, nil
+        if State then okProfile, profile = State.profile() end
+        local marks = okProfile and type(profile) == "table" and tonumber(profile.marks) or nil
+        if listing.price and marks and marks < listing.price * count then
+            unable[quest.key] = ("%s needs %d %s, and buying them costs %d Marks (you have %d)."):format(quest.title, need, task.target, listing.price * count, marks)
+            return true
+        end
+        if distance(here, listing.position) > Shop.REACH - 2 then
+            say(kit, "Flying to the shop to buy %s for %s.", task.target, quest.title)
+            kit.travel(listing.position, { reach = Shop.REACH - 4 })
+            return true
+        end
+        if kit.flying() then
+            kit.land()
+            return true
+        end
+        say(kit, "Buying %d %s for %s.", count, task.target, quest.title)
+        local bought, why = Shop.buy(task.target, count)
+        if not bought then
+            if why == Shop.Errors.NO_MARKS then
+                unable[quest.key] = ("%s needs more Marks to buy %s."):format(quest.title, task.target)
+            else
+                kit.sleep(2)
+            end
+        else
+            kit.sleep(1)
+        end
+        return true
+    end
+
+    -- one piece of the task, done by the brain that farms that kind of thing
+    local function work(kit, Quests, quest, task)
+        local here = kit.position()
+        local nodes = task.kind == "collect" and task.target and nodesFor(kit, task.target) or nil
+        if nodes then
+            nodeCfg.items = nodes
+            if task.position and here and distance(here, task.position) > AREA then kit.setHome(task.position) end
+            return switch(kit, "collect").step(kit)
+        end
+        if task.kind == "kill" then
+            local names = mobsFor(kit, Quests, task.target)
+            if #names == 0 then
+                unable[quest.key] = ("Couldn't tell which monster %s wants."):format(quest.title)
+                return
+            end
+            local set, nightOnly = {}, true
+            for _, name in ipairs(names) do
+                set[name] = true
+                if not NIGHT_ONLY[name] then nightOnly = false end
+            end
+            local clock = Services.Lighting.ClockTime
+            if nightOnly and clock >= DAWN and clock < DUSK then
+                aside[quest.key] = os.clock() + SET_ASIDE
+                return
+            end
+            mobCfg.names = set
+            if task.position then
+                kit.setHome(task.position)
+                local World = kit.api("World")
+                local near = nil
+                if World and here then
+                    local okNear, list = World.mobs({ names = names, alive = true, origin = here, maxDistance = AREA, limit = 1 })
+                    near = okNear and type(list) == "table" and list[1] or nil
+                end
+                if not near and here and distance(here, task.position) > AREA then
+                    say(kit, "Flying to the %s hunt for %s.", names[1], quest.title)
+                    switch(kit, "kill")
+                    kit.travel(task.position, { reach = 40 })
+                    return
+                end
+            end
+            local hunt = switch(kit, "kill")
+            hunt.step(kit)
+            if hunt.target() then
+                emptySince = nil
+            elseif here and task.position and distance(here, task.position) <= AREA * 2 then
+                emptySince = emptySince or os.clock()
+                if os.clock() - emptySince > NO_MOB_WAIT then
+                    emptySince = nil
+                    aside[quest.key] = os.clock() + SET_ASIDE
+                end
+            end
+            return
+        end
+        if task.kind == "race" and task.target then
+            raceCfg.course = task.target
+            return switch(kit, "race").step(kit)
+        end
+        if task.kind == "other" and hit(kit, quest, task) then return end
+        if task.kind == "collect" and buyFor(kit, quest, task) then return end
+        unable[quest.key] = ("%s needs something the farm can't do yet (%s)."):format(quest.title, task.name)
+    end
+
+    local function isNight()
+        local clock = Services.Lighting.ClockTime
+        return clock >= DUSK or clock < DAWN
+    end
+
+    -- a node of these items the farm's tools can gather
+    local function toolsGather(kit, items)
+        local Professions = kit.api("Professions")
+        if not Professions then return false end
+        for _, kind in ipairs({ "Ore", "Harvest" }) do
+            local okPower, power = Professions.toolPower(kind)
+            if okPower and (tonumber(power) or 0) > 0 then
+                local ok, list = Professions.nodes({ kind = kind, items = items, maxPower = power, limit = 1 })
+                if ok and type(list) == "table" and #list > 0 then return true end
+            end
+        end
+        return false
+    end
+
+    local bossNames = nil
+    local function isBoss(kit, names)
+        if bossNames == nil then
+            local World = kit.api("World")
+            local ok, beasts = false, nil
+            if World then ok, beasts = World.beasts() end
+            if not (ok and type(beasts) == "table") then return false end
+            bossNames = {}
+            for _, beast in ipairs(beasts) do
+                if beast.boss then bossNames[beast.name] = true end
+            end
+        end
+        for _, name in ipairs(names) do
+            if bossNames[name] then return true end
+        end
+        return false
+    end
+
+    -- seconds a quest's tasks should take, or nil when one of them is something the farm can't do
+    local function taskTime(kit, Quests, template)
+        local Shop = kit.api("Shop")
+        local seconds = 0
+        for _, task in ipairs(template.tasks or {}) do
+            if not task.hidden then
+                if task.kind == "collect" then
+                    local nodes = task.target and nodesFor(kit, task.target) or nil
+                    local okShop, listings = false, nil
+                    if Shop and task.target then okShop, listings = Shop.find(task.target) end
+                    if nodes and toolsGather(kit, nodes) then
+                        seconds = seconds + task.max * GUESS.collect
+                    elseif okShop and type(listings) == "table" and #listings > 0 then
+                        seconds = seconds + GUESS.buy
+                    else
+                        return nil
+                    end
+                elseif task.kind == "kill" then
+                    local names = mobsFor(kit, Quests, task.target)
+                    if #names == 0 then return nil end
+                    local nightOnly = true
+                    for _, name in ipairs(names) do
+                        if not NIGHT_ONLY[name] then nightOnly = false end
+                    end
+                    if nightOnly and not isNight() then return nil end
+                    seconds = seconds + task.max * (isBoss(kit, names) and GUESS.boss or GUESS.kill)
+                elseif task.kind == "race" then
+                    seconds = seconds + GUESS.race
+                elseif task.kind == "other" and string.match(task.name or "", "^Hit ") then
+                    seconds = seconds + task.max * GUESS.hit
+                else
+                    return nil
+                end
+            end
+        end
+        return seconds
+    end
+
+    -- every repeatable the farm can do, as giver -> how much it pays a second, the best first in the list
+    local function rankQuests(kit, Quests)
+        if ranked and os.clock() - rankedAt < RANK_EVERY then return ranked.list, ranked.score end
+        local ok, list = Quests.repeatables()
+        local here = kit.position()
+        if not (ok and type(list) == "table" and here) then return {}, {} end
+        local score, givers = {}, {}
+        for _, template in ipairs(list) do
+            local seconds = not unable[template.giver] and taskTime(kit, Quests, template) or nil
+            if seconds and template.position then
+                local first = template.tasks and template.tasks[1] and template.tasks[1].position or template.position
+                local travel = (distance(here, template.position) + 2 * distance(template.position, first)) / GUESS_SPEED
+                local rewards = template.rewards or {}
+                local worth = (rewards.xp or 0) + (rewards.marks or 0) * MARK_WORTH
+                score[template.giver] = worth / (seconds + travel + GUESS.handIn)
+                givers[#givers + 1] = template.giver
+            end
+        end
+        table.sort(givers, function(a, b) return score[a] > score[b] end)
+        ranked, rankedAt = { list = givers, score = score }, os.clock()
+        return givers, score
+    end
+
+    local function templatesBy(Quests)
+        local ok, list = Quests.repeatables()
+        local out = {}
+        if ok and type(list) == "table" then
+            for _, template in ipairs(list) do out[template.giver] = template end
+        end
+        return out
+    end
+
+    -- the nearest picked quest that can be taken now; cooldowns are asked as they come up, never more than every RECHECK
+    local function takeNext(kit, Quests, givers, templates, holding, score)
+        local here = kit.position()
+        if not here then return end
+        local now = os.clock()
+        local options, soonest = {}, nil
+        for _, giver in ipairs(givers) do
+            local template = templates[giver]
+            if template and template.position and not unable[giver] and not holding[giver] and (skipped[giver] or 0) <= now then
+                local at = readyAt[giver] or 0
+                if at <= now then
+                    options[#options + 1] = template
+                elseif not soonest or at < soonest then
+                    soonest = at
+                end
+            end
+        end
+        table.sort(options, function(a, b)
+            if score then return (score[a.giver] or 0) > (score[b.giver] or 0) end
+            return distance(here, a.position) < distance(here, b.position)
+        end)
+        for _, template in ipairs(options) do
+            local giver = template.giver
+            if (askedAt[giver] or -math.huge) + RECHECK <= now then
+                askedAt[giver] = now
+                local ok, left = Quests.cooldown(giver)
+                if ok and left > 0 then
+                    readyAt[giver] = now + left
+                    if not soonest or readyAt[giver] < soonest then soonest = readyAt[giver] end
+                end
+            end
+            if (readyAt[giver] or 0) <= now then
+                local model = reachGiver(kit, giver, template.position)
+                if not model then return end
+                say(kit, "Taking %s from %s.", template.title, giver)
+                local taken = Quests.accept(model)
+                if not taken then
+                    skipped[giver] = os.clock() + GIVE_UP
+                    readyAt[giver] = nil
+                end
+                return
+            end
+        end
+        local _, setAside = next(aside)
+        if soonest then
+            say(kit, "Every quest you picked is resting. The next one is ready in %s.", minutes(soonest - now))
+        elseif setAside and setAside > now then
+            say(kit, "The monsters for your hunts aren't out right now. Looking again in %s.", minutes(setAside - now))
+        elseif next(unable) then
+            local _, why = next(unable)
+            kit.status(why)
+        else
+            kit.status("None of the quests you picked can be taken right now.")
+        end
+        kit.sleep(WAIT)
+    end
+
+    function brain.step(kit)
+        local Quests = kit.api("Quests")
+        if not Quests then
+            kit.status("Quests aren't ready yet.")
+            kit.sleep(1)
+            return
+        end
+        local givers, score = nil, nil
+        if cfg.best then
+            givers, score = rankQuests(kit, Quests)
+            if #givers == 0 then
+                kit.status("None of the quests can be done right now.")
+                kit.sleep(WAIT)
+                return
+            end
+        else
+            givers = chosenList(cfg.givers)
+            if #givers == 0 then
+                kit.status("Pick the quests to do.")
+                kit.sleep(1)
+                return
+            end
+        end
+        local picked = {}
+        for _, giver in ipairs(givers) do picked[giver] = true end
+        local templates = templatesBy(Quests)
+        local ok, active = Quests.active()
+        local holding = {}
+        if ok and type(active) == "table" then
+            for _, quest in ipairs(active) do
+                if not quest.completed then holding[quest.key] = true end
+            end
+            for _, quest in ipairs(active) do
+                if picked[quest.key] and not quest.completed and not unable[quest.key] and (aside[quest.key] or 0) <= os.clock() then
+                    if quest.ready then return handIn(kit, Quests, quest, templates[quest.key]) end
+                    for _, task in ipairs(quest.tasks) do
+                        if not task.done and not task.hidden then
+                            say(kit, "%s: %s (%d of %d).", quest.title, task.name, task.progress, task.max)
+                            return work(kit, Quests, quest, task)
+                        end
+                    end
+                end
+            end
+        end
+        return takeNext(kit, Quests, givers, templates, holding, score)
     end
 
     return brain
@@ -45466,6 +46843,616 @@ end
 return M
 
 end)
+__bundle_register("Features/Clover/Farm/Mobs", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- mob farm brain: picks the mob of the chosen kinds it can best take (near, alone, already hurt) and stays on it until it dies, flies over on the broom and lands beside it to fight on foot (the game refuses swings and casts on a broom); with parrying on it fights around the parry: no swing is started that a strike due from the parry api would catch mid-swing (a swinging character's parry is refused), heavies go into the windows the mob's own state attributes say it cannot strike in (stunned, or CantStrike after its attack) and right after a parry lands, lights fill the rest; it watches every frame after a hit for the moment the mob is handed over to finish it with the instakill; without parrying it blocks between swings instead; it never backs off, however low its health
+local M = {}
+
+local SEARCH      = 2500
+-- further than this it flies; a flight lands this far short of the mob so the landing never ends on top of it
+local FIGHT_RANGE = 30
+local APPROACH    = 12
+-- swings registered from up to about 9 studs live (6.2 seen landing on a wolf); it swings from this far, so a mob shuffling about is not chased after every hit, and chases to this close
+local MELEE       = 8
+local CHASE_REACH = 4
+-- where the fight is stood: the target kept STAND studs off, stepped in past STRIKE_REACH and out inside TOO_CLOSE, and on the side away from any other enemy within CROWD_GAP of it, so it stands between them and us; a step waits out a strike due this soon
+local STAND        = 4
+local STRIKE_REACH = 6
+local TOO_CLOSE    = 2
+local SIDE_DRIFT   = 5
+local STEP_REACH   = 1.5
+local STEP_SLACK   = 0.35
+-- live 2026-10-24 (a level 6 with gauntlets on a wolf): a held block soaked every hit for 12 s but one, a block break with its 1.2 s stun
+local GUARD_EVERY = 2
+local GUARD_TIME  = 0.9
+local WAIT_GUARD  = 0.15
+-- the frames after a swing the server is likeliest to hand the mob over in
+local LAND_TIME   = 0.35
+-- in instakill mode a mob gone this soon after the first instakill on it was the instakill's doing; slower, it was worn down
+local EXECUTE_CREDIT = 1
+-- a mob it hasn't hurt in this long (out of reach, or shrugging every hit off) is left alone for a while; a long fight that is still landing hits goes on (live 2026-10-24: a 90 s cap on the whole fight walked away from Holda at 22%, and she healed)
+local TARGET_TIME = 40
+local SKIP_FOR    = 30
+-- the trip failures that mean a mob can't be reached from here
+local UNREACHABLE = { ["movement/no_path"] = true, ["movement/timed_out"] = true, ["movement/blocked"] = true }
+-- picking: each other mob this close to a candidate counts against it as this many studs, and a hurt one is worth this much nearer
+local CROWD_GAP   = 25
+local CROWD_COST  = 60
+local HURT_BONUS  = 80
+local HOME_FAR    = 300
+-- StateManager.displayTags.lua: the state the heavy attack leaves while it recharges
+local HEAVY_COOLDOWN = "HeavyAttackCooldown"
+-- the parry api parries what the mobs wind up within this range; the mob is open for a moment after a parry lands, so the guard drops and every swing goes in
+local PARRY_RANGE = 30
+local PUNISH_TIME = 1
+-- how long a swing keeps the character busy (live 2026-10-24: a light held State_Attacking 0.57 s; a heavy is slower), so one is only started with that long left before a strike, plus a margin
+local SWING_TIME   = { light = 0.6, heavy = 0.95 }
+-- how long a cast keeps the character busy (live 2026-10-24: Scorching Barrage held its state for several seconds of hits)
+local SKILL_TIME   = 2
+-- spells reach from here, so one is thrown before closing in (live 2026-10-25: a magic power 39 mage left its spell unused through a 70 s Raven Blackwood fight it lost on punches)
+local SPELL_RANGE  = 40
+local STRIKE_SLACK = 0.12
+local HOLD_POLL    = 0.03
+-- a cast the server never ran is told by its leaving the mana and the spell's cooldown untouched this long after (live 2026-11-03: Scorching Barrage answered true every 0.7 s with neither moving, and the farm, taking each for its swing, never threw a punch), and that spell is set aside, longer each time
+local CAST_PROOF     = 0.8
+local CAST_BENCH     = 30
+local CAST_BENCH_MAX = 300
+
+local function distance(a, b)
+    return (a - b).Magnitude
+end
+
+-- a zero only this client holds (an instakill the server never took) is not a death: the server's own shows in the mob's replicated Dead state
+local function healthAlive(mob)
+    local ok, living = pcall(function()
+        local humanoid = mob.humanoid
+        return mob.model.Parent ~= nil and humanoid.Parent ~= nil and mob.root.Parent ~= nil
+            and (humanoid.Health > 0 or humanoid:GetState() ~= Enum.HumanoidStateType.Dead)
+    end)
+    return ok and living
+end
+
+local function rootOf(mob)
+    local ok, position = pcall(function() return mob.root.Position end)
+    if ok then return position end
+    return nil
+end
+
+-- how long the mob cannot strike for, off the attributes it carries (live 2026-10-24 on a wolf: State_Stunned 0.75 s after our hit, State_CantStrike 3 s after it finishes an attack, each with a StateEnd_ server-time stamp)
+local function freeFor(mob, now)
+    if not now then return 0 end
+    local ok, free = pcall(function()
+        local model = mob.model
+        local out = 0
+        for _, name in ipairs({ "Stunned", "CantStrike" }) do
+            local until_ = model:GetAttribute("StateEnd_" .. name)
+            if model:GetAttribute("State_" .. name) == true and type(until_) == "number" then out = math.max(out, until_ - now) end
+        end
+        return out
+    end)
+    if ok then return free end
+    return 0
+end
+
+-- the mob is winding up or throwing an attack (live 2026-10-24: every hit a Dire Wolf landed came in its SkillActive with HyperArmor, which our hits don't interrupt, most while we were mid-combo or channelling a spell, when no parry or block can be pressed)
+local function attacking(mob)
+    local ok, on = pcall(function()
+        local model = mob.model
+        return model:GetAttribute("State_SkillActive") == true or model:GetAttribute("State_Swinging") == true
+    end)
+    return ok and on
+end
+
+local function healthShare(mob)
+    local ok, share = pcall(function() return mob.humanoid.Health / math.max(mob.humanoid.MaxHealth, 1) end)
+    if ok then return share end
+    return 1
+end
+
+local function chosenList(names)
+    local out = {}
+    for name, on in pairs(names) do
+        if on then out[#out + 1] = name end
+    end
+    table.sort(out)
+    return out
+end
+
+local function describe(list)
+    if #list == 1 then return list[1] end
+    return list[1] .. " or " .. list[2]
+end
+
+-- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry, dodge (roll through specials), plus locked() for the premium gate, and the boss farm's proper (names that take no "a" or "the") and stayPut (no flying home when nothing's about)
+function M.new(cfg)
+    local function called(name, article)
+        if cfg.proper then return name end
+        if article == "a" and name:match("^[AEIOUaeiou]") then article = "an" end
+        return article .. " " .. name
+    end
+
+    -- parrying and the instakill are premium: the gate only no-ops a locked toggle's callback, so the on-by-default ones are checked here too
+    local function unlocked()
+        return not (type(cfg.locked) == "function" and cfg.locked())
+    end
+    local function parryOn() return cfg.parry == true and unlocked() end
+    local function instakillOn() return cfg.instakill == true and unlocked() end
+    local function instakillMode() return cfg.instakillMode == true and unlocked() end
+
+    -- mobs our own instakill zeroed here, and when it first was: their health reads 0 on this client whether or not the server took it
+    local zeroed = setmetatable({}, { __mode = "k" })
+
+    -- in instakill mode a mob lives until its instance leaves the world (the user, 2026-10-24: judge it by the instance, not by health), so one zeroed here is fought on until it is really gone
+    local function alive(mob)
+        if not instakillMode() then return healthAlive(mob) end
+        local ok, present = pcall(function() return mob.model.Parent ~= nil and mob.root.Parent ~= nil end)
+        if not ok or not present then return false end
+        if zeroed[mob.model] then return true end
+        return healthAlive(mob)
+    end
+
+    local brain = {}
+    local target = nil
+    local skipped = {}
+    -- the last cast still to show it took, and the spells set aside after one that didn't
+    local casts = { pending = nil, benchedUntil = {}, bench = {} }
+    local guarding = false
+    -- the special the current mob is winding up, and every special's wind-up as measured so far
+    local punishUntil = 0
+
+    function brain.begin()
+        target, skipped, guarding, punishUntil = nil, {}, false, 0
+        casts = { pending = nil, benchedUntil = {}, bench = {} }
+        brain.aimed, brain.wired, brain.parryToken = false, false, nil
+    end
+
+    function brain.target()
+        return target and target.mob or nil
+    end
+
+    local function has(kit, state)
+        local State = kit.api("State")
+        if not State then return false end
+        local ok, on = State.has(state)
+        return ok and on == true
+    end
+
+    local function serverNow(kit)
+        local State = kit.api("State")
+        if not State then return nil end
+        local ok, now = State.serverTime()
+        if ok and type(now) == "number" then return now end
+        return nil
+    end
+
+    -- the soonest strike the parry api expects, in seconds, or nil
+    local function strikeIn(kit)
+        if not parryOn() then return nil end
+        local Parry = kit.api("Parry")
+        if not Parry then return nil end
+        local ok, due = Parry.incoming()
+        if ok and type(due) == "table" then return due.strikeIn end
+        return nil
+    end
+
+    local function canSwing(kit)
+        local State = kit.api("State")
+        if not State then return false end
+        local ok, can = State.can("combat")
+        return ok and can == true
+    end
+
+    local function guard(kit, on)
+        if guarding == on then return end
+        local Combat = kit.api("Combat")
+        if not Combat then return end
+        if Combat.block(on) == true or not on then guarding = on end
+    end
+
+    -- the nearest is not always the best: a mob with others round it brings them along, and a hurt one is nearly done
+    local function pick(kit, names)
+        local World = kit.api("World")
+        local here = kit.position()
+        if not (World and here) then return nil end
+        local living = true
+        if instakillMode() then living = nil end
+        local ok, list = World.mobs({ names = names, alive = living, origin = here, maxDistance = SEARCH, limit = 20 })
+        if not ok or type(list) ~= "table" then return nil end
+        if instakillMode() then
+            local kept = {}
+            for _, entry in ipairs(list) do
+                if entry.alive or zeroed[entry.model] then kept[#kept + 1] = entry end
+            end
+            list = kept
+        end
+        local okAll, everyone = World.mobs({ alive = true, origin = here, maxDistance = SEARCH, limit = 80 })
+        if not okAll or type(everyone) ~= "table" then everyone = list end
+        local now = os.clock()
+        local best, bestScore = nil, math.huge
+        for _, entry in ipairs(list) do
+            local skipUntil = skipped[entry.model]
+            if not skipUntil or skipUntil < now then
+                local crowd = 0
+                for _, other in ipairs(everyone) do
+                    if other.model ~= entry.model and distance(other.position, entry.position) <= CROWD_GAP then crowd = crowd + 1 end
+                end
+                local score = entry.distance + crowd * CROWD_COST - (1 - healthShare(entry)) * HURT_BONUS
+                if score < bestScore then best, bestScore = entry, score end
+            end
+        end
+        return best
+    end
+
+    local function skip(mob)
+        skipped[mob.model] = os.clock() + SKIP_FOR
+        target = nil
+    end
+
+    -- a mob that died while we were on it counts as ours
+    local function settle(kit)
+        if target and not alive(target.mob) then
+            if target.fought then
+                kit.add("kills")
+                local first = zeroed[target.mob.model]
+                if instakillMode() and type(first) == "number" and os.clock() - first <= EXECUTE_CREDIT then kit.add("executes") end
+            end
+            target = nil
+        end
+    end
+
+    -- the instakill, every frame it is in reach: in instakill mode tried whatever ownership says and judged later by the instance leaving; otherwise only on a mob the server has handed over, judged at once
+    local function tryExecute(kit, Combat, mob)
+        if instakillMode() then
+            if Combat.execute(mob.model, { force = true }) == true and not zeroed[mob.model] then zeroed[mob.model] = os.clock() end
+            return false
+        end
+        if instakillOn() and Combat.execute(mob.model) == true and not alive(mob) then
+            kit.add("executes")
+            return true
+        end
+        return false
+    end
+
+    local function aim(kit, Combat)
+        if brain.aimed then return end
+        local ok = Combat.setAim(function()
+            local current = target and target.mob
+            local position = current and rootOf(current)
+            if position then return position, current.root end
+            return nil
+        end)
+        if ok == true then
+            brain.aimed = true
+            kit.aiming(true)
+        end
+    end
+
+    local function energy(kit)
+        local State = kit.api("State")
+        if not State then return nil end
+        local ok, vitals = State.vitals()
+        if ok and type(vitals) == "table" and type(vitals.energy) == "number" then return vitals.energy end
+        return nil
+    end
+
+    -- the pending cast is judged once CAST_PROOF has passed: mana spent or the spell cooling down means it ran
+    local function judgeCast(kit, skills)
+        local pending = casts.pending
+        if not pending or os.clock() - pending.at < CAST_PROOF then return end
+        casts.pending = nil
+        local now = energy(kit)
+        local took = now ~= nil and pending.energy ~= nil and now < pending.energy - 1
+        for _, skill in ipairs(skills) do
+            if skill.name == pending.name and (tonumber(skill.remaining) or 0) > 0 then took = true end
+        end
+        if took then
+            casts.bench[pending.name] = nil
+            return
+        end
+        local wait = math.min((casts.bench[pending.name] or CAST_BENCH / 2) * 2, CAST_BENCH_MAX)
+        casts.bench[pending.name] = wait
+        casts.benchedUntil[pending.name] = os.clock() + wait
+    end
+
+    -- one cast at a time is proven before the next, and the swings go in meanwhile
+    local function castReady(kit, Combat)
+        local ok, skills = Combat.skills()
+        if not ok or type(skills) ~= "table" then return false end
+        judgeCast(kit, skills)
+        if casts.pending then return false end
+        for _, skill in ipairs(skills) do
+            if skill.ready and (casts.benchedUntil[skill.name] or 0) <= os.clock() then
+                aim(kit, Combat)
+                local before = energy(kit)
+                if Combat.cast(skill.name) == true then
+                    casts.pending = { name = skill.name, at = os.clock(), energy = before }
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    -- the parry api runs while the farm fights and the player wants parries, and every landed parry opens the mob up
+    local function syncParry(kit)
+        local Parry = kit.api("Parry")
+        if not Parry then return end
+        if parryOn() and not brain.parryToken then
+            local ok, token = Parry.request("Mob Farm", { range = PARRY_RANGE, block = cfg.block ~= false, dodge = cfg.dodge ~= false })
+            if not ok then return end
+            brain.parryToken, brain.parryDodge = token, cfg.dodge ~= false
+            kit.track({ Disconnect = function()
+                if brain.parryToken == token then
+                    Parry.release(token)
+                    brain.parryToken = nil
+                end
+            end })
+        elseif not parryOn() and brain.parryToken then
+            Parry.release(brain.parryToken)
+            brain.parryToken = nil
+        elseif brain.parryToken and brain.parryDodge ~= (cfg.dodge ~= false) then
+            brain.parryDodge = cfg.dodge ~= false
+            Parry.adjust(brain.parryToken, { dodge = brain.parryDodge })
+        end
+    end
+
+    local function wire(kit)
+        syncParry(kit)
+        if brain.wired then return end
+        brain.wired = true
+        local Parry = kit.api("Parry")
+        if Parry then
+            kit.track(Parry.onParry.Connect(function()
+                punishUntil = os.clock() + PUNISH_TIME
+                kit.add("parries")
+            end))
+        end
+    end
+
+    -- the frames right after a hit, when the server is likeliest to hand the mob over, are watched one by one
+    local function watchLanding(kit, Combat, mob)
+        local untilAt = os.clock() + LAND_TIME
+        while os.clock() < untilAt do
+            if not alive(mob) then return end
+            if tryExecute(kit, Combat, mob) then return end
+            if not kit.sleep(0) then return end
+        end
+    end
+
+    -- STAND studs from the target on the side away from the other enemies near it (their pull summed), else on the side we are already on; at our own height so a step never climbs
+    local function standAt(kit, mob, at)
+        local here = kit.position()
+        if not here then return nil end
+        local side = Vector3.new(here.X - at.X, 0, here.Z - at.Z)
+        local World = kit.api("World")
+        if World then
+            local ok, near = World.mobs({ alive = true, origin = at, maxDistance = CROWD_GAP, limit = 12 })
+            if ok and type(near) == "table" then
+                local away = Vector3.zero
+                for _, other in ipairs(near) do
+                    if other.model ~= mob.model and other.position then
+                        local push = Vector3.new(at.X - other.position.X, 0, at.Z - other.position.Z)
+                        if push.Magnitude > 0.1 then away = away + push.Unit end
+                    end
+                end
+                if away.Magnitude > 0.1 then side = away end
+            end
+        end
+        if side.Magnitude < 0.1 then return nil end
+        local spot = at + side.Unit * STAND
+        return Vector3.new(spot.X, here.Y, spot.Z)
+    end
+
+    local function fight(kit, mob, gap)
+        local Combat = kit.api("Combat")
+        if not Combat then
+            kit.status("Combat isn't ready yet.")
+            kit.sleep(1)
+            return
+        end
+        local okWeapon, weapon = Combat.weapon()
+        if not okWeapon then
+            kit.status("You don't have a weapon to fight with.")
+            kit.sleep(2)
+            return
+        end
+        if not weapon.equipped then
+            guard(kit, false)
+            kit.status("Drawing your weapon.")
+            Combat.equipWeapon()
+            return
+        end
+        if gap > MELEE then
+            guard(kit, false)
+            local due = strikeIn(kit)
+            if cfg.skills and gap <= SPELL_RANGE and (due == nil or due - STRIKE_SLACK >= SKILL_TIME) then
+                local at = rootOf(mob)
+                if at then kit.face(at) end
+                if castReady(kit, Combat) then
+                    target.fought = true
+                    kit.status(("Casting at %s."):format(called(mob.name, "the")))
+                    watchLanding(kit, Combat, mob)
+                    return
+                end
+            end
+            kit.status(("Closing in on %s."):format(called(mob.name, "the")))
+            kit.travel(function() return rootOf(mob) end, { reach = CHASE_REACH, broom = false, watch = function() return not alive(mob) end })
+            return
+        end
+        local at = rootOf(mob)
+        -- the fight is stood where swings reach and other enemies are behind the target, stepping only between strikes
+        local stand = at and standAt(kit, mob, at)
+        if stand and (gap > STRIKE_REACH or gap < TOO_CLOSE or distance(kit.position(), stand) > SIDE_DRIFT) then
+            local due = strikeIn(kit)
+            if not due or due > STEP_SLACK then
+                guard(kit, false)
+                kit.travel(stand, { reach = STEP_REACH, broom = false, watch = function() return not alive(mob) end })
+                local now = rootOf(mob)
+                if now then kit.face(now) end
+                return
+            end
+        end
+        if at then kit.face(at) end
+        target.fought = true
+        if instakillMode() then
+            kit.status(("Fighting %s, instakilling it until it's gone."):format(called(mob.name, "a")))
+        else
+            kit.status(("Fighting %s (%d%% health left)."):format(called(mob.name, "a"), math.floor(healthShare(mob) * 100)))
+        end
+        if tryExecute(kit, Combat, mob) then return end
+
+        -- right after a parry the mob is open: no guard, every swing in
+        local punishing = os.clock() < punishUntil
+        if punishing then target.swings = 0 end
+
+        -- with parrying on, the parry api owns the defence: nothing is started that a strike due before it finishes would catch
+        if parryOn() then
+            guard(kit, false)
+            local due = strikeIn(kit)
+            if due and due < SWING_TIME.light + STRIKE_SLACK then
+                kit.status(("Waiting to parry %s."):format(called(mob.name, "the")))
+                kit.sleep(HOLD_POLL)
+                return
+            end
+            if not canSwing(kit) then
+                kit.sleep(HOLD_POLL)
+                return
+            end
+            -- room for a heavy: a window the mob cannot strike in, a parry just landed, or the next strike far enough off
+            local free = freeFor(mob, serverNow(kit))
+            if punishing then free = math.max(free, SWING_TIME.heavy) end
+            -- an attack under way is never swung into: the parry api's block or parry is all that answers it
+            if attacking(mob) and free <= 0 then
+                kit.status(("Waiting out %s's attack."):format(mob.name))
+                kit.sleep(HOLD_POLL)
+                return
+            end
+            local room = math.huge
+            if due then room = due - STRIKE_SLACK end
+            local heavyFits = free >= SWING_TIME.heavy and room >= SWING_TIME.heavy
+            local swung = false
+            -- a spell channels for seconds with no parry or block, so it goes in when no strike is due before it ends, or into a window the mob can't strike in
+            if cfg.skills and (free >= SKILL_TIME or punishing or room >= SKILL_TIME) then swung = castReady(kit, Combat) end
+            if not swung and cfg.heavy and heavyFits and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
+            if not swung then swung = Combat.attack("light") == true end
+            if swung then
+                target.swings = (target.swings or 0) + 1
+                watchLanding(kit, Combat, mob)
+            else
+                kit.sleep(HOLD_POLL)
+            end
+            return
+        end
+
+        -- a short guard every couple of swings, so its next hit lands on the block
+        if cfg.block and not punishing and (target.swings or 0) >= GUARD_EVERY then
+            guard(kit, true)
+            local untilAt = os.clock() + GUARD_TIME
+            while os.clock() < untilAt and alive(mob) do
+                local now = rootOf(mob)
+                if now then kit.face(now) end
+                if not kit.sleep(0.1) then return end
+            end
+            target.swings = 0
+            return
+        end
+
+        -- the game would refuse a swing now (mid swing, debounce, stunned): block it out instead of wasting the press
+        if not canSwing(kit) then
+            if cfg.block and not punishing then guard(kit, true) end
+            kit.sleep(WAIT_GUARD)
+            return
+        end
+        guard(kit, false)
+
+        local swung = false
+        if cfg.skills then swung = castReady(kit, Combat) end
+        if not swung and cfg.heavy and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
+        if not swung then swung = Combat.attack("light") == true end
+        if swung then
+            target.swings = (target.swings or 0) + 1
+            watchLanding(kit, Combat, mob)
+        else
+            kit.sleep(WAIT_GUARD)
+        end
+    end
+
+    function brain.step(kit)
+        wire(kit)
+        local names = chosenList(cfg.names)
+        if #names == 0 then
+            guard(kit, false)
+            kit.status("Pick the monsters to farm.")
+            kit.sleep(1)
+            return
+        end
+        settle(kit)
+
+        if target and not cfg.names[target.mob.name] and not cfg.names[target.mob.baseName] then target = nil end
+        if not target then
+            guard(kit, false)
+            local entry = pick(kit, names)
+            if not entry then
+                local home, here = kit.home(), kit.position()
+                -- the boss farm picks its own next spot, so it never flies back to the last fight (live 2026-10-25: twice 1,500 studs back to Raven's den after Holda's house had no way in)
+                if home and here and not cfg.stayPut and distance(home, here) > HOME_FAR then
+                    kit.status("Heading back to where you were farming.")
+                    kit.travel(home, { reach = 20 })
+                    return
+                end
+                if #names > 2 then
+                    kit.status("None of the monsters you picked are around. Waiting for one to show up.")
+                else
+                    kit.status(("No %s around. Waiting for one to show up."):format(describe(names)))
+                end
+                kit.sleep(1.5)
+                return
+            end
+            target = { mob = entry, since = os.clock(), swings = 0 }
+        end
+
+        local mob = target.mob
+        local share = healthShare(mob)
+        if not target.share or share < target.share - 0.005 then target.share, target.since = share, os.clock() end
+        if os.clock() - target.since > TARGET_TIME then
+            guard(kit, false)
+            return skip(mob)
+        end
+        local here, at = kit.position(), rootOf(mob)
+        if not (here and at) then
+            settle(kit)
+            return
+        end
+        local gap = distance(here, at)
+        if gap > FIGHT_RANGE then
+            -- the clock on hurting it only runs within reach (live 2026-10-25: a death and the flight back used up its 40 s, and a full-health Raven Blackwood was benched on arrival)
+            target.since = os.clock()
+            guard(kit, false)
+            kit.status(("Flying to %s (%d studs away)."):format(called(mob.name, "a"), math.floor(gap)))
+            local ok, why = kit.travel(function() return rootOf(mob) end, { reach = APPROACH, watch = function() return not alive(mob) end })
+            -- only a route that can't be had leaves the mob for a while; a respawn, a server teleport or a death mid-flight is just tried again (live 2026-10-24: a boss left alone for 30 s over a trip begun while the character loaded)
+            if not ok and UNREACHABLE[why] then
+                local after, now = kit.position(), rootOf(mob)
+                if after and now and distance(after, now) > FIGHT_RANGE then skip(mob) end
+            end
+            return
+        end
+        kit.setHome(at)
+        if kit.flying() then
+            guard(kit, false)
+            kit.status("Landing to fight.")
+            kit.land()
+            return
+        end
+        fight(kit, mob, gap)
+        settle(kit)
+    end
+
+    return brain
+end
+
+return M
+
+end)
 __bundle_register("Features/Clover/Farm/Missions", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- bird mission farm brain: the Guild's missions through the Mission Bird (BirdClient.lua): summons the bird, asks for a mission of the rank you pick (the best your level and mission rank allow by default), flies to the marker the server sends, fights everything around it with the mob farm's fighting until the server reports the result, then goes again while you have mission tokens (QueueData.lua:518-544; one every 7 minutes, 4 at most)
 local Services = require("Services")
@@ -45703,1095 +47690,6 @@ function M.new(cfg, shared)
             Jobs.spawn(function() net.invoke("Systems", "RequestMission", { Action = "Cancel" }, ASK_TIMEOUT) end, { name = "Missions.cancel" })
         end
         if player and player:GetAttribute("BirdSpawned") then net.send("Systems", "Summon", { Action = "Close" }) end
-    end
-
-    return brain
-end
-
-return M
-
-end)
-__bundle_register("Features/Clover/Farm/Mobs", function(require, _LOADED, __bundle_register, __bundle_modules)
--- mob farm brain: picks the mob of the chosen kinds it can best take (near, alone, already hurt) and stays on it until it dies, flies over on the broom and lands beside it to fight on foot (the game refuses swings and casts on a broom); with parrying on it fights around the parry: no swing is started that a strike due from the parry api would catch mid-swing (a swinging character's parry is refused), heavies go into the windows the mob's own state attributes say it cannot strike in (stunned, or CantStrike after its attack) and right after a parry lands, lights fill the rest; it watches every frame after a hit for the moment the mob is handed over to finish it with the instakill; without parrying it blocks between swings instead; it never backs off, however low its health
-local M = {}
-
-local SEARCH      = 2500
--- further than this it flies; a flight lands this far short of the mob so the landing never ends on top of it
-local FIGHT_RANGE = 30
-local APPROACH    = 12
--- swings registered from up to about 9 studs live (6.2 seen landing on a wolf); it swings from this far, so a mob shuffling about is not chased after every hit, and chases to this close
-local MELEE       = 8
-local CHASE_REACH = 4
--- live 2026-10-24 (a level 6 with gauntlets on a wolf): a held block soaked every hit for 12 s but one, a block break with its 1.2 s stun
-local GUARD_EVERY = 2
-local GUARD_TIME  = 0.9
-local WAIT_GUARD  = 0.15
--- the frames after a swing the server is likeliest to hand the mob over in
-local LAND_TIME   = 0.35
--- in instakill mode a mob gone this soon after the first instakill on it was the instakill's doing; slower, it was worn down
-local EXECUTE_CREDIT = 1
--- a mob it hasn't hurt in this long (out of reach, or shrugging every hit off) is left alone for a while; a long fight that is still landing hits goes on (live 2026-10-24: a 90 s cap on the whole fight walked away from Holda at 22%, and she healed)
-local TARGET_TIME = 40
-local SKIP_FOR    = 30
--- the trip failures that mean a mob can't be reached from here
-local UNREACHABLE = { ["movement/no_path"] = true, ["movement/timed_out"] = true, ["movement/blocked"] = true }
--- picking: each other mob this close to a candidate counts against it as this many studs, and a hurt one is worth this much nearer
-local CROWD_GAP   = 25
-local CROWD_COST  = 60
-local HURT_BONUS  = 80
-local HOME_FAR    = 300
--- StateManager.displayTags.lua: the state the heavy attack leaves while it recharges
-local HEAVY_COOLDOWN = "HeavyAttackCooldown"
--- the parry api parries what the mobs wind up within this range; the mob is open for a moment after a parry lands, so the guard drops and every swing goes in
-local PARRY_RANGE = 30
-local PUNISH_TIME = 1
--- how long a swing keeps the character busy (live 2026-10-24: a light held State_Attacking 0.57 s; a heavy is slower), so one is only started with that long left before a strike, plus a margin
-local SWING_TIME   = { light = 0.6, heavy = 0.95 }
--- how long a cast keeps the character busy (live 2026-10-24: Scorching Barrage held its state for several seconds of hits)
-local SKILL_TIME   = 2
--- spells reach from here, so one is thrown before closing in (live 2026-10-25: a magic power 39 mage left its spell unused through a 70 s Raven Blackwood fight it lost on punches)
-local SPELL_RANGE  = 40
-local STRIKE_SLACK = 0.12
-local HOLD_POLL    = 0.03
-
-local function distance(a, b)
-    return (a - b).Magnitude
-end
-
-local function healthAlive(mob)
-    local ok, living = pcall(function()
-        return mob.model.Parent ~= nil and mob.humanoid.Parent ~= nil and mob.root.Parent ~= nil and mob.humanoid.Health > 0
-    end)
-    return ok and living
-end
-
-local function rootOf(mob)
-    local ok, position = pcall(function() return mob.root.Position end)
-    if ok then return position end
-    return nil
-end
-
--- how long the mob cannot strike for, off the attributes it carries (live 2026-10-24 on a wolf: State_Stunned 0.75 s after our hit, State_CantStrike 3 s after it finishes an attack, each with a StateEnd_ server-time stamp)
-local function freeFor(mob, now)
-    if not now then return 0 end
-    local ok, free = pcall(function()
-        local model = mob.model
-        local out = 0
-        for _, name in ipairs({ "Stunned", "CantStrike" }) do
-            local until_ = model:GetAttribute("StateEnd_" .. name)
-            if model:GetAttribute("State_" .. name) == true and type(until_) == "number" then out = math.max(out, until_ - now) end
-        end
-        return out
-    end)
-    if ok then return free end
-    return 0
-end
-
--- the mob is winding up or throwing an attack (live 2026-10-24: every hit a Dire Wolf landed came in its SkillActive with HyperArmor, which our hits don't interrupt, most while we were mid-combo or channelling a spell, when no parry or block can be pressed)
-local function attacking(mob)
-    local ok, on = pcall(function()
-        local model = mob.model
-        return model:GetAttribute("State_SkillActive") == true or model:GetAttribute("State_Swinging") == true
-    end)
-    return ok and on
-end
-
-local function healthShare(mob)
-    local ok, share = pcall(function() return mob.humanoid.Health / math.max(mob.humanoid.MaxHealth, 1) end)
-    if ok then return share end
-    return 1
-end
-
-local function chosenList(names)
-    local out = {}
-    for name, on in pairs(names) do
-        if on then out[#out + 1] = name end
-    end
-    table.sort(out)
-    return out
-end
-
-local function describe(list)
-    if #list == 1 then return list[1] end
-    return list[1] .. " or " .. list[2]
-end
-
--- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry, dodge (roll through specials), plus locked() for the premium gate, and the boss farm's proper (names that take no "a" or "the") and stayPut (no flying home when nothing's about)
-function M.new(cfg)
-    local function called(name, article)
-        if cfg.proper then return name end
-        if article == "a" and name:match("^[AEIOUaeiou]") then article = "an" end
-        return article .. " " .. name
-    end
-
-    -- parrying and the instakill are premium: the gate only no-ops a locked toggle's callback, so the on-by-default ones are checked here too
-    local function unlocked()
-        return not (type(cfg.locked) == "function" and cfg.locked())
-    end
-    local function parryOn() return cfg.parry == true and unlocked() end
-    local function instakillOn() return cfg.instakill == true and unlocked() end
-    local function instakillMode() return cfg.instakillMode == true and unlocked() end
-
-    -- mobs our own instakill zeroed here, and when it first was: their health reads 0 on this client whether or not the server took it
-    local zeroed = setmetatable({}, { __mode = "k" })
-
-    -- in instakill mode a mob lives until its instance leaves the world (the user, 2026-10-24: judge it by the instance, not by health), so one zeroed here is fought on until it is really gone
-    local function alive(mob)
-        if not instakillMode() then return healthAlive(mob) end
-        local ok, present = pcall(function() return mob.model.Parent ~= nil and mob.root.Parent ~= nil end)
-        if not ok or not present then return false end
-        if zeroed[mob.model] then return true end
-        return healthAlive(mob)
-    end
-
-    local brain = {}
-    local target = nil
-    local skipped = {}
-    local guarding = false
-    -- the special the current mob is winding up, and every special's wind-up as measured so far
-    local punishUntil = 0
-
-    function brain.begin()
-        target, skipped, guarding, punishUntil = nil, {}, false, 0
-        brain.aimed, brain.wired, brain.parryToken = false, false, nil
-    end
-
-    function brain.target()
-        return target and target.mob or nil
-    end
-
-    local function has(kit, state)
-        local State = kit.api("State")
-        if not State then return false end
-        local ok, on = State.has(state)
-        return ok and on == true
-    end
-
-    local function serverNow(kit)
-        local State = kit.api("State")
-        if not State then return nil end
-        local ok, now = State.serverTime()
-        if ok and type(now) == "number" then return now end
-        return nil
-    end
-
-    -- the soonest strike the parry api expects, in seconds, or nil
-    local function strikeIn(kit)
-        if not parryOn() then return nil end
-        local Parry = kit.api("Parry")
-        if not Parry then return nil end
-        local ok, due = Parry.incoming()
-        if ok and type(due) == "table" then return due.strikeIn end
-        return nil
-    end
-
-    local function canSwing(kit)
-        local State = kit.api("State")
-        if not State then return false end
-        local ok, can = State.can("combat")
-        return ok and can == true
-    end
-
-    local function guard(kit, on)
-        if guarding == on then return end
-        local Combat = kit.api("Combat")
-        if not Combat then return end
-        if Combat.block(on) == true or not on then guarding = on end
-    end
-
-    -- the nearest is not always the best: a mob with others round it brings them along, and a hurt one is nearly done
-    local function pick(kit, names)
-        local World = kit.api("World")
-        local here = kit.position()
-        if not (World and here) then return nil end
-        local living = true
-        if instakillMode() then living = nil end
-        local ok, list = World.mobs({ names = names, alive = living, origin = here, maxDistance = SEARCH, limit = 20 })
-        if not ok or type(list) ~= "table" then return nil end
-        if instakillMode() then
-            local kept = {}
-            for _, entry in ipairs(list) do
-                if entry.alive or zeroed[entry.model] then kept[#kept + 1] = entry end
-            end
-            list = kept
-        end
-        local okAll, everyone = World.mobs({ alive = true, origin = here, maxDistance = SEARCH, limit = 80 })
-        if not okAll or type(everyone) ~= "table" then everyone = list end
-        local now = os.clock()
-        local best, bestScore = nil, math.huge
-        for _, entry in ipairs(list) do
-            local skipUntil = skipped[entry.model]
-            if not skipUntil or skipUntil < now then
-                local crowd = 0
-                for _, other in ipairs(everyone) do
-                    if other.model ~= entry.model and distance(other.position, entry.position) <= CROWD_GAP then crowd = crowd + 1 end
-                end
-                local score = entry.distance + crowd * CROWD_COST - (1 - healthShare(entry)) * HURT_BONUS
-                if score < bestScore then best, bestScore = entry, score end
-            end
-        end
-        return best
-    end
-
-    local function skip(mob)
-        skipped[mob.model] = os.clock() + SKIP_FOR
-        target = nil
-    end
-
-    -- a mob that died while we were on it counts as ours
-    local function settle(kit)
-        if target and not alive(target.mob) then
-            if target.fought then
-                kit.add("kills")
-                local first = zeroed[target.mob.model]
-                if instakillMode() and type(first) == "number" and os.clock() - first <= EXECUTE_CREDIT then kit.add("executes") end
-            end
-            target = nil
-        end
-    end
-
-    -- the instakill, every frame it is in reach: in instakill mode tried whatever ownership says and judged later by the instance leaving; otherwise only on a mob the server has handed over, judged at once
-    local function tryExecute(kit, Combat, mob)
-        if instakillMode() then
-            if Combat.execute(mob.model, { force = true }) == true and not zeroed[mob.model] then zeroed[mob.model] = os.clock() end
-            return false
-        end
-        if instakillOn() and Combat.execute(mob.model) == true and not alive(mob) then
-            kit.add("executes")
-            return true
-        end
-        return false
-    end
-
-    local function aim(kit, Combat)
-        if brain.aimed then return end
-        local ok = Combat.setAim(function()
-            local current = target and target.mob
-            local position = current and rootOf(current)
-            if position then return position, current.root end
-            return nil
-        end)
-        if ok == true then
-            brain.aimed = true
-            kit.aiming(true)
-        end
-    end
-
-    local function castReady(kit, Combat)
-        local ok, skills = Combat.skills()
-        if not ok or type(skills) ~= "table" then return false end
-        for _, skill in ipairs(skills) do
-            if skill.ready then
-                aim(kit, Combat)
-                if Combat.cast(skill.name) == true then return true end
-            end
-        end
-        return false
-    end
-
-    -- the parry api runs while the farm fights and the player wants parries, and every landed parry opens the mob up
-    local function syncParry(kit)
-        local Parry = kit.api("Parry")
-        if not Parry then return end
-        if parryOn() and not brain.parryToken then
-            local ok, token = Parry.request("Mob Farm", { range = PARRY_RANGE, block = cfg.block ~= false, dodge = cfg.dodge ~= false })
-            if not ok then return end
-            brain.parryToken, brain.parryDodge = token, cfg.dodge ~= false
-            kit.track({ Disconnect = function()
-                if brain.parryToken == token then
-                    Parry.release(token)
-                    brain.parryToken = nil
-                end
-            end })
-        elseif not parryOn() and brain.parryToken then
-            Parry.release(brain.parryToken)
-            brain.parryToken = nil
-        elseif brain.parryToken and brain.parryDodge ~= (cfg.dodge ~= false) then
-            brain.parryDodge = cfg.dodge ~= false
-            Parry.adjust(brain.parryToken, { dodge = brain.parryDodge })
-        end
-    end
-
-    local function wire(kit)
-        syncParry(kit)
-        if brain.wired then return end
-        brain.wired = true
-        local Parry = kit.api("Parry")
-        if Parry then
-            kit.track(Parry.onParry.Connect(function()
-                punishUntil = os.clock() + PUNISH_TIME
-                kit.add("parries")
-            end))
-        end
-    end
-
-    -- the frames right after a hit, when the server is likeliest to hand the mob over, are watched one by one
-    local function watchLanding(kit, Combat, mob)
-        local untilAt = os.clock() + LAND_TIME
-        while os.clock() < untilAt do
-            if not alive(mob) then return end
-            if tryExecute(kit, Combat, mob) then return end
-            if not kit.sleep(0) then return end
-        end
-    end
-
-    local function fight(kit, mob, gap)
-        local Combat = kit.api("Combat")
-        if not Combat then
-            kit.status("Combat isn't ready yet.")
-            kit.sleep(1)
-            return
-        end
-        local okWeapon, weapon = Combat.weapon()
-        if not okWeapon then
-            kit.status("You don't have a weapon to fight with.")
-            kit.sleep(2)
-            return
-        end
-        if not weapon.equipped then
-            guard(kit, false)
-            kit.status("Drawing your weapon.")
-            Combat.equipWeapon()
-            return
-        end
-        if gap > MELEE then
-            guard(kit, false)
-            local due = strikeIn(kit)
-            if cfg.skills and gap <= SPELL_RANGE and (due == nil or due - STRIKE_SLACK >= SKILL_TIME) then
-                local at = rootOf(mob)
-                if at then kit.face(at) end
-                if castReady(kit, Combat) then
-                    target.fought = true
-                    kit.status(("Casting at %s."):format(called(mob.name, "the")))
-                    watchLanding(kit, Combat, mob)
-                    return
-                end
-            end
-            kit.status(("Closing in on %s."):format(called(mob.name, "the")))
-            kit.travel(function() return rootOf(mob) end, { reach = CHASE_REACH, broom = false, watch = function() return not alive(mob) end })
-            return
-        end
-        local at = rootOf(mob)
-        if at then kit.face(at) end
-        target.fought = true
-        if instakillMode() then
-            kit.status(("Fighting %s, instakilling it until it's gone."):format(called(mob.name, "a")))
-        else
-            kit.status(("Fighting %s (%d%% health left)."):format(called(mob.name, "a"), math.floor(healthShare(mob) * 100)))
-        end
-        if tryExecute(kit, Combat, mob) then return end
-
-        -- right after a parry the mob is open: no guard, every swing in
-        local punishing = os.clock() < punishUntil
-        if punishing then target.swings = 0 end
-
-        -- with parrying on, the parry api owns the defence: nothing is started that a strike due before it finishes would catch
-        if parryOn() then
-            guard(kit, false)
-            local due = strikeIn(kit)
-            if due and due < SWING_TIME.light + STRIKE_SLACK then
-                kit.status(("Waiting to parry %s."):format(called(mob.name, "the")))
-                kit.sleep(HOLD_POLL)
-                return
-            end
-            if not canSwing(kit) then
-                kit.sleep(HOLD_POLL)
-                return
-            end
-            -- room for a heavy: a window the mob cannot strike in, a parry just landed, or the next strike far enough off
-            local free = freeFor(mob, serverNow(kit))
-            if punishing then free = math.max(free, SWING_TIME.heavy) end
-            -- an attack under way is never swung into: the parry api's block or parry is all that answers it
-            if attacking(mob) and free <= 0 then
-                kit.status(("Waiting out %s's attack."):format(mob.name))
-                kit.sleep(HOLD_POLL)
-                return
-            end
-            local room = math.huge
-            if due then room = due - STRIKE_SLACK end
-            local heavyFits = free >= SWING_TIME.heavy and room >= SWING_TIME.heavy
-            local swung = false
-            -- a spell channels for seconds with no parry or block, so it goes in when no strike is due before it ends, or into a window the mob can't strike in
-            if cfg.skills and (free >= SKILL_TIME or punishing or room >= SKILL_TIME) then swung = castReady(kit, Combat) end
-            if not swung and cfg.heavy and heavyFits and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
-            if not swung then swung = Combat.attack("light") == true end
-            if swung then
-                target.swings = (target.swings or 0) + 1
-                watchLanding(kit, Combat, mob)
-            else
-                kit.sleep(HOLD_POLL)
-            end
-            return
-        end
-
-        -- a short guard every couple of swings, so its next hit lands on the block
-        if cfg.block and not punishing and (target.swings or 0) >= GUARD_EVERY then
-            guard(kit, true)
-            local untilAt = os.clock() + GUARD_TIME
-            while os.clock() < untilAt and alive(mob) do
-                local now = rootOf(mob)
-                if now then kit.face(now) end
-                if not kit.sleep(0.1) then return end
-            end
-            target.swings = 0
-            return
-        end
-
-        -- the game would refuse a swing now (mid swing, debounce, stunned): block it out instead of wasting the press
-        if not canSwing(kit) then
-            if cfg.block and not punishing then guard(kit, true) end
-            kit.sleep(WAIT_GUARD)
-            return
-        end
-        guard(kit, false)
-
-        local swung = false
-        if cfg.skills then swung = castReady(kit, Combat) end
-        if not swung and cfg.heavy and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
-        if not swung then swung = Combat.attack("light") == true end
-        if swung then
-            target.swings = (target.swings or 0) + 1
-            watchLanding(kit, Combat, mob)
-        else
-            kit.sleep(WAIT_GUARD)
-        end
-    end
-
-    function brain.step(kit)
-        wire(kit)
-        local names = chosenList(cfg.names)
-        if #names == 0 then
-            guard(kit, false)
-            kit.status("Pick the monsters to farm.")
-            kit.sleep(1)
-            return
-        end
-        settle(kit)
-
-        if target and not cfg.names[target.mob.name] and not cfg.names[target.mob.baseName] then target = nil end
-        if not target then
-            guard(kit, false)
-            local entry = pick(kit, names)
-            if not entry then
-                local home, here = kit.home(), kit.position()
-                -- the boss farm picks its own next spot, so it never flies back to the last fight (live 2026-10-25: twice 1,500 studs back to Raven's den after Holda's house had no way in)
-                if home and here and not cfg.stayPut and distance(home, here) > HOME_FAR then
-                    kit.status("Heading back to where you were farming.")
-                    kit.travel(home, { reach = 20 })
-                    return
-                end
-                if #names > 2 then
-                    kit.status("None of the monsters you picked are around. Waiting for one to show up.")
-                else
-                    kit.status(("No %s around. Waiting for one to show up."):format(describe(names)))
-                end
-                kit.sleep(1.5)
-                return
-            end
-            target = { mob = entry, since = os.clock(), swings = 0 }
-        end
-
-        local mob = target.mob
-        local share = healthShare(mob)
-        if not target.share or share < target.share - 0.005 then target.share, target.since = share, os.clock() end
-        if os.clock() - target.since > TARGET_TIME then
-            guard(kit, false)
-            return skip(mob)
-        end
-        local here, at = kit.position(), rootOf(mob)
-        if not (here and at) then
-            settle(kit)
-            return
-        end
-        local gap = distance(here, at)
-        if gap > FIGHT_RANGE then
-            -- the clock on hurting it only runs within reach (live 2026-10-25: a death and the flight back used up its 40 s, and a full-health Raven Blackwood was benched on arrival)
-            target.since = os.clock()
-            guard(kit, false)
-            kit.status(("Flying to %s (%d studs away)."):format(called(mob.name, "a"), math.floor(gap)))
-            local ok, why = kit.travel(function() return rootOf(mob) end, { reach = APPROACH, watch = function() return not alive(mob) end })
-            -- only a route that can't be had leaves the mob for a while; a respawn, a server teleport or a death mid-flight is just tried again (live 2026-10-24: a boss left alone for 30 s over a trip begun while the character loaded)
-            if not ok and UNREACHABLE[why] then
-                local after, now = kit.position(), rootOf(mob)
-                if after and now and distance(after, now) > FIGHT_RANGE then skip(mob) end
-            end
-            return
-        end
-        kit.setHome(at)
-        if kit.flying() then
-            guard(kit, false)
-            kit.status("Landing to fight.")
-            kit.land()
-            return
-        end
-        fight(kit, mob, gap)
-        settle(kit)
-    end
-
-    return brain
-end
-
-return M
-
-end)
-__bundle_register("Features/Clover/Farm/Quests", function(require, _LOADED, __bundle_register, __bundle_modules)
--- quest farm brain: works through the repeatable quests you pick: takes one whose giver is off cooldown (nearest first), does its tasks with the farm's own brains (the gathering farm for a gather, the mob farm for a hunt where the quest points, the race farm for a race) or by hand (a 'Hit the ...' task, struck with light attacks; an item no node gives, bought at a shop), hands it in at the giver and goes on, waiting out the cooldowns when every quest is resting; a quest it has no way to do is left alone
-local Services = require("Services")
-local Mobs     = require("Features/Clover/Farm/Mobs")
-local Nodes    = require("Features/Clover/Farm/Nodes")
-local Races    = require("Features/Clover/Farm/Races")
-
-local M = {}
-
--- live 2026-10-24: accepting and handing in both answered from beside the giver with no dialogue open
-local GIVER_REACH = 8
--- a giver's cooldown is asked again no sooner than this, and a giver that would not give is left this long
-local RECHECK = 30
-local GIVE_UP = 120
--- monsters for a hunt are looked for within this of where the quest points; further than that it flies there first
-local AREA = 250
--- a hunt with none of its monsters about for this long (Night Charmers only come out after dark) is set aside this long while other quests go on
-local NO_MOB_WAIT = 45
-local SET_ASIDE = 300
--- monsters that only come out after dark (live 2026-10-24: Night Charmers), whose hunts wait out the day rather than fly over to find nothing; the game's night by Lighting.ClockTime
-local NIGHT_ONLY = { ["Night Charmer"] = true }
-local DUSK, DAWN = 18, 6
--- picking the best quests itself: what each pays (its XP, and a Mark counted as this much XP) over a guess at its time, travel at this speed plus each task's own, worked out again this often
-local MARK_WORTH = 2
-local GUESS_SPEED = 250
-local GUESS = { collect = 10, buy = 8, kill = 45, boss = 150, race = 15, hit = 0.9, handIn = 5 }
-local RANK_EVERY = 30
-local WAIT = 5
--- a "Hit the ..." task (Captain Hayes' Whack-a-Dummy, live 2026-10-24: 35 hits on any of three Training Dummies in the Kamo Encampment) is struck from this close, one light attack at a time, looking for the target this far round where the quest points
-local HIT_REACH = 5
-local HIT_AREA = 60
-local HIT_GAP = 0.35
-
-local function distance(a, b)
-    return (a - b).Magnitude
-end
-
-local function chosenList(set)
-    local out = {}
-    for name, on in pairs(set) do
-        if on then out[#out + 1] = name end
-    end
-    table.sort(out)
-    return out
-end
-
--- a quest title that ends in its own "!" or "?" (Boar Hunt!) takes no full stop after it
-local function say(kit, fmt, ...)
-    local text = fmt:format(...):gsub("([!?])%.", "%1")
-    kit.status(text)
-end
-
-local function minutes(seconds)
-    if seconds < 60 then return ("%ds"):format(math.ceil(seconds)) end
-    return ("%dm %02ds"):format(math.floor(seconds / 60), math.floor(seconds % 60))
-end
-
--- cfg is the live settings table the menu writes (givers, a set); shared holds the mob, gathering and race farms' own settings, which the quests borrow
-function M.new(cfg, shared)
-    local brain = {}
-    local mobCfg = setmetatable({ names = {} }, { __index = shared.mob })
-    local nodeCfg = setmetatable({ items = {} }, { __index = shared.node })
-    local raceCfg = setmetatable({ course = nil, challenge = false, best = false }, { __index = shared.race })
-    local subs = { kill = Mobs.new(mobCfg), collect = Nodes.new(nodeCfg), race = Races.new(raceCfg) }
-    local using = nil
-    local readyAt, askedAt, skipped, unable = {}, {}, {}, {}
-    local aside, emptySince = {}, nil
-    local gatherable = nil
-    -- best mode's ranking of the quests, kept for RANK_EVERY
-    local ranked, rankedAt = nil, -math.huge
-
-    function brain.begin()
-        using, readyAt, askedAt, skipped, unable, gatherable = nil, {}, {}, {}, {}, nil
-        ranked, rankedAt = nil, -math.huge
-        aside, emptySince = {}, nil
-        for _, sub in pairs(subs) do
-            if sub.begin then sub.begin() end
-        end
-    end
-
-    function brain.stop(why)
-        for _, sub in pairs(subs) do
-            if sub.stop then pcall(sub.stop, why) end
-        end
-    end
-
-    local function switch(kit, kind)
-        if using == kind then return subs[kind] end
-        local previous = using and subs[using] or nil
-        if previous and previous.stop then pcall(previous.stop, "switched") end
-        -- a block the hunt was holding is let go before anything else is tried
-        local Combat = kit.api("Combat")
-        if Combat then pcall(Combat.block, false) end
-        using = kind
-        if subs[kind].begin then subs[kind].begin() end
-        return subs[kind]
-    end
-
-    -- the nodes that give an item: a plant is its own node, an ore drops from rocks of other names (live 2026-10-24: Silver from Pebble and Stone Cluster); nil when nothing the gathering farm reaches gives it (Wood and Stone come from no node)
-    local function nodesFor(kit, item)
-        if gatherable == nil then
-            local Professions = kit.api("Professions")
-            if not Professions then return nil end
-            local map = {}
-            for _, kind in ipairs({ "Ore", "Harvest" }) do
-                local ok, list = Professions.nodes({ kind = kind })
-                if ok and type(list) == "table" then
-                    for _, entry in ipairs(list) do
-                        local gives = entry.drop or entry.item
-                        if type(gives) == "string" and type(entry.item) == "string" then
-                            map[gives] = map[gives] or {}
-                            map[gives][entry.item] = true
-                        end
-                    end
-                end
-            end
-            if next(map) == nil then return nil end
-            gatherable = map
-        end
-        return gatherable[item]
-    end
-
-    local function mobsFor(kit, Quests, stem)
-        local World = kit.api("World")
-        if not World then return {} end
-        local ok, names = World.mobNames()
-        if not ok or type(names) ~= "table" then return {} end
-        return Quests.matchMobs(stem, names)
-    end
-
-    local function giverModel(kit, name)
-        local World = kit.api("World")
-        if not World then return nil end
-        local ok, entry = World.npc(name)
-        if ok and type(entry) == "table" then return entry.model end
-        return nil
-    end
-
-    -- stands by the giver; answers its model once there
-    local function reachGiver(kit, name, at)
-        local here = kit.position()
-        if not here then return nil end
-        local model = giverModel(kit, name)
-        local spot = (model and model:GetPivot().Position) or at
-        if not spot then return nil end
-        if distance(here, spot) > GIVER_REACH + 2 then
-            say(kit, "Flying to %s (%d studs away).", name, math.floor(distance(here, spot)))
-            kit.travel(spot, { reach = GIVER_REACH })
-            return nil
-        end
-        if kit.flying() then
-            kit.land()
-            return nil
-        end
-        return model or giverModel(kit, name)
-    end
-
-    local function handIn(kit, Quests, quest, template)
-        local model = reachGiver(kit, quest.giver, (template and template.position) or quest.returnAt)
-        if not model then return end
-        say(kit, "Handing in %s.", quest.title)
-        local ok = Quests.turnIn(quest.key)
-        if not ok then
-            -- the game's own dialogue hands it in on opening (DM.lua:93-106) when the plain send was not taken
-            local Interact = kit.api("Interact")
-            if Interact then
-                Interact.talk(model)
-                kit.sleep(1)
-                pcall(Interact.close)
-            end
-            local okNow, now = Quests.quest(quest.key)
-            ok = not okNow or (type(now) == "table" and now.completed)
-        end
-        if ok then
-            kit.add("quests")
-            kit.stats.lastQuest = quest.title
-            local cooldown = template and template.cooldown or 600
-            readyAt[quest.key] = os.clock() + cooldown
-        else
-            skipped[quest.key] = os.clock() + GIVE_UP
-        end
-    end
-
-    -- the nearest model named like the task's target ("Hit the Training Dummy") that has a Humanoid, round where the quest points
-    local function hitTarget(task)
-        local wanted = string.match(task.name or "", "^Hit the (.+)$") or string.match(task.name or "", "^Hit (.+)$")
-        if not (wanted and task.position) then return nil end
-        local okParts, parts = pcall(function() return Services.Workspace:GetPartBoundsInRadius(task.position, HIT_AREA) end)
-        if not okParts then return nil, wanted end
-        local best, bestGap, seen = nil, math.huge, {}
-        for _, part in ipairs(parts) do
-            local model = part:FindFirstAncestorOfClass("Model")
-            if model and not seen[model] and model.Name == wanted and model:FindFirstChildOfClass("Humanoid") then
-                seen[model] = true
-                local okAt, at = pcall(function() return model:GetPivot().Position end)
-                if okAt and distance(at, task.position) < bestGap then best, bestGap = { model = model, position = at }, distance(at, task.position) end
-            end
-        end
-        return best, wanted
-    end
-
-    -- answers false when the task isn't one it knows how to hit
-    local function hit(kit, quest, task)
-        local target, wanted = hitTarget(task)
-        if not wanted then return false end
-        local here = kit.position()
-        if not here then return true end
-        if not target then
-            if task.position and distance(here, task.position) > HIT_REACH * 4 then
-                say(kit, "Flying to the %s for %s.", wanted, quest.title)
-                kit.travel(task.position, { reach = 10 })
-            else
-                kit.sleep(1)
-            end
-            return true
-        end
-        if distance(here, target.position) > HIT_REACH + 2 then
-            kit.travel(target.position, { reach = HIT_REACH })
-            return true
-        end
-        if kit.flying() then
-            kit.land()
-            return true
-        end
-        local Combat = kit.api("Combat")
-        if not Combat then
-            kit.sleep(1)
-            return true
-        end
-        local okWeapon, weapon = Combat.weapon()
-        if not okWeapon then
-            unable[quest.key] = ("%s needs a weapon to hit the %s with."):format(quest.title, wanted)
-            return true
-        end
-        if not weapon.equipped then
-            Combat.equipWeapon()
-            kit.sleep(0.5)
-            return true
-        end
-        kit.face(target.position)
-        Combat.attack("light")
-        kit.sleep(HIT_GAP)
-        return true
-    end
-
-    -- an item no node gives but a shop sells (live 2026-10-24: Wood at 5 Marks in Kamo): what's still missing is bought there; answers false when no shop is known for it
-    local function buyFor(kit, quest, task)
-        local Shop = kit.api("Shop")
-        local here = kit.position()
-        if not (Shop and here and task.target) then return false end
-        local ok, list = Shop.find(task.target, here)
-        if not ok or type(list) ~= "table" or #list == 0 then return false end
-        local listing = list[1]
-        local need = math.max((task.max or 1) - (task.progress or 0), 1)
-        local count = math.min(need, Shop.MAX_BUY)
-        local State = kit.api("State")
-        local okProfile, profile = false, nil
-        if State then okProfile, profile = State.profile() end
-        local marks = okProfile and type(profile) == "table" and tonumber(profile.marks) or nil
-        if listing.price and marks and marks < listing.price * count then
-            unable[quest.key] = ("%s needs %d %s, and buying them costs %d Marks (you have %d)."):format(quest.title, need, task.target, listing.price * count, marks)
-            return true
-        end
-        if distance(here, listing.position) > Shop.REACH - 2 then
-            say(kit, "Flying to the shop to buy %s for %s.", task.target, quest.title)
-            kit.travel(listing.position, { reach = Shop.REACH - 4 })
-            return true
-        end
-        if kit.flying() then
-            kit.land()
-            return true
-        end
-        say(kit, "Buying %d %s for %s.", count, task.target, quest.title)
-        local bought, why = Shop.buy(task.target, count)
-        if not bought then
-            if why == Shop.Errors.NO_MARKS then
-                unable[quest.key] = ("%s needs more Marks to buy %s."):format(quest.title, task.target)
-            else
-                kit.sleep(2)
-            end
-        else
-            kit.sleep(1)
-        end
-        return true
-    end
-
-    -- one piece of the task, done by the brain that farms that kind of thing
-    local function work(kit, Quests, quest, task)
-        local here = kit.position()
-        local nodes = task.kind == "collect" and task.target and nodesFor(kit, task.target) or nil
-        if nodes then
-            nodeCfg.items = nodes
-            if task.position and here and distance(here, task.position) > AREA then kit.setHome(task.position) end
-            return switch(kit, "collect").step(kit)
-        end
-        if task.kind == "kill" then
-            local names = mobsFor(kit, Quests, task.target)
-            if #names == 0 then
-                unable[quest.key] = ("Couldn't tell which monster %s wants."):format(quest.title)
-                return
-            end
-            local set, nightOnly = {}, true
-            for _, name in ipairs(names) do
-                set[name] = true
-                if not NIGHT_ONLY[name] then nightOnly = false end
-            end
-            local clock = Services.Lighting.ClockTime
-            if nightOnly and clock >= DAWN and clock < DUSK then
-                aside[quest.key] = os.clock() + SET_ASIDE
-                return
-            end
-            mobCfg.names = set
-            if task.position then
-                kit.setHome(task.position)
-                local World = kit.api("World")
-                local near = nil
-                if World and here then
-                    local okNear, list = World.mobs({ names = names, alive = true, origin = here, maxDistance = AREA, limit = 1 })
-                    near = okNear and type(list) == "table" and list[1] or nil
-                end
-                if not near and here and distance(here, task.position) > AREA then
-                    say(kit, "Flying to the %s hunt for %s.", names[1], quest.title)
-                    switch(kit, "kill")
-                    kit.travel(task.position, { reach = 40 })
-                    return
-                end
-            end
-            local hunt = switch(kit, "kill")
-            hunt.step(kit)
-            if hunt.target() then
-                emptySince = nil
-            elseif here and task.position and distance(here, task.position) <= AREA * 2 then
-                emptySince = emptySince or os.clock()
-                if os.clock() - emptySince > NO_MOB_WAIT then
-                    emptySince = nil
-                    aside[quest.key] = os.clock() + SET_ASIDE
-                end
-            end
-            return
-        end
-        if task.kind == "race" and task.target then
-            raceCfg.course = task.target
-            return switch(kit, "race").step(kit)
-        end
-        if task.kind == "other" and hit(kit, quest, task) then return end
-        if task.kind == "collect" and buyFor(kit, quest, task) then return end
-        unable[quest.key] = ("%s needs something the farm can't do yet (%s)."):format(quest.title, task.name)
-    end
-
-    local function isNight()
-        local clock = Services.Lighting.ClockTime
-        return clock >= DUSK or clock < DAWN
-    end
-
-    -- a node of these items the farm's tools can gather
-    local function toolsGather(kit, items)
-        local Professions = kit.api("Professions")
-        if not Professions then return false end
-        for _, kind in ipairs({ "Ore", "Harvest" }) do
-            local okPower, power = Professions.toolPower(kind)
-            if okPower and (tonumber(power) or 0) > 0 then
-                local ok, list = Professions.nodes({ kind = kind, items = items, maxPower = power, limit = 1 })
-                if ok and type(list) == "table" and #list > 0 then return true end
-            end
-        end
-        return false
-    end
-
-    local bossNames = nil
-    local function isBoss(kit, names)
-        if bossNames == nil then
-            local World = kit.api("World")
-            local ok, beasts = false, nil
-            if World then ok, beasts = World.beasts() end
-            if not (ok and type(beasts) == "table") then return false end
-            bossNames = {}
-            for _, beast in ipairs(beasts) do
-                if beast.boss then bossNames[beast.name] = true end
-            end
-        end
-        for _, name in ipairs(names) do
-            if bossNames[name] then return true end
-        end
-        return false
-    end
-
-    -- seconds a quest's tasks should take, or nil when one of them is something the farm can't do
-    local function taskTime(kit, Quests, template)
-        local Shop = kit.api("Shop")
-        local seconds = 0
-        for _, task in ipairs(template.tasks or {}) do
-            if not task.hidden then
-                if task.kind == "collect" then
-                    local nodes = task.target and nodesFor(kit, task.target) or nil
-                    local okShop, listings = false, nil
-                    if Shop and task.target then okShop, listings = Shop.find(task.target) end
-                    if nodes and toolsGather(kit, nodes) then
-                        seconds = seconds + task.max * GUESS.collect
-                    elseif okShop and type(listings) == "table" and #listings > 0 then
-                        seconds = seconds + GUESS.buy
-                    else
-                        return nil
-                    end
-                elseif task.kind == "kill" then
-                    local names = mobsFor(kit, Quests, task.target)
-                    if #names == 0 then return nil end
-                    local nightOnly = true
-                    for _, name in ipairs(names) do
-                        if not NIGHT_ONLY[name] then nightOnly = false end
-                    end
-                    if nightOnly and not isNight() then return nil end
-                    seconds = seconds + task.max * (isBoss(kit, names) and GUESS.boss or GUESS.kill)
-                elseif task.kind == "race" then
-                    seconds = seconds + GUESS.race
-                elseif task.kind == "other" and string.match(task.name or "", "^Hit ") then
-                    seconds = seconds + task.max * GUESS.hit
-                else
-                    return nil
-                end
-            end
-        end
-        return seconds
-    end
-
-    -- every repeatable the farm can do, as giver -> how much it pays a second, the best first in the list
-    local function rankQuests(kit, Quests)
-        if ranked and os.clock() - rankedAt < RANK_EVERY then return ranked.list, ranked.score end
-        local ok, list = Quests.repeatables()
-        local here = kit.position()
-        if not (ok and type(list) == "table" and here) then return {}, {} end
-        local score, givers = {}, {}
-        for _, template in ipairs(list) do
-            local seconds = not unable[template.giver] and taskTime(kit, Quests, template) or nil
-            if seconds and template.position then
-                local first = template.tasks and template.tasks[1] and template.tasks[1].position or template.position
-                local travel = (distance(here, template.position) + 2 * distance(template.position, first)) / GUESS_SPEED
-                local rewards = template.rewards or {}
-                local worth = (rewards.xp or 0) + (rewards.marks or 0) * MARK_WORTH
-                score[template.giver] = worth / (seconds + travel + GUESS.handIn)
-                givers[#givers + 1] = template.giver
-            end
-        end
-        table.sort(givers, function(a, b) return score[a] > score[b] end)
-        ranked, rankedAt = { list = givers, score = score }, os.clock()
-        return givers, score
-    end
-
-    local function templatesBy(Quests)
-        local ok, list = Quests.repeatables()
-        local out = {}
-        if ok and type(list) == "table" then
-            for _, template in ipairs(list) do out[template.giver] = template end
-        end
-        return out
-    end
-
-    -- the nearest picked quest that can be taken now; cooldowns are asked as they come up, never more than every RECHECK
-    local function takeNext(kit, Quests, givers, templates, holding, score)
-        local here = kit.position()
-        if not here then return end
-        local now = os.clock()
-        local options, soonest = {}, nil
-        for _, giver in ipairs(givers) do
-            local template = templates[giver]
-            if template and template.position and not unable[giver] and not holding[giver] and (skipped[giver] or 0) <= now then
-                local at = readyAt[giver] or 0
-                if at <= now then
-                    options[#options + 1] = template
-                elseif not soonest or at < soonest then
-                    soonest = at
-                end
-            end
-        end
-        table.sort(options, function(a, b)
-            if score then return (score[a.giver] or 0) > (score[b.giver] or 0) end
-            return distance(here, a.position) < distance(here, b.position)
-        end)
-        for _, template in ipairs(options) do
-            local giver = template.giver
-            if (askedAt[giver] or -math.huge) + RECHECK <= now then
-                askedAt[giver] = now
-                local ok, left = Quests.cooldown(giver)
-                if ok and left > 0 then
-                    readyAt[giver] = now + left
-                    if not soonest or readyAt[giver] < soonest then soonest = readyAt[giver] end
-                end
-            end
-            if (readyAt[giver] or 0) <= now then
-                local model = reachGiver(kit, giver, template.position)
-                if not model then return end
-                say(kit, "Taking %s from %s.", template.title, giver)
-                local taken = Quests.accept(model)
-                if not taken then
-                    skipped[giver] = os.clock() + GIVE_UP
-                    readyAt[giver] = nil
-                end
-                return
-            end
-        end
-        local _, setAside = next(aside)
-        if soonest then
-            say(kit, "Every quest you picked is resting. The next one is ready in %s.", minutes(soonest - now))
-        elseif setAside and setAside > now then
-            say(kit, "The monsters for your hunts aren't out right now. Looking again in %s.", minutes(setAside - now))
-        elseif next(unable) then
-            local _, why = next(unable)
-            kit.status(why)
-        else
-            kit.status("None of the quests you picked can be taken right now.")
-        end
-        kit.sleep(WAIT)
-    end
-
-    function brain.step(kit)
-        local Quests = kit.api("Quests")
-        if not Quests then
-            kit.status("Quests aren't ready yet.")
-            kit.sleep(1)
-            return
-        end
-        local givers, score = nil, nil
-        if cfg.best then
-            givers, score = rankQuests(kit, Quests)
-            if #givers == 0 then
-                kit.status("None of the quests can be done right now.")
-                kit.sleep(WAIT)
-                return
-            end
-        else
-            givers = chosenList(cfg.givers)
-            if #givers == 0 then
-                kit.status("Pick the quests to do.")
-                kit.sleep(1)
-                return
-            end
-        end
-        local picked = {}
-        for _, giver in ipairs(givers) do picked[giver] = true end
-        local templates = templatesBy(Quests)
-        local ok, active = Quests.active()
-        local holding = {}
-        if ok and type(active) == "table" then
-            for _, quest in ipairs(active) do
-                if not quest.completed then holding[quest.key] = true end
-            end
-            for _, quest in ipairs(active) do
-                if picked[quest.key] and not quest.completed and not unable[quest.key] and (aside[quest.key] or 0) <= os.clock() then
-                    if quest.ready then return handIn(kit, Quests, quest, templates[quest.key]) end
-                    for _, task in ipairs(quest.tasks) do
-                        if not task.done and not task.hidden then
-                            say(kit, "%s: %s (%d of %d).", quest.title, task.name, task.progress, task.max)
-                            return work(kit, Quests, quest, task)
-                        end
-                    end
-                end
-            end
-        end
-        return takeNext(kit, Quests, givers, templates, holding, score)
     end
 
     return brain
