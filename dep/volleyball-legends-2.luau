@@ -20442,9 +20442,9 @@ local HitSettings = require("Features/Volleyball/HitSettings")
 
 return function(tab)
     local hitting = tab:AddLeftGroupbox("Hitting", "hand")
-    -- auto hit's swings are always aimed, so turning it on or off tells assist's aim
-    hitting:AddToggle("VL_AutoHit", { Text = "Auto Hit", Default = false, Callback = HitSettings.aimGateChanged })
-        :AddKeyPicker("VL_AutoHitKey", { Default = nil, SyncToggleState = true, Mode = "Toggle" })
+    -- auto hit's swings are always aimed, so turning it on or off tells assist's aim; premium, its bind too so a locked click shows the upsell
+    hitting:AddToggle("VL_AutoHit", { Text = "Auto Hit", Default = false, Callback = HitSettings.aimGateChanged, Premium = true })
+        :AddKeyPicker("VL_AutoHitKey", { Default = nil, SyncToggleState = true, Mode = "Toggle", Premium = true })
     hitting:AddDropdown("VL_HitWith", { Text = "Ground Hit", Values = { "Bump", "Set", "Nothing" }, Default = "Bump" })
     hitting:AddDropdown("VL_AirHit", { Text = "Air Hit", Values = { "Spike", "Jump Set" }, Default = "Spike" })
     hitting:AddToggle("VL_ChaseBall", { Text = "Chase Ball", Default = false, Tooltip = "Walk to where the ball lands" })
