@@ -108,7 +108,7 @@ local FREE_SCRIPTS = {
 }
 
 local LUARMOR_SDK_URL   = "https://sdkapi-public.luarmor.net/library.lua"
-local LUARMOR_SCRIPT_ID = "2a503330cb8ca154841314e3b291f7bf"
+local LUARMOR_SCRIPT_ID = "1acad587672d96c8afb9c5bbc36bf921"
 local LuarmorAPI, LuarmorInitDone
 
 local function initLuarmor()
