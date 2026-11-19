@@ -823,7 +823,7 @@ end
 local BENCHMARKS = {
     { name = "sUNC",   value = 100, shown = "100", link = SUNC_RESULTS },
     { name = "Myriad", value = 100, shown = "100", link = MYRIAD_RESULTS },
-    { name = "UNC",    value = 95,  shown = "~95" },
+    { name = "UNC",    value = 100,  shown = "100" },
 }
 
 local function benchmarkSlide(page, owner)
