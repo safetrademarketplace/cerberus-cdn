@@ -9011,7 +9011,7 @@ M.layout = {
     { section = "Auto", tabs = {
         { key = "Control",   label = "Control",   icon = "sliders-horizontal", configKeys = { "FarmControl", "Webhook", "AutoQuests", "AutoGarden", "AutoWorldEvents" } },
         { key = "Fights",    label = "Fights",    icon = "swords",             configKeys = { "AutoWorldEvents", "MobFarm", "AutoRaid" } },
-        { key = "Quests",    label = "Quests",    icon = "scroll",             configKeys = { "AutoQuests" } },
+        { key = "Quests",    label = "Quests",    icon = "scroll",             configKeys = { "AutoQuests", "AutoHamon" } },
         { key = "Gathering", label = "Gathering", icon = "sprout",             configKeys = { "AutoGarden", "CashCases", "GameUtilities" } },
     } },
     -- the game's own features that aren't combat, travel or farming
@@ -9035,7 +9035,7 @@ M.mounts = {
     { key = "Combat",     mount = TabCombat,     mountOrder = 6,  configKeys = { "Combat", "Aimbot" } },
     { key = "ESP",        mount = TabESP,        mountOrder = 7,  configKeys = { "ESP" } },
     { key = "Misc",       mount = TabMisc,       mountOrder = 8,  configKeys = { "Misc" } },
-    { key = "Auto",       mount = TabAuto,       mountOrder = 9,  configKeys = { "AutoQuests", "AutoGarden", "AutoStats", "AutoWorldEvents", "CashCases", "MobFarm", "AutoRaid", "ServerIntel", "FarmControl", "Webhook" } },
+    { key = "Auto",       mount = TabAuto,       mountOrder = 9,  configKeys = { "AutoQuests", "AutoGarden", "AutoStats", "AutoHamon", "AutoWorldEvents", "CashCases", "MobFarm", "AutoRaid", "ServerIntel", "FarmControl", "Webhook" } },
     { key = "Fun",        mount = TabFun,        mountOrder = 10, configKeys = { "Fun" } },
     { key = "Game",       mount = TabGame,       mountOrder = 11, configKeys = { "GameUtilities" } },
     { key = "UISettings", mount = TabUISettings, mountOrder = 1 },
@@ -10545,7 +10545,9 @@ local Search      = require("Features/Utilities/Beachcombing/Search")
 
 local OWNER = "AutoBeachcombing"
 local FARM = "Beachcombing"
-local TICK = 1
+-- live 2026-11-22 (user: as efficient as possible): caches cap at 3 alive and respawn 20-35 s after a dig (Beachcombing.lua Caches), about one
+-- find per 9 s at best; a 1 s pass and 0.6 s settle ran ~13 s a find
+local TICK = 0.3
 local DETECTOR = "Metal Detector"
 -- Modules.Beachcombing.lua:7, the model the server welds to your character while it is switched on
 local HELD = "HeldMetalDetector"
@@ -10560,7 +10562,7 @@ local ROAM = 80
 local SCAN = 36
 local SPACING = 2.5
 local STEP = 8
-local SETTLE = 0.6
+local SETTLE = 0.35
 local SAMPLE_AGE = 20
 local SAMPLE_REACH = 60
 local DIG_WAIT = 6
@@ -10574,6 +10576,9 @@ local SHOP_WAIT = 6
 -- live 2026-11-17 (garden flow): a trade sent right after the shop opens is refused with "Please wait a moment"
 local SHOP_SETTLE = 1.5
 local SHOP_TRIES = 3
+-- Beachcombing.lua:75 HourlyFinds: past this many in an hour the loot turns to scrap 30 / junk 70 (recon/reward_rate.md:101), so the farm rests
+local HOURLY_FINDS = 60
+local HOUR = 3600
 
 local M = {}
 
@@ -10596,6 +10601,9 @@ function M.mount(ctx)
     local sandAt0 = 0
     local tries, parked, failedAt = {}, {}, {}
     local lastDig = -math.huge
+    -- os.clock() of each find this session, kept for the hour the game's cap counts
+    local findTimes = {}
+    local lastFinds = nil
 
     local function say(text) Status.set(OWNER, text, Status.ACTING) end
 
@@ -10876,6 +10884,25 @@ function M.mount(ctx)
         return nil
     end
 
+    local function hourlyCap()
+        local mod = beachModule()
+        return mod and tonumber(rawget(mod, "HourlyFinds")) or HOURLY_FINDS
+    end
+
+    -- counts new finds off Stats.BeachFinds and answers the seconds until the hour's cap frees a find, or nil while finds still pay
+    local function capRest()
+        local now, total = os.clock(), tonumber(finds())
+        if total then
+            if lastFinds and total > lastFinds then
+                for _ = 1, math.min(total - lastFinds, 10) do findTimes[#findTimes + 1] = now end
+            end
+            lastFinds = total
+        end
+        while findTimes[1] and now - findTimes[1] > HOUR do table.remove(findTimes, 1) end
+        if #findTimes < hourlyCap() then return nil end
+        return HOUR - (now - findTimes[1])
+    end
+
     -- gated: the farm plan held this pass back; work: the last pass that ran acted
     local gated, work = false, false
     local function pass()
@@ -10892,6 +10919,12 @@ function M.mount(ctx)
         local root = References.humanoidRootPart
         if not (hum and hum.Parent and hum.Health > 0 and root and root.Parent) then return "Waiting to respawn" end
         if Player.isBusy() then return "Waiting for a scene" end
+
+        local rest = capRest()
+        if rest and toggleOn("Beachcombing_StopAtCap", true) then
+            if held() then Player.useItem(DETECTOR) end
+            return ("Hourly finds used, back in %dm"):format(math.ceil(rest / 60))
+        end
 
         if count(DETECTOR) < 1 then
             if not toggleOn("Beachcombing_Buy", true) then return "Need a Metal Detector" end
@@ -10981,6 +11014,11 @@ function M.mount(ctx)
         enabled = function() return enabled end,
         active  = function() return token ~= nil end,
         wants   = function() return enabled and work end,
+    })
+    box:AddToggle("Beachcombing_StopAtCap", {
+        Text    = "Stop At Hourly Cap",
+        Default = true,
+        Tooltip = "After 60 finds an hour it's only scrap and junk",
     })
     box:AddToggle("Beachcombing_Buy", {
         Text    = "Buy Detector",
@@ -11447,8 +11485,9 @@ function M.mount(ctx)
         local ev, wait = Plan.pick(list, want, done, latched)
         if not ev then
             if wait then
-                -- events first takes movement early, so the other farms are already parked when the loot lands
-                if first and Player.ready() and ensureClaim() then return wait, Status.WAITING, true end
+                -- events first takes movement early, so the other farms are already parked when the loot lands (not for a transport en route: see Plan.holdsEarly)
+                if wanting and first and Player.ready() and ensureClaim() then return wait, Status.WAITING, true end
+                releaseClaim()
                 return wait, Status.WAITING, false
             end
             return "No events", Status.IDLE, false
@@ -11622,10 +11661,16 @@ function Plan.pick(list, picked, done, latched)
 end
 
 -- true while any picked event is live, ready or not
+-- live 2026-11-19 (user: stuck on "Transport en route"): the truck's drive takes minutes and every other farm sat parked for it; a transport only holds the
+-- other farms once it has crashed and can be looted, while a meteor (short, and grabbed fast) still parks them as it comes in
+function Plan.holdsEarly(ev)
+    return Plan.kind(ev.Id) ~= "transport"
+end
+
 function Plan.anyLive(list, picked, done)
     for _, ev in ipairs(type(list) == "table" and list or {}) do
         local label = type(ev) == "table" and Plan.label(ev.Id)
-        if label and picked[label] and not done[ev.EventId] and ev.Phase ~= "Cleanup" then return true end
+        if label and picked[label] and not done[ev.EventId] and ev.Phase ~= "Cleanup" and (Plan.holdsEarly(ev) or Plan.actionable(ev)) then return true end
     end
     return false
 end
@@ -11722,15 +11767,17 @@ local CLEAR_TIMEOUT = 600
 -- live 2026-11-18: MR's Barrage has no Hits field (SK:4340-4354) so it read as one 0.36 tick, Flame Breath's 5.4 is one tick of a 3 s hold, and Life Detector's "damage" is a marker
 local HINTS = {
     ["Red Pull"]            = { opener = true },
-    ["Flaming Grasp"]       = { execute = 0.05, punish = true },
+    ["Flaming Grasp"]       = { execute = 0.05, punish = true, antiHeal = true },
     ["Barrage"]             = { stunEscape = true, hold = 2.5, damage = 12.5 },
-    ["Crossfire Hurricane"] = { afterKnock = true },
+    ["Crossfire Hurricane"] = { afterKnock = true, antiHeal = true },
     ["Red Bind"]            = { punish = true },
-    ["Flame Breath"]        = { onDown = true, hold = 3, damage = 32 },
+    ["Flame Breath"]        = { onDown = true, hold = 3, damage = 32, antiHeal = true },
     ["Life Detector"]       = { never = true },
 }
 -- the m1 string never runs longer than the longest weapon profile (WP SwingActiveTimes: 5 for MR and Fists)
 local COMBO_MAX = 5
+-- a skill's damage is read this long after it's released
+local DEALT_WAIT = 0.6
 local NO_HINT = {}
 -- Abilities:IsIdleNPC's exclusions (Abilities.lua:1502-1512)
 local IDLE_ATTRS = { "TrainingDummy", "Stand", "StandName", "Vehicle", "SummonFamily", "SummonSkill" }
@@ -12237,7 +12284,7 @@ function Engage.new(ctx)
             S.attachHandle, h = nil, nil
         end
         if not h then
-            local ok, result = World.attach(target, { mode = want.mode, distance = want.distance, height = want.height, token = S.token })
+            local ok, result = World.attach(target, { mode = want.mode, distance = want.distance, height = want.height, token = S.token, confine = S.opts.confine })
             if not ok then
                 if result == WE.NOT_OWNER or result == WE.BUSY then return false, "busy" end
                 return true
@@ -12319,6 +12366,12 @@ function Engage.new(ctx)
         end
         if h.onDown and info.ragdolled then s = s * 1.5 end
         if h.afterKnock and now() - life.knockAt <= 2 then s = s * 1.25 end
+        -- live 2026-11-19 (tarkus): a vampire heals off its VampireBlood, and fire (Flaming Grasp's 22.5 hit) put Status_AntiHeal on it; while it isn't
+        -- anti-healed, a fire skill comes first
+        if info.vampire and not info.antiHealed and (h.antiHeal or i.antiHeal) then s = s + 1500 end
+        -- live 2026-11-19: barrage's 2.5 s did 0.2-0.4 a hit to tarkus against 12.5 expected; a skill's real share of its damage on this target scales it
+        local real = life.dealt and life.dealt[c.name]
+        if real then s = s * math.clamp(real, 0.05, 1.5) end
         return s + i.cooldown * 1e-4
     end
 
@@ -12381,8 +12434,19 @@ function Engage.new(ctx)
             life.string = 0
             life.cut = true
         end
+        local hum = target:FindFirstChildOfClass("Humanoid")
+        local before = hum and hum.Health
         sleepFor(S, hold)
         Combat.releaseSkill(c.key, target)
+        -- what it really took off, against what it should have, kept for this target (a regen tick or another hit only nudges it)
+        local expected = tonumber(c.info.damage)
+        if hum and before and expected and expected > 0 then
+            task.delay(DEALT_WAIT, function() -- leak:allow a one-shot read that neither loops nor waits again
+                local share = math.max(0, before - hum.Health) / expected
+                local was = life.dealt[c.name]
+                life.dealt[c.name] = was and (was + share) / 2 or share
+            end)
+        end
         return true
     end
 
@@ -12490,6 +12554,8 @@ function Engage.new(ctx)
             target = target, opened = false, string = 0, cut = false, lockout = false, sends = 0,
             best = health, progressAt = now(), lastRatio = 1, sawDeath = false, knockedAt = nil,
             knockAt = -math.huge, skillLook = -math.huge,
+            -- what each skill really did to this target against what it should (see cast)
+            dealt = {},
         }
     end
 
@@ -12534,6 +12600,8 @@ function Engage.new(ctx)
                     ensureSummon()
                     -- live 2026-11-18: a knocked-out npc is finished by the server 5.0 s after it drops however it's hit (DIO, Bobby Jean); skills spent on it are
                     -- cooldowns lost for the next enemy, so it only gets the m1 string until its life ends
+                    info.vampire = target:GetAttribute("VampireBlood") ~= nil
+                    info.antiHealed = target:GetAttribute("Status_AntiHeal") ~= nil
                     local c = not info.passedOut and chooseSkill(S, life, info) or nil
                     if not (c and cast(S, target, life, c)) then melee(S, target, life, info) end
                 end
@@ -17169,6 +17237,11 @@ return function(S)
         return Net.fire("TrainRaid", "Play", out)
     end
 
+    -- TrainRaidClient.Rings.lua:1209-1221 + TrainRaidClient.lua:109-113: while chained to tarkus the client sends TrainRaidFast ("Struggle", {}) every 0.2 s or more
+    local function raidStruggle()
+        return Net.fire("TrainRaidFast", "Struggle", {})
+    end
+
     -- TrainRaidClient.lua:1905-1907: names the passenger from the server's "Suspect" push {Index, Token} (:6257-6259, showSuspect :1848)
     local function raidAccuse(index, token)
         if (type(index) ~= "number" and type(index) ~= "string") or type(token) ~= "string" or token == "" then return false, Errors.BAD_ARGS end
@@ -17216,7 +17289,7 @@ return function(S)
         openRaidBoard = openRaidBoard, openRaidShop = openRaidShop, refreshRaid = refreshRaid,
         startRaid = startRaid, raidReady = raidReady, travelReady = travelReady, buyRaidItem = buyRaidItem,
         queueInvade = queueInvade, cancelInvade = cancelInvade, raidAction = raidAction, raidWeekly = raidWeekly,
-        raidAccuse = raidAccuse, raidPurseTake = raidPurseTake,
+        raidAccuse = raidAccuse, raidPurseTake = raidPurseTake, raidStruggle = raidStruggle,
         raidMessage = raidMessage, raidResults = raidResults,
     }
 end
@@ -17657,7 +17730,17 @@ return function(S)
         S.own(unbindOffers)
     end
 
+    -- PlayerScripts.Core.HowlerCases.lua:114-119: a case's prompt sends ("Hold", id) when the hold starts and ("Open", id) when it completes (0.8 s,
+    -- HowlerCases.lua HoldDuration); only those two verbs, only a case id
+    local CASE_VERBS = { Hold = true, Open = true }
+    local function howlerCase(verb, id)
+        if not CASE_VERBS[verb] then return false, Errors.NOT_ALLOWED end
+        if type(id) ~= "string" or not string.match(id, "^case_%d%d$") then return false, Errors.BAD_ARGS end
+        return Net.fire("HowlerCases", verb, id)
+    end
+
     return {
+        howlerCase = howlerCase,
         quests = quests, completed = completed, isCompleted = isCompleted, canStart = canStart,
         offers = offers, tracker = tracker, angeloJob = angeloJob,
         start = start, track = track, store = store, handIn = handIn, storyDialogue = storyDialogue,
@@ -17747,8 +17830,9 @@ return function(S)
 
     local function qteState() return true, qte end
 
-    -- QTE.lua:716-744: one input in flight until the server answers or a second passes, and only a token the session shows
-    local function qteInput(sessionId, token)
+    -- QTE.lua:716-744: one input in flight until the server answers or a second passes, and only a token the session shows; `ahead` sends without
+    -- waiting for that answer, as the client does for a PredictProgress session (QTE.lua:723), for prompts whose time won't cover a round trip a key
+    local function qteInput(sessionId, token, ahead)
         if not qte or qte.ended then return false, Errors.NO_SESSION end
         if tostring(sessionId) ~= qte.sessionId then return false, Errors.STALE end
         token = tostring(token)
@@ -17757,7 +17841,7 @@ return function(S)
             if t == token then shown = true end
         end
         if not shown then return false, Errors.BAD_ARGS end
-        if qte.pendingAt and os.clock() - qte.pendingAt < 1 then return false, Errors.BUSY end
+        if not ahead and qte.pendingAt and os.clock() - qte.pendingAt < 1 then return false, Errors.BUSY end
         qte.pendingAt = os.clock()
         return Net.fire("QTE", "Input", qte.sessionId, token)
     end
@@ -21859,12 +21943,18 @@ end
 end)
 __bundle_register("Api/World/Movement", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- world movement: the one sanctioned mover, one claimed owner at a time; travelTo (the default) is one PivotTo then a bounded stream and ViewZones wait, walkTo follows a fresh path per compute with a stuck check and a replan that must change the path, glideTo wraps Helpers.MoveToPos, attach holds you on a target every heartbeat; the travel verbs yield and answer (true) on arrival or (false, code)
+local Executor = require("Utility/Executor")
 local Scheduler = require("Utility/Scheduler")
 
+local DIRECT_STEP = 0.1
+local DIRECT_STALL = 1.5
+local SPRINT_AGAIN = 0.5
 local TOLERANCE       = 4
 local HEIGHT_SLACK    = 8      -- a walk arrives level with the goal, not on the roof above it
 local POLL            = 0.1
 local TRAVEL_OFFSET   = 3      -- a travel lands this far above the target so the root clears the floor
+local GROUND_UP       = 250    -- a ground landing looks for the floor from this far above the spot
+local GROUND_DEPTH    = 600    -- down to this far below that
 local STREAM_WAIT     = 2
 local WAYPOINT_RADIUS = 3
 local REISSUE_AFTER   = 5      -- Humanoid:MoveTo gives up by itself after 8 s
@@ -22018,8 +22108,21 @@ return function(ctx, shared)
             if ok then return hit end
             return nil
         end
+        -- live 2026-11-19: rings' black neon void slabs (Map.Map.Chasm.VoidFloor, TrainingHall.VoidCeilings) "count as falling in when touched"; landing on a
+        -- ceiling one 160 over the training hall killed us, so a slab in a Void-named part or folder is never floor
+        local function deadly(part)
+            local node = part
+            for _ = 1, 3 do
+                if not node then break end
+                if string.find(node.Name, "Void", 1, true) then return true end
+                node = node.Parent
+            end
+            return false
+        end
+        probe.deadly = deadly
         function probe.floor(point, up, depth)
             local hit = cast(point.X, point.Y + up, point.Z, depth)
+            if hit and hit.Instance and deadly(hit.Instance) then return nil, true end
             return hit and Vector3.new(point.X, hit.Position.Y, point.Z) or nil
         end
         function probe.material(point)
@@ -22099,11 +22202,83 @@ return function(ctx, shared)
     end
 
     -- true when walked; false and the stuck waypoint's index on a stall; nil when the trip ended under it
+    -- the player's control module (PlayerModule ControlModule instance: controllers + moveFunction), found once in the gc
+    local controlCache = nil
+    local function controlModule()
+        if controlCache and rawget(controlCache, "moveFunction") then return controlCache end
+        local getgc = Executor.get("getgc")
+        if not getgc then return nil end
+        for _, t in ipairs(getgc(true)) do
+            if type(t) == "table" and rawget(t, "controllers") ~= nil and rawget(t, "moveFunction") ~= nil then controlCache = t end
+        end
+        return controlCache
+    end
+
+    -- the character's PlayerController module (runStart / runStop) and its movement state table (Running, HoldingRun), both read off runStart's
+    -- upvalues: the module is the one whose upvalues hold this character's humanoid
+    local function playerController()
+        local getgc = Executor.get("getgc")
+        if not getgc then return nil end
+        for _, t in ipairs(getgc(true)) do
+            if type(t) == "table" and type(rawget(t, "runStart")) == "function" and type(rawget(t, "runStop")) == "function" then
+                local mine, state = false, nil
+                for i = 1, 20 do
+                    local okU, v = pcall(debug.getupvalue, t.runStart, i)
+                    if not okU then break end
+                    if v == References.humanoid then mine = true end
+                    if type(v) == "table" and rawget(v, "HoldingRun") ~= nil and rawget(v, "Running") ~= nil then state = v end
+                end
+                if mine then return t, state end
+            end
+        end
+        return nil
+    end
+
+    -- live 2026-11-22: a bare Humanoid:MoveTo no longer moves the character anywhere (the game's controls push their own Move every frame and
+    -- override it), so walks steer through the control module's moveFunction instead: pointed at trip.steerTarget for the trip, handed back after.
+    -- with opts.sprint the game's own run is held the same way the key does (PlayerController HoldingRun + runStart: a WalkSpeed write is undone)
+    local function steer(trip, opts)
+        if trip.steering ~= nil then return trip.steering end
+        local controls = controlModule()
+        local original = controls and rawget(controls, "moveFunction")
+        if not (controls and original) then
+            trip.steering = false
+            return false
+        end
+        local runner, runState = nil, nil
+        if opts.sprint then runner, runState = playerController() end
+        local sprintAt = -math.huge
+        rawset(controls, "moveFunction", function(player, _, _)
+            local target = trip.steerTarget
+            local d = target and (target - trip.root.Position) * Vector3.new(1, 0, 1) or Vector3.zero
+            player:Move(d.Magnitude > 0.5 and d.Unit or Vector3.zero, false)
+            if runner and runState and target then
+                runState.HoldingRun = true
+                if not runState.Running and os.clock() - sprintAt > SPRINT_AGAIN and trip.hum.MoveDirection.Magnitude > 0.05 then
+                    sprintAt = os.clock()
+                    pcall(runner.runStart, runner)
+                end
+            end
+        end)
+        trip.cleanup[#trip.cleanup + 1] = function()
+            rawset(controls, "moveFunction", original)
+            if runState then runState.HoldingRun = false end
+        end
+        trip.steering = true
+        return true
+    end
+
+    -- head for a point: through the steer when it's in place, else the old MoveTo
+    local function headFor(trip, point)
+        trip.steerTarget = point
+        if not trip.steering then trip.hum:MoveTo(point) end
+    end
+
     local function follow(trip, waypoints)
         local hum, root = trip.hum, trip.root
         for i = 2, #waypoints do
             local point = waypoints[i]
-            hum:MoveTo(point.Position)
+            headFor(trip, point.Position)
             local jumpedAt = -math.huge
             if point.Action == Enum.PathWaypointAction.Jump and jump(trip) then jumpedAt = os.clock() end
             local issued, bestAt, best = os.clock(), os.clock(), math.huge
@@ -22117,7 +22292,7 @@ return function(ctx, shared)
                 if now - bestAt > STUCK_AFTER then return false, i end
                 if now - bestAt > JUMP_AFTER and now - jumpedAt > JUMP_EVERY and jump(trip) then jumpedAt = now end
                 if now - issued > REISSUE_AFTER then
-                    hum:MoveTo(point.Position)
+                    headFor(trip, point.Position)
                     issued = now
                 end
             end
@@ -22147,11 +22322,27 @@ return function(ctx, shared)
     local function walkBody(trip, goal, opts)
         if opts.sprint then holdSprint(trip) end
         trip.cleanup[#trip.cleanup + 1] = function()
+            trip.steerTarget = nil
             if trip.root.Parent then trip.hum:MoveTo(trip.root.Position) end
         end
+        steer(trip, opts)
         if opts.stream ~= false then
             shared.streamAround(goal, STREAM_WAIT)
             if not going(trip) then return false, trip.stopped end
+        end
+        -- opts.direct: straight at the goal the way a player runs a known route, no path planned (live 2026-11-22: the planner found no way up the
+        -- rings hall's west ramp the user ran in 11 s); gives up once it stops gaining ground
+        if opts.direct then
+            local best, bestAt = flat(trip.root.Position, goal), os.clock()
+            while going(trip) do
+                if reached(trip, goal) then return settle(trip, opts) end
+                headFor(trip, goal)
+                task.wait(DIRECT_STEP)
+                local left = flat(trip.root.Position, goal)
+                if left < best - 0.5 then best, bestAt = left, os.clock() end
+                if os.clock() - bestAt > DIRECT_STALL then return false, Errors.BLOCKED end
+            end
+            return false, trip.stopped
         end
         local probe = newProbe(trip.char)
         local failures, closest, costs, stalled = 0, math.huge, nil, nil
@@ -22219,6 +22410,27 @@ return function(ctx, shared)
     local function teleportBody(trip, cframe, opts)
         local root = trip.root
         local target = cframe.Position
+        -- opts.ground: the spot is streamed in first and the landing moved onto the real floor under it (a guessed height dropped us from the air: live
+        -- 2026-11-19, the cash case sweep's grid stops); nothing found keeps the given spot
+        if opts.ground then
+            -- opts.stream = false skips the wait for a spot already loaded (a chain of short hops along a path)
+            if opts.stream ~= false then
+                shared.streamAround(target, tonumber(opts.streamTimeout) or STREAM_WAIT)
+                if not going(trip) then return false, trip.stopped end
+            end
+            -- opts.groundUp: how far above the spot the floor is looked for; a high start lands on roofs and overhangs (live 2026-11-19: 160 over a hall)
+            local floor, void = newProbe(trip.char).floor(target, tonumber(opts.groundUp) or GROUND_UP, GROUND_DEPTH)
+            -- a void slab under the spot is never a landing, strict or not
+            if void then return false, Errors.NO_GROUND end
+            -- opts.groundRequired: no floor under the spot, or one more than opts.groundMaxDrop below it, refuses the trip instead of dropping you into the void
+            -- (live 2026-11-19: rings' spare rings over a drop teleported us into it, two lives in four seconds)
+            local maxDrop = tonumber(opts.groundMaxDrop)
+            if opts.groundRequired and (not floor or (maxDrop and target.Y - floor.Y > maxDrop)) then return false, Errors.NO_GROUND end
+            if floor then
+                target = floor + Vector3.new(0, tonumber(opts.groundOffset) or TRAVEL_OFFSET, 0)
+                cframe = cframe.Rotation + target
+            end
+        end
         pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
         -- a MoveTo left by a replaced walk would march you back from the landing, so the humanoid's goal moves with you
         trip.hum:MoveTo(target)
@@ -22357,6 +22569,9 @@ return function(ctx, shared)
         opts = opts or {}
         local state = { target = target, mode = "behind", distance = 2.5, height = 0, side = 0, lost = false }
         if not attachSettings(state, opts) then return false, Errors.BAD_ARGS end
+        -- opts.confine(position) -> position keeps the hold point inside an area (a raid keeps you on the train while a knocked-back target leaves it)
+        if opts.confine ~= nil and type(opts.confine) ~= "function" then return false, Errors.BAD_ARGS end
+        state.confine = opts.confine
         local trip, err = begin(opts.token)
         if not trip then return false, err end
         if opts.noclip ~= false and ctx.Helpers and ctx.Helpers.startNoclip then
@@ -22372,7 +22587,12 @@ return function(ctx, shared)
             end
             state.lost = false
             trip.root.AssemblyLinearVelocity = Vector3.zero
-            trip.char:PivotTo(holdFrame(state, troot))
+            local frame = holdFrame(state, troot)
+            if state.confine then
+                local ok, inside = pcall(state.confine, frame.Position)
+                if ok and typeof(inside) == "Vector3" then frame = frame.Rotation + inside end
+            end
+            trip.char:PivotTo(frame)
         end
         -- the scheduler retires a task after three throws, which would leave the handle saying active while nothing holds you
         local conn = Scheduler.heartbeat(function()
@@ -22825,6 +23045,7 @@ return {
     DIED            = "world/died",
     NO_PATH         = "world/no_path",
     BLOCKED         = "world/blocked",
+    NO_GROUND       = "world/no_ground",
     NOT_ARRIVED     = "world/not_arrived",
     ERROR           = "world/error",
 
@@ -29768,8 +29989,9 @@ end
 
 end)
 __bundle_register("Tabs/Auto", function(require, _LOADED, __bundle_register, __bundle_modules)
--- auto tab: hosts Auto Quests, Auto Garden, Auto World Events, Auto Raid, Auto Mob Farm, Server Alerts/Hop/Arrow Hunt, Farm Control, Cash Cases, Auto Stats (on the Game section) + Webhooks; stashes Webhook on ctx so Cerberus.lua can fire the launch ping after all tabs mount
+-- auto tab: hosts Auto Quests, Auto Hamon, Auto Garden, Auto World Events, Auto Raid, Auto Mob Farm, Server Alerts/Hop/Arrow Hunt, Farm Control, Cash Cases, Auto Stats (on the Game section) + Webhooks; stashes Webhook on ctx so Cerberus.lua can fire the launch ping after all tabs mount
 local AutoGarden = require("Features/Auto/Garden")
+local AutoHamon  = require("Features/Auto/Hamon")
 local AutoQuests = require("Features/Auto/Quests")
 local AutoStats  = require("Features/Auto/Stats")
 local AutoWorldEvents = require("Features/Auto/WorldEvents")
@@ -29803,6 +30025,8 @@ return function(ctx)
     local apis = ctx.Api or {}
 
     if Config.AutoQuests then AutoQuests(buildBase(ctx)) end
+    -- after auto quests: the hamon box sits under its quest boxes and the mask trial drives its toggles
+    if Config.AutoHamon then AutoHamon.mount(buildBase(ctx)) end
     if Config.AutoGarden then AutoGarden(buildBase(ctx)) end
     if Config.AutoStats then AutoStats.mount(buildBase(ctx)) end
     if Config.AutoWorldEvents then AutoWorldEvents.mount(buildBase(ctx)) end
@@ -31030,6 +31254,7 @@ local FarmConfig  = require("Utility/FarmConfig")
 local Farms       = require("Utility/Farms")
 local FarmSettings = require("Utility/FarmSettings")
 local Engage      = require("Features/Combat/Engage")
+local Keys        = require("Features/Auto/Keys")
 local Plan        = require("Features/Auto/Raid/Plan")
 local Run         = require("Features/Auto/Raid/Run")
 local WorldEvents = require("Features/Auto/WorldEvents")
@@ -31051,6 +31276,9 @@ local FAIL_BACKOFF_MAX = 300
 local START_RETRY = 30
 -- the board's cooldowns are seconds left when it was pushed; a recheck waits this long past them
 local COOLDOWN_SLACK = 2
+-- the raid server's head count is checked this often, and a hop home that didn't land is tried again after this long
+local CROWD_EVERY = 2
+local CROWD_RETRY = 15
 
 local M = {}
 
@@ -31082,13 +31310,15 @@ function M.mount(ctx)
     local Options, Toggles, References = ctx.Options, ctx.Toggles, ctx.References
 
     local job, token = nil, nil
+    local keyJob = nil
     local woken = false
     -- gated: the farm plan held back a new raid; work: the last pass that ran had a raid going or one to start
     local gated, work = false, false
     local runs, clears, failStreak = 0, 0, 0
     local retryAt = 0
-    local readyFor = nil
-    local readyAt = 0
+    -- each picked raid's own cooldown (clock time it's ready), and the raid started last so the next start cycles on
+    local readyAt = {}
+    local lastKey = nil
     local boardAt = -math.huge
 
     local function post(text, level) Status.set(OWNER, text, level) end
@@ -31107,7 +31337,7 @@ function M.mount(ctx)
         return element.Value
     end
 
-    local function raidKey() return Plan.keyFor(option("AutoRaid_Raid", Plan.CHOICES[1])) end
+    local function pickedRaids() return Plan.pickedKeys(option("AutoRaid_Raid", { [Plan.CHOICES[1]] = true })) end
 
     local engine, engineTried = nil, false
     local function getEngine()
@@ -31253,15 +31483,15 @@ function M.mount(ctx)
                 retryAt = os.clock() + math.min(FAIL_BACKOFF_MAX, FAIL_BACKOFF * 2 ^ (failStreak - FAIL_LIMIT))
             end
         end
-        local key = res and res.Raid or raidKey()
+        local key = res and res.Raid or lastKey or Plan.ORDER[1]
         local name = (Plan.RAIDS[key] or Plan.RAIDS.Train).label
         local loot = res and type(res.Loot) == "table" and #res.Loot or 0
         if res and ctx.Library then
             UiWrite.notify(ctx.Library, ("%s %s: %d item%s"):format(name, cleared and "cleared" or "failed", loot, loot == 1 and "" or "s"), 5)
         end
         waitHome(j)
-        -- the board's cooldown is read fresh before the next start
-        readyAt = 0
+        -- the board's cooldown is read fresh before this raid's next start; the cycle moves on to the next picked raid first
+        readyAt[key] = 0
         return (cleared and "Cleared %d of %d" or "Raid failed, %d of %d cleared"):format(clears, runs), line
     end
 
@@ -31303,9 +31533,6 @@ function M.mount(ctx)
             setWanting(true)
             return "Loading your setup", Status.IDLE, false
         end
-        local key = raidKey()
-        -- live 2026-11-18: switching from highway star (on cooldown) to the train kept highway star's wait; a wait belongs to the raid it was read for
-        if key ~= readyFor then readyAt, readyFor = 0, key end
         if Plan.limitReached(runs, option("AutoRaid_Runs", 0)) then return "All raid runs done", Status.IDLE, false end
         local replay = toggleOn("AutoRaid_Replay", true)
         if not replay and runs >= 1 then return "Raid done, replay is off", Status.IDLE, false end
@@ -31322,10 +31549,18 @@ function M.mount(ctx)
             return why, Status.WAITING, false
         end
         if not Player.ready() then return "Waiting for your save", Status.IDLE, false end
-        local locked = Plan.locked(key, References.player and References.player:GetAttribute("HasTrainRaidAccess"), Player.value("Stats.Level"))
-        if locked then return locked, Status.IDLE, false end
-        local left = readyAt - os.clock()
-        if left > 0 then return "Raid ready in " .. Plan.clock(left), Status.WAITING, false end
+        -- user 2026-11-19: of the picked raids you can enter, the next one after the last run that's off cooldown (each keeps its own wait)
+        local open, firstLocked = {}, nil
+        for _, k in ipairs(pickedRaids()) do
+            local locked = Plan.locked(k, References.player and References.player:GetAttribute("HasTrainRaidAccess"), Player.value("Stats.Level"))
+            if locked then firstLocked = firstLocked or locked else open[#open + 1] = k end
+        end
+        if #open == 0 then return firstLocked or "Pick a raid", Status.IDLE, false end
+        local key, soonest, left = Plan.nextRaid(open, readyAt, os.clock(), lastKey)
+        if not key then
+            local name = #open > 1 and Plan.RAIDS[soonest].label .. " " or "Raid "
+            return name .. "ready in " .. Plan.clock(left), Status.WAITING, false
+        end
         if partyLeaderElse() then
             if toggleOn("AutoRaid_Party", true) then return "Waiting for your party leader", Status.IDLE, false end
             return "Your party leader starts raids", Status.IDLE, false
@@ -31348,12 +31583,12 @@ function M.mount(ctx)
         if not j.alive then return nil, nil, false end
         local pick = Plan.pickDifficulty(board, myUserId(), key, option("AutoRaid_Difficulty", "Regular"))
         if pick.wait then
-            readyAt = os.clock() + pick.wait + COOLDOWN_SLACK
+            readyAt[key] = os.clock() + pick.wait + COOLDOWN_SLACK
             setWanting(false)
             return "Raid ready in " .. Plan.clock(pick.wait), Status.WAITING, false
         end
         if not pick.difficulty then
-            readyAt = os.clock() + START_RETRY
+            readyAt[key] = os.clock() + START_RETRY
             return pick.line, Status.IDLE, false
         end
         if board.Active then return "Your party's raid is running", Status.IDLE, false end
@@ -31367,13 +31602,16 @@ function M.mount(ctx)
         local ok, err = Activities.startRaid(key, pick.difficulty)
         if not ok then
             inRaid = false
-            readyAt = os.clock() + START_RETRY
+            readyAt[key] = os.clock() + START_RETRY
             Log.dev("AutoRaid", "start refused: %s", tostring(err))
             return "Raid didn't start", Status.IDLE, false
         end
-        if waitStart(j) then return "Raid starting", Status.ACTING, true end
+        if waitStart(j) then
+            lastKey = key
+            return "Raid starting", Status.ACTING, true
+        end
         inRaid = false
-        readyAt = os.clock() + START_RETRY
+        readyAt[key] = os.clock() + START_RETRY
         return "Raid didn't start", Status.IDLE, false
     end
 
@@ -31412,13 +31650,16 @@ function M.mount(ctx)
     local function stop()
         enabled = false
         inRaid = false
+        if keyJob then keyJob:Cancel() end
+        keyJob = nil
         setWanting(false)
         if job then job:Cancel() end
         job = nil
         runner.stop()
         if engine then engine.destroy() end
         releaseClaim()
-        runs, clears, failStreak, readyAt, retryAt = 0, 0, 0, 0, 0
+        runs, clears, failStreak, retryAt = 0, 0, 0, 0
+        readyAt, lastKey = {}, nil
         gated, work = false, false
         Status.clear(OWNER)
     end
@@ -31439,6 +31680,22 @@ function M.mount(ctx)
         runner.onMessage(verb, payload)
     end))
 
+    -- user 2026-11-19: a raid server with more players than the slider allows is left for the lobby (the main place); 0 is off
+    local crowdHopAt = -math.huge
+    O.track(Jobs.interval(CROWD_EVERY, function()
+        if not enabled or not Plan.inRaid(state()) then return end
+        local players = ctx.Services and ctx.Services.Players
+        local count = players and #players:GetPlayers() or 0
+        local limit = option("AutoRaid_MaxPlayers", 0)
+        if not Plan.tooCrowded(count, limit) or os.clock() - crowdHopAt < CROWD_RETRY then return end
+        crowdHopAt = os.clock()
+        say(("%d players here, going back to the lobby"):format(count))
+        if ctx.Library then UiWrite.notify(ctx.Library, ("Raid has %d players (max %d), leaving"):format(count, limit), 5) end
+        FarmConfig.queueDevReload()
+        local ok, err = pcall(function() ctx.Services.TeleportService:Teleport(ctx.Services.Game.PlaceId, References.player) end)
+        if not ok then Log.devwarn("AutoRaid", "lobby hop failed: %s", tostring(err)) end
+    end, { name = "AutoRaidCrowd" }))
+
     local box = ctx.Tabs.Fights:AddLeftGroupbox("Auto Raid", "train-front")
     box:AddToggle("AutoRaid_Enabled", {
         Text     = "Auto Raid",
@@ -31448,6 +31705,8 @@ function M.mount(ctx)
                 if enabled then return end
                 enabled = true
                 job = O.track(Jobs.spawn(loop, { name = "AutoRaid" }))
+                -- user 2026-11-22: a key prompt in the tarkus fight went unanswered as we died; raids answer their own prompts
+                keyJob = O.track(Jobs.spawn(function(j) Keys.loop(j, Activities, function() return enabled end) end, { name = "AutoRaid.keys" }))
             else
                 stop()
                 -- live 2026-11-18 (user): switched off by hand, the farm stops coming back after a rejoin
@@ -31466,7 +31725,7 @@ function M.mount(ctx)
         active  = M.active,
         wants   = function() return enabled and (inRaid or work) end,
     })
-    box:AddDropdown("AutoRaid_Raid", { Text = "Raid", Values = Plan.CHOICES, Default = Plan.CHOICES[1] })
+    box:AddDropdown("AutoRaid_Raid", { Text = "Raids", Values = Plan.CHOICES, Default = { Plan.CHOICES[1] }, Multi = true, Tooltip = "Picks several and takes turns as each comes off cooldown" })
     box:AddDropdown("AutoRaid_Difficulty", {
         Text    = "Difficulty",
         Values  = Plan.DIFFICULTIES,
@@ -31484,6 +31743,14 @@ function M.mount(ctx)
     settings:AddToggle("AutoRaid_Party", { Text = "Join Party Raids", Default = true })
     settings:AddDropdown("AutoRaid_Position", { Text = "Position", Values = Plan.POSITIONS, Default = "Combat Settings" })
     settings:AddSlider("AutoRaid_Distance", { Text = "Distance", Default = 3, Min = 1, Max = 10, Rounding = 1 })
+    settings:AddSlider("AutoRaid_MaxPlayers", {
+        Text     = "Max Players In Raid",
+        Default  = 0,
+        Min      = 0,
+        Max      = 20,
+        Rounding = 0,
+        Tooltip  = "More than this and you go back to the lobby (0 = off)",
+    })
 
     O.onUnload(stop)
     O.onUnload(function() Farms.unregister(FARM) end)
@@ -31497,10 +31764,12 @@ __bundle_register("Features/Auto/Raid/Run", function(require, _LOADED, __bundle_
 -- auto raid run: drives one raid from the inside, fighting the best-ranked enemy with the shared engine (adds before the boss), answering the train's suspect and purse pushes and highway star's latch, pressing the raid's own prompts when nothing is left to hit, and sitting out a spectate until the results land
 local Executor = require("Utility/Executor")
 local Identity = require("Utility/Identity")
+local GameHud  = require("Utility/GameHud")
 local Jobs     = require("Utility/Jobs")
 local Log      = require("Utility/Log")
 local Lockpick = require("Features/Auto/Lockpick")
 local Highway  = require("Features/Auto/Raid/Highway")
+local Hazards  = require("Features/Auto/Raid/Hazards")
 local Plan     = require("Features/Auto/Raid/Plan")
 
 local OWNER = "AutoRaid"
@@ -31513,6 +31782,7 @@ local PROMPT_RADIUS = 60
 local PROMPT_TRIES = 2
 -- live 2026-11-18: a press that went nowhere (lock before the clip, purse out of reach) used up both tries for good and the car stalled; tries now lapse and are tried again
 local PROMPT_RETRY = 20
+local KEY_RETRY = 3
 local PICKUP_RADIUS = 40
 local ADVANCE_AFTER = 6
 local ADVANCE_EVERY = 8
@@ -31548,7 +31818,48 @@ function Run.new(env)
     function R.result() return result end
 
     -- pushes arrive on the remote's thread; they are only queued here and acted on in the run's own loop
+    -- live-unverified (Rings.lua:1209-1221, 1748-1758): RingsChain {On, Need, Progress} chains you to tarkus; the struggle is sent at the client's 0.2 s pace until it's off
+    local STRUGGLE_EVERY = 0.2
+    local struggling = nil
+    local function stopStruggle()
+        if struggling then struggling:Cancel() end
+        struggling = nil
+    end
+    local function startStruggle()
+        if struggling or not Activities.raidStruggle then return end
+        struggling = Jobs.interval(STRUGGLE_EVERY, function() Activities.raidStruggle() end, { name = "AutoRaid struggle", immediate = true })
+    end
+
+    -- live-unverified (RingsHazards.lua:252-320, Telegraph.lua:63-80): an icefall lands at At inside Size/2 of Position; a telegraph is a floor rectangle
+    -- (CFrame along its LookVector, Size X width by Z length) for Duration. each is a strike zone until it lands, stepped out of by stepAvoid
+    local strikes = {}
+    local function serverNow() return env.Services.Workspace:GetServerTimeNow() end
+    local function addStrike(verb, payload)
+        local now = serverNow()
+        if verb == "RingsIcefall" and typeof(payload.Position) == "Vector3" then
+            local at = tonumber(payload.At) or now
+            local size = tonumber(payload.Size) or 9
+            if at - now > 0.05 and at - now <= 6 then strikes[#strikes + 1] = Hazards.circle(payload.Position, size / 2 + 3, at + 0.3) end
+        elseif verb == "Telegraph" and typeof(payload.CFrame) == "CFrame" and typeof(payload.Size) == "Vector3" then
+            local cf, size = payload.CFrame, payload.Size
+            -- whether the frame marks the rectangle's centre or its start isn't known, so the box covers both
+            local center = cf * CFrame.new(0, 0, -size.Z / 4)
+            strikes[#strikes + 1] = { strike = true, untilAt = now + (tonumber(payload.Duration) or 1), box = { cf = center, size = Vector3.new(size.X + 2, 40, size.Z * 1.5 + 2) } }
+        end
+        for i = #strikes, 1, -1 do
+            if strikes[i].untilAt < now then table.remove(strikes, i) end
+        end
+    end
+
     function R.onMessage(verb, payload)
+        if (verb == "RingsIcefall" or verb == "Telegraph") and type(payload) == "table" then
+            pcall(addStrike, verb, payload)
+            return
+        end
+        if verb == "RingsChain" and type(payload) == "table" then
+            if payload.On then startStruggle() else stopStruggle() end
+            return
+        end
         if verb == "Results" and type(payload) == "table" then
             result = payload
         elseif verb == "Suspect" or verb == "Purse" or verb == "Latch" or verb == "PurseResult" then
@@ -31579,7 +31890,10 @@ function Run.new(env)
         local dialogue = gui and gui:FindFirstChild("Dialogue")
         if not (dialogue and dialogue:IsA("ScreenGui") and dialogue.Enabled) then return false end
         Identity.elevate()
-        return (pcall(function() dialogue.Enabled = false end))
+        local ok = pcall(function() dialogue.Enabled = false end)
+        -- live 2026-11-19 (user: the hp/moves/money hud sometimes vanishes): disabling the dialogue skips the close that fades the hud back in
+        if ok then GameHud.restoreAfterClose(player) end
+        return ok
     end
 
     local function stopFight()
@@ -31675,9 +31989,10 @@ function Run.new(env)
         local ok, list = World.combatants({ npcs = true, alive = true, maxDistance = radius })
         if not ok then return {} end
         local bossName = type(st.Boss) == "table" and st.Boss.Name or nil
+        local targets = Plan.targetNames(st)
         local out = {}
         for _, model in ipairs(list) do
-            if Plan.isEnemy(model, bossName) and engine.valid(model) then
+            if Plan.isEnemy(model, bossName, targets) and engine.valid(model) then
                 local e = entryFor(model, bossName)
                 if e then out[#out + 1] = e end
             end
@@ -31685,8 +32000,76 @@ function Run.new(env)
         return out
     end
 
+    -- live 2026-11-19: a target knocked off the side of the train took the attach with it, and the fight went on under the car until we died (151 hp to 1,
+    -- a life gone); on the train the hold point is kept inside the car we're in (its width less a margin, never under its floor)
+    local CONFINE_MARGIN = 3
+    -- standing in a car puts the root about 3 under its box centre (see offTrain)
+    local CONFINE_FLOOR = -3
+    local confineCar = nil
+    -- during a warm-up the fight is held near the fire (see stepWarm)
+    local confineFire = nil
+    local FIRE_ZONE = 8
+    -- live 2026-11-19 (user: we fell off the mountain): rings' fights are on cliffs, and a vampire knocked over the graveyard's edge took the attach (and a
+    -- life) with it; on rings a hold point with no floor within EDGE_DEPTH under it stays at the last one that had floor
+    local EDGE_DEPTH = 40
+    local confineEdges = false
+    -- set once the hazard list exists (stepAvoid): (hazard, way out) at a point
+    local confineHazards = nil
+    local lastFooting = nil
+    local edgeParams = nil
+    local function hasFloor(position)
+        -- no probe available reads as floor, so the hold is never pinned by a missing api
+        if not edgeParams then
+            local okP, params = pcall(function() return RaycastParams.new() end)
+            if not okP then return true end
+            edgeParams = params
+        end
+        edgeParams.FilterType = Enum.RaycastFilterType.Exclude
+        local char = References.character
+        edgeParams.FilterDescendantsInstances = char and { char } or {}
+        pcall(function() edgeParams.RespectCanCollide = true end)
+        local ok, hit = pcall(env.Services.Workspace.Raycast, env.Services.Workspace, position + Vector3.new(0, 3, 0), Vector3.new(0, -EDGE_DEPTH, 0), edgeParams)
+        if not (ok and hit) then return false end
+        -- a void slab (Chasm.VoidFloor, "counts as falling in when touched") under the point is no floor at all
+        local node = hit.Instance
+        for _ = 1, 3 do
+            if not node then break end
+            if string.find(node.Name, "Void", 1, true) then return false end
+            node = node.Parent
+        end
+        return true
+    end
+    local function confine(position)
+        if confineEdges and confineHazards then
+            local okH, hazard, way = pcall(confineHazards, position)
+            if okH and hazard and way then position = Vector3.new(way.X, position.Y, way.Z) end
+        end
+        if confineEdges then
+            if hasFloor(position) then
+                lastFooting = position
+            elseif lastFooting then
+                return lastFooting
+            end
+        end
+        if confineFire then
+            local flat = Vector3.new(position.X - confineFire.X, 0, position.Z - confineFire.Z)
+            if flat.Magnitude > FIRE_ZONE then position = Vector3.new(confineFire.X, position.Y, confineFire.Z) + flat.Unit * FIRE_ZONE end
+        end
+        local car = confineCar
+        if not (car and car.Parent) then return position end
+        local cf, size = car:GetBoundingBox()
+        local p = cf:PointToObjectSpace(position)
+        local halfZ = math.max(0, size.Z / 2 - CONFINE_MARGIN)
+        -- along the car (X) the gangways join the next car, so only the sides and the floor are held
+        local clamped = Vector3.new(p.X, math.max(p.Y, CONFINE_FLOOR), math.clamp(p.Z, -halfZ, halfZ))
+        if clamped == p then return position end
+        return cf:PointToWorldSpace(clamped)
+    end
+
     local function fightOpts()
         local o = { owner = OWNER, token = env.token(), timeout = FIGHT_TIMEOUT }
+        -- always passed: confine reads the current car and warm-up fire each frame, and lets the point through when neither is set
+        o.confine = confine
         local position = env.option("AutoRaid_Position", "Combat Settings")
         if position ~= "Combat Settings" and position ~= nil then
             o.mode = position
@@ -31746,10 +32129,18 @@ function Run.new(env)
     local function tryKey(p)
         return tostring(objectiveNow) .. "|" .. tostring(p.action)
     end
+    -- live 2026-11-19: car 5's key hunt sat 20 s at 3 of 5 compartments; a search the hits interrupted used both tries and waited out PROMPT_RETRY. during a key hunt
+    -- the compartments' own prompts come back after KEY_RETRY
+    local function retryFor(p)
+        local objective, action = string.lower(tostring(objectiveNow or "")), string.lower(tostring(p.action or ""))
+        local hunt = string.find(objective, "key", 1, true) or string.find(objective, "compartment", 1, true)
+        if hunt and (string.find(action, "search", 1, true) or string.find(action, "pick", 1, true)) then return KEY_RETRY end
+        return PROMPT_RETRY
+    end
     local function triesOf(p)
         local byAction = tries[p.prompt]
         local entry = byAction and byAction[tryKey(p)]
-        if not entry or os.clock() - entry.at >= PROMPT_RETRY then return 0 end
+        if not entry or os.clock() - entry.at >= retryFor(p) then return 0 end
         return entry.count
     end
 
@@ -31758,7 +32149,7 @@ function Run.new(env)
         tries[p.prompt] = byAction
         local key = tryKey(p)
         local entry = byAction[key]
-        if not entry or os.clock() - entry.at >= PROMPT_RETRY then entry = { count = 0 } end
+        if not entry or os.clock() - entry.at >= retryFor(p) then entry = { count = 0 } end
         entry.count, entry.at = entry.count + 1, os.clock()
         byAction[key] = entry
     end
@@ -31813,6 +32204,12 @@ function Run.new(env)
                 for _, p in ipairs(okRoom and inRoom or {}) do list[#list + 1] = p end
             end
         end
+        -- rings' spare rings (Props.SpareRing): one you've claimed carries Claimed_<UserId>, which only hides it on your client (Rings.lua:1371-1389)
+        local claimKey = References.player and ("Claimed_" .. tostring(References.player.UserId))
+        for _, p in ipairs(list) do
+            local okRing, ring = pcall(function() return claimKey and p.prompt:FindFirstAncestor("SpareRing") end)
+            if okRing and ring and ring:GetAttribute(claimKey) ~= nil then p.claimed = true end
+        end
         if pressNext(list, from) then
             env.say(label(st, "Checking the " .. string.lower((Plan.RAIDS[st.Raid] or Plan.RAIDS.Train).unit)))
             return true
@@ -31828,6 +32225,401 @@ function Run.new(env)
         local pos = best.model:GetPivot().Position
         env.say(label(st, "Moving to " .. best.name))
         World.travelTo(pos, { token = env.token() })
+        return true
+    end
+
+    -- live 2026-11-19 (user: our cold keeps rising): rings areas drain the character's Temperature (Map.Areas ColdRate -0.4 to -0.6 a second) toward -100,
+    -- where it bites 1% max hp every 0.1 s (Temperature.lua ColdDamageFraction/Interval; "Frostbite" took 157 hp in 15 s). Fires warm you (Props Campfire /
+    -- Brazier, Map.Torches), so a low temperature stops the fight for a warm-up beside the nearest one until it's back up
+    -- live 2026-11-19 (user: we hit 100 cold without warming up): warmth is the server's (the client's fires are only lights, Rings.lua:1320-1369), and
+    -- fighting 20 studs out never warmed us. so the warm-up goes by feedback: stand by the fire, fight only what comes within a few studs of it, and a fire
+    -- that doesn't warm within WARM_CHECK is swapped for the next nearest
+    local COLD_LOW = -60
+    local COLD_OK = -20
+    -- this cold, frostbite (-100) is a few seconds off: warmth first, whatever is around
+    local COLD_CRITICAL = -90
+    local FIRE_STAND = 3
+    local WARM_CHECK = 5
+    local WARM_FIGHT = 15
+    local warming = nil
+    local function temperature()
+        local char = References.character
+        local t = char and char:GetAttribute("Temperature")
+        return type(t) == "number" and t or nil
+    end
+    -- the nearest fire not yet found cold (Props Campfire / Brazier first; a torch only when much nearer)
+    local function nearestFire(st, from, skip)
+        local root = raidRoot(st)
+        if not root then return nil end
+        local best, bestD = nil, math.huge
+        local function consider(model, weight)
+            local ok, pos = pcall(function() return model:GetPivot().Position end)
+            if ok and pos and not (skip and skip[model]) then
+                local d = (pos - from).Magnitude * weight
+                if d < bestD then best, bestD = model, d end
+            end
+        end
+        local props = root:FindFirstChild("Props")
+        for _, c in ipairs(props and props:GetChildren() or {}) do
+            if c.Name == "Campfire" or c.Name == "Brazier" then consider(c, 1) end
+        end
+        local map = root:FindFirstChild("Map")
+        local torches = map and map:FindFirstChild("Torches")
+        for _, c in ipairs(torches and torches:GetChildren() or {}) do consider(c, 2) end
+        return best
+    end
+    local function stepWarm(st)
+        local t = temperature()
+        if not t then return false end
+        if warming then
+            if t >= COLD_OK then warming, confineFire = nil, nil return false end
+        elseif t > COLD_LOW then
+            return false
+        end
+        -- live 2026-11-22 (user: slow into the graveyard): the run starts near -60, and a fire first cost the walk-in; before a stage's
+        -- waves start (no Progress yet) only deep cold stops the walk to its area
+        if not warming and t > COLD_CRITICAL and (st.Progress == nil or st.Progress == "") then return false end
+        local from = myPosition()
+        if not from then return false end
+        if not warming then
+            local fire = nearestFire(st, from, nil)
+            if not fire then return false end
+            warming = { fire = fire, since = os.clock(), at = t, skip = {} }
+        end
+        -- swap a fire that hasn't warmed us since we got there
+        if os.clock() - warming.since > WARM_CHECK then
+            if t <= warming.at + 0.5 then
+                warming.skip[warming.fire] = true
+                local nextFire = nearestFire(st, from, warming.skip)
+                if not nextFire then warming, confineFire = nil, nil return false end
+                warming.fire = nextFire
+            end
+            warming.since, warming.at = os.clock(), t
+        end
+        local fireAt = warming.fire:GetPivot().Position
+        confineFire = fireAt
+        -- what's hitting us at the fire is fought there; deep cold puts warmth first
+        if t > COLD_CRITICAL and #enemies(st, WARM_FIGHT) > 0 then return false end
+        stopFight()
+        env.say(label(st, ("Warming up (%d)"):format(math.floor(t))))
+        local flat = Vector3.new(from.X - fireAt.X, 0, from.Z - fireAt.Z)
+        local spot = fireAt + (flat.Magnitude > 0.5 and flat.Unit or Vector3.new(1, 0, 0)) * FIRE_STAND
+        if (Vector3.new(spot.X, from.Y, spot.Z) - from).Magnitude > 2 then
+            -- arriving restarts the warm check, so the walk over isn't counted against the fire
+            warming.since, warming.at = os.clock(), t
+            World.travelTo(spot, { token = env.token(), ground = true })
+        end
+        return true
+    end
+
+    -- rings' traps from the live map (live 2026-11-19 dump): spike strips (Props, Plate or Cycle), the spike floor and pit, the collapsing floor; inside one
+    -- that hurts now (or is about to), and inside an announced strike, the run steps out before anything else, and fights are held outside them
+    local HAZARD_REFRESH = 10
+    local hazardList, hazardRoot, hazardAt = {}, nil, -math.huge
+    local function hazardsFor(st)
+        local root = raidRoot(st)
+        if not root then return {} end
+        if root ~= hazardRoot or os.clock() - hazardAt > HAZARD_REFRESH then
+            hazardRoot, hazardAt = root, os.clock()
+            local ok, list = pcall(Hazards.collect, root)
+            hazardList = ok and list or {}
+        end
+        return hazardList
+    end
+    local function stepAvoid(st)
+        if st.Raid ~= "Rings" then return false end
+        local list = hazardsFor(st)
+        confineHazards = function(position) return Hazards.at(list, strikes, position, serverNow(), true) end
+        local from = myPosition()
+        if not from then return false end
+        local hazard, way = Hazards.at(list, strikes, from, serverNow())
+        if not hazard then return false end
+        stopFight()
+        env.say(label(st, hazard.strike and "Dodging a strike" or ("Stepping off the " .. tostring(hazard.attrs and hazard.attrs.TrapType or "trap"))))
+        World.travelTo(way, { token = env.token(), ground = true, groundUp = 8 })
+        return true
+    end
+
+    -- user 2026-11-19 (get all the rings, as optimised as possible): rings' spare rings (Props.SpareRing, a prompt each; Claimed_<UserId> once taken,
+    -- Rings.lua:1371-1389) are taken whenever nothing needs fighting, nearest first anywhere in the raid, before the run moves on
+    local RING_TRIES = 3
+    -- a ring more than this above the floor under it hangs over a drop or on a climb
+    local RING_DROP = 15
+    local ringTries = setmetatable({}, { __mode = "k" })
+    local function stepSpareRings(st)
+        if st.Raid ~= "Rings" then return false end
+        local root = raidRoot(st)
+        local from = myPosition()
+        if not (root and from) then return false end
+        local claimKey = References.player and ("Claimed_" .. tostring(References.player.UserId))
+        local best, bestPrompt, bestD = nil, nil, math.huge
+        for _, d in ipairs(root:GetDescendants()) do
+            if d.Name == "SpareRing" and d:IsA("Model") and not (claimKey and d:GetAttribute(claimKey) ~= nil) and (ringTries[d] or 0) < RING_TRIES then
+                local prompt = d:FindFirstChildWhichIsA("ProximityPrompt", true)
+                if prompt and prompt.Enabled then
+                    local okP, pos = pcall(function() return d:GetPivot().Position end)
+                    if okP and pos and (pos - from).Magnitude < bestD then best, bestPrompt, bestD = d, prompt, (pos - from).Magnitude end
+                end
+            end
+        end
+        if not best then return false end
+        ringTries[best] = (ringTries[best] or 0) + 1
+        env.say(label(st, "Taking a spare ring"))
+        if bestD > (bestPrompt.MaxActivationDistance or 8) - 1 then
+            -- a ring with no floor close under it (over a drop, on a wall) is skipped rather than teleported to
+            local okGo = World.travelTo(best:GetPivot().Position, { token = env.token(), ground = true, groundRequired = true, groundMaxDrop = RING_DROP })
+            if not okGo then
+                ringTries[best] = RING_TRIES
+                return true
+            end
+        end
+        local ok, err = World.firePrompt(bestPrompt)
+        if not ok then Log.dev("AutoRaid", "spare ring refused: %s", tostring(err)) end
+        return true
+    end
+
+    -- live 2026-11-19: rings stage 1 ("Survive the dead in the graveyard") only starts once you walk through into its area (Map.Areas, ZoneId A<stage>,
+    -- e.g. A1 The Graveyard Cliff 154 studs from the spawn); idle at the spawn, "Frostbite" took 157 hp in 15 s and a life. with nothing to fight, the run goes
+    -- straight to the stage's area
+    local AREA_NEAR = 40
+    -- within this of a route point the route is picked up from there
+    local ROUTE_NEAR = 25
+    local ROUTE_TOLERANCE = 2.5
+    local ROUTE_HOP_UP = 6
+    local ROUTE_HOPS = 8
+    local ROUTE_HOP_GAP = 0.1
+    local ROUTE_FIGHT_NEAR = 40
+    local AREA_DEADLY = 15
+    local WAYPOINT_WAIT = 10
+    local wayTry = nil
+    local AREA_PROBE_UP = 12
+    local AREA_EVERY = 4
+    local areaAt = -math.huge
+    local areaGoal = nil
+    -- live 2026-11-19: "Cross the broken bridge" came as stage 1's second objective with nothing to fight, and the run stood in the graveyard; an objective
+    -- that sends you on (cross / reach / climb / head / go) moves to the next area along the route (ZoneId order A1, A2, A3, A5...) after the one you're in
+    local MOVE_WORDS = { "cross", "reach", "climb", "head", "go to", "make your way", "escape", "get to", "find the way" }
+    local function zoneNumber(area)
+        local id = area:GetAttribute("ZoneId")
+        return type(id) == "string" and tonumber(string.match(id, "%d+")) or nil
+    end
+    function R.nextArea(areas, from, stage, objective)
+        local list = {}
+        for _, area in ipairs(areas) do
+            local n = zoneNumber(area)
+            local ok, pos = pcall(function() return area:GetPivot().Position end)
+            if n and ok then list[#list + 1] = { area = area, n = n, pos = pos } end
+        end
+        table.sort(list, function(a, b) return a.n < b.n end)
+        if #list == 0 then return nil end
+        local text = string.lower(tostring(objective or ""))
+        local moving = false
+        for _, w in ipairs(MOVE_WORDS) do
+            if string.find(text, w, 1, true) then moving = true break end
+        end
+        if moving then
+            -- the area you're in is the nearest one; the next along the route is the goal
+            local here, hereD = nil, math.huge
+            for i, a in ipairs(list) do
+                local d = (Vector3.new(a.pos.X, from.Y, a.pos.Z) - from).Magnitude
+                if d < hereD then here, hereD = i, d end
+            end
+            local goal = list[math.min(#list, here + 1)]
+            -- live 2026-11-22 (user: we lost the raid really quick): "Climb the frozen mountain" sent a fresh respawn to the summit's marker and the
+            -- landing there dropped into the void, the last life gone in 3 s; the summit is climbed to, never teleported to
+            if goal.area:GetAttribute("AreaId") == "RingsSummit" or goal.area:GetAttribute("ZoneId") == "A7" then return nil end
+            return goal.area
+        end
+        for _, a in ipairs(list) do
+            if a.n == stage then return a.area end
+        end
+        -- live 2026-11-22 (user: we only walked into the graveyard to warm up): the first State push came 16 s into the run, so with no stage
+        -- known yet the route's first area is the goal
+        if stage == nil then return list[1].area end
+        return nil
+    end
+
+    -- live 2026-11-19: "Cross the broken bridge" is Map.Obstacles.BrokenSpan_*: pillars tagged Step 1..8 (a CrumbleTop on 3, an IceCap on 5, both Step too),
+    -- then a ChainClimbPlate hanging from the far landing's edge above pillar 8 ("the climb up from pillar 8"); going straight to the next area didn't count.
+    -- each step's top is stood on in order (ground landing finds the top), then the chain plate, then the landing beyond it
+    local BRIDGE_GAP = 0.6
+    local BRIDGE_RETRY = 20
+    local bridgeDone = nil
+    function R.bridgeSteps(span)
+        local steps = {}
+        for _, c in ipairs(span:GetChildren()) do
+            local n = tonumber(c:GetAttribute("Step"))
+            if n and c:IsA("BasePart") then
+                -- a crumble or ice cap sits on its pillar: the cap is the top to stand on
+                local top = c.Position + Vector3.new(0, c.Size.Y / 2, 0)
+                if not steps[n] or top.Y > steps[n].Y then steps[n] = top end
+            end
+        end
+        local out = {}
+        for n = 1, 50 do
+            if steps[n] then out[#out + 1] = steps[n] end
+        end
+        return out
+    end
+    local function stepRingsBridge(st, j)
+        if st.Raid ~= "Rings" then return false end
+        local objective = string.lower(tostring(st.Objective or ""))
+        -- one crossing per objective, tried again if the objective is still there after BRIDGE_RETRY
+        if not string.find(objective, "bridge", 1, true) then return false end
+        if bridgeDone and bridgeDone.objective == st.Objective and os.clock() - bridgeDone.at < BRIDGE_RETRY then return false end
+        local root = raidRoot(st)
+        local map = root and root:FindFirstChild("Map")
+        local obstacles = map and map:FindFirstChild("Obstacles")
+        local span = nil
+        for _, c in ipairs(obstacles and obstacles:GetChildren() or {}) do
+            if string.find(c.Name, "BrokenSpan", 1, true) then span = c end
+        end
+        if not span then return false end
+        bridgeDone = { objective = st.Objective, at = os.clock() }
+        stopFight()
+        local steps = R.bridgeSteps(span)
+        for i, top in ipairs(steps) do
+            env.say(label(st, ("Crossing the bridge %d/%d"):format(i, #steps)))
+            World.travelTo(top, { token = env.token(), offset = 3 })
+            if not j:sleep(BRIDGE_GAP) then return true end
+        end
+        local plate = span:FindFirstChild("ChainClimbPlate")
+        if plate and plate:IsA("BasePart") then
+            env.say(label(st, "Climbing the chain"))
+            -- the landing is past the plate's top edge, away from the pillars
+            local away = steps[#steps] and Vector3.new(plate.Position.X - steps[#steps].X, 0, plate.Position.Z - steps[#steps].Z) or Vector3.new(0, 0, 1)
+            away = away.Magnitude > 0.1 and away.Unit or Vector3.new(0, 0, 1)
+            local landing = plate.Position + Vector3.new(0, plate.Size.Y / 2 + 4, 0) + away * 6
+            World.travelTo(landing, { token = env.token(), ground = true })
+        end
+        return true
+    end
+
+    -- live 2026-11-19: a move whose landing killed us was sent again after each respawn, three lives in 12 s; a death soon after a move drops it (called
+    -- from the loop's respawn wait, since steps only run while alive)
+    local function noteDeath()
+        if areaGoal and areaGoal.movedAt and os.clock() - areaGoal.movedAt < AREA_DEADLY then areaGoal.dead = true end
+    end
+
+    -- live 2026-11-22 (user: you should see the actual dio model and just tp to that): the shrine's DIO waits dormant (TrainRaidDormant,
+    -- FightableNPC false) ~200 studs from where the climb ends and nothing woke him; the run goes to the raid's boss model itself
+    local BOSS_NEAR = 18
+    local BOSS_STAND = 10
+    local BOSS_EVERY = 4
+    local bossAt = -math.huge
+    local function stepRingsBoss(st)
+        if st.Raid ~= "Rings" or not string.find(string.lower(tostring(st.Objective or "")), "defeat", 1, true) then return false end
+        if os.clock() - bossAt < BOSS_EVERY then return false end
+        local players = env.Services.Workspace:FindFirstChild("Game")
+        players = players and players:FindFirstChild("Players")
+        local boss = nil
+        for _, model in ipairs(players and players:GetChildren() or {}) do
+            if model:GetAttribute("TrainRaidBoss") == true and model:GetAttribute("TrainRaidNPC") == tostring(st.Id) then boss = model end
+        end
+        local here = myPosition()
+        if not (boss and here) then return false end
+        local okP, pivot = pcall(function() return boss:GetPivot() end)
+        if not okP then return false end
+        if (pivot.Position - here).Magnitude <= BOSS_NEAR then return false end
+        bossAt = os.clock()
+        env.say(label(st, "Going to " .. tostring(boss:GetAttribute("RingsBoss") or boss.Name)))
+        World.travelTo(pivot.Position + pivot.LookVector * BOSS_STAND, { token = env.token(), ground = true, groundRequired = true, groundUp = AREA_PROBE_UP })
+        return true
+    end
+
+    local function stepRingsArea(st, j)
+        if st.Raid ~= "Rings" or os.clock() - areaAt < AREA_EVERY then return false end
+        -- a recorded route is run one leg a pass, so a fight (an earlier step) cuts in between legs and the route picks up again after it
+        -- (user 2026-11-22: enemies spawn on the path; pause, kill them, then resume)
+        local route, hop = Plan.ringsRoute(st.Objective)
+        if route then
+            local here = myPosition()
+            if not here then return false end
+            local index, onRoute = Plan.routeResume(route, here, ROUTE_NEAR)
+            areaAt = os.clock() - AREA_EVERY
+            if not onRoute then
+                env.say(label(st, "Going to the start of the route"))
+                World.travelTo(route[1], { token = env.token(), ground = true, groundRequired = true, groundUp = AREA_PROBE_UP })
+                return true
+            end
+            env.say(label(st, ("%s the route %d/%d"):format(hop and "Hopping" or "Running", index, #route)))
+            local ok, err
+            if hop then
+                -- each hop lands on the floor just under the recorded spot, never on a void slab; several a pass along the loaded path (user 2026-11-22: the
+                -- chains could be faster), stopping the moment an enemy is near or the objective moves so the fight step takes over
+                local objective = st.Objective
+                for i = index, math.min(#route, index + ROUTE_HOPS - 1) do
+                    if i > index then
+                        if j and not j:sleep(ROUTE_HOP_GAP) then return true end
+                        if #enemies(st, ROUTE_FIGHT_NEAR) > 0 or (state() or {}).Objective ~= objective then break end
+                    end
+                    ok, err = World.travelTo(route[i], { token = env.token(), ground = true, groundRequired = true, groundUp = ROUTE_HOP_UP,
+                        stream = false, viewZonesTimeout = 0 })
+                    if not ok then break end
+                end
+            else
+                ok, err = World.walkTo(route[index], { token = env.token(), sprint = true, direct = true, stream = false, tolerance = ROUTE_TOLERANCE })
+            end
+            if not ok then Log.dev("AutoRaid", "route leg %d: %s", index, tostring(err)) end
+            return true
+        end
+        -- an objective with a known waypoint goes there instead of to an area
+        -- candidates are tried in turn: one stood at for WAYPOINT_WAIT without the objective moving (or refused, or deadly) hands over to the next
+        local waypoints, walks = Plan.ringsWaypoint(st.Objective)
+        if waypoints then
+            local objective = tostring(st.Objective)
+            if not (wayTry and wayTry.objective == objective) then wayTry = { objective = objective, index = 1, since = nil } end
+            if areaGoal and areaGoal.objective == objective and areaGoal.dead then
+                areaGoal.dead = false
+                wayTry.index, wayTry.since = wayTry.index + 1, nil
+            end
+            local waypoint = waypoints[wayTry.index]
+            if not waypoint then return false end
+            local here = myPosition()
+            if not here then return false end
+            if (Vector3.new(waypoint.X, here.Y, waypoint.Z) - here).Magnitude <= AREA_NEAR / 2 then
+                wayTry.since = wayTry.since or os.clock()
+                if os.clock() - wayTry.since < WAYPOINT_WAIT then return false end
+                Log.dev("AutoRaid", "waypoint %d for %q didn't count", wayTry.index, objective)
+                wayTry.index, wayTry.since = wayTry.index + 1, nil
+                waypoint = waypoints[wayTry.index]
+                if not waypoint then return false end
+            end
+            areaAt = os.clock()
+            areaGoal = { objective = objective, movedAt = os.clock() }
+            env.say(label(st, ("Heading for %s (%d/%d)"):format(string.lower(objective):gsub("^%a+ ", ""), wayTry.index, #waypoints)))
+            local okGo
+            if walks and walks[wayTry.index] then
+                -- a leg the game only counts on foot (a teleport there didn't)
+                okGo = World.walkTo(waypoint, { token = env.token(), sprint = true })
+            else
+                okGo = World.travelTo(waypoint, { token = env.token(), ground = true, groundRequired = true, groundUp = AREA_PROBE_UP })
+            end
+            -- a refused landing (no floor, a void slab) moves straight on to the next candidate
+            if not okGo then wayTry.index, wayTry.since = wayTry.index + 1, nil end
+            return true
+        end
+        local root = raidRoot(st)
+        local map = root and root:FindFirstChild("Map")
+        local areas = map and map:FindFirstChild("Areas")
+        local from = myPosition()
+        if not (areas and from) then return false end
+        -- one goal per objective: arriving makes the goal the nearest area, and re-picking then would hop on along the route
+        local objective = tostring(st.Objective)
+        if areaGoal and areaGoal.objective == objective and areaGoal.dead then return false end
+        local area = areaGoal and areaGoal.objective == objective and areaGoal.area or nil
+        if not area then
+            area = R.nextArea(areas:GetChildren(), from, tonumber(st.Car) or tonumber(st.Stage), st.Objective)
+            if not area then return false end
+            areaGoal = { objective = objective, area = area }
+        end
+        local pivot = area:GetPivot().Position
+        if (Vector3.new(pivot.X, from.Y, pivot.Z) - from).Magnitude <= AREA_NEAR then return false end
+        areaAt = os.clock()
+        env.say(label(st, "Going to " .. tostring(area:GetAttribute("AreaTitle") or area.Name)))
+        areaGoal.movedAt = os.clock()
+        -- the floor is looked for from just above the area's marker, so a roof or overhang over it isn't taken for the ground
+        World.travelTo(pivot, { token = env.token(), ground = true, groundRequired = true, groundUp = AREA_PROBE_UP })
         return true
     end
 
@@ -31893,7 +32685,10 @@ function Run.new(env)
     -- live 2026-11-18: casts from 30-40 studs never counted; from 4 studs inside, barrage alone took car 7's door 60% -> 9%
     local DOOR_REACH = 8
     local DOOR_STAND = 4
+    -- Skills.lua: BarrageLength 2.5, so holding longer adds nothing
     local SKILL_HOLD = { Barrage = 2.5 }
+    local DOOR_CAST_GAP = 0.5
+    local DOOR_SWING_GAP = 0.8
     local doorCastAt = 0
     -- live 2026-11-18: after a respawn the stand stayed away and the door step "cast" into nothing (75% for minutes); skill steps call the stand first
     local summonAt = 0
@@ -31924,11 +32719,16 @@ function Run.new(env)
         return fallback
     end
 
+    -- live 2026-11-19: the last 9% of car 7's door sat out every skill's cooldown; each cast goes at the next panel still standing, round the door
+    local aimTurn = 0
     local function doorAim(door)
+        local standing = {}
         for _, d in ipairs(door:GetDescendants()) do
-            if d:IsA("BasePart") and d.Name == "DESTRUCTABLE" and d.Transparency < 1 then return d.Position end
+            if d:IsA("BasePart") and d.Name == "DESTRUCTABLE" and d.Transparency < 1 then standing[#standing + 1] = d.Position end
         end
-        return door:GetPivot().Position
+        if #standing == 0 then return door:GetPivot().Position end
+        aimTurn = aimTurn % #standing + 1
+        return standing[aimTurn]
     end
 
     local function stepDoor(st)
@@ -31954,6 +32754,15 @@ function Run.new(env)
         if not standOut() then return true end
         local ok, list = Combat.skills()
         if not ok then return true end
+        local anyReady = false
+        for _, skill in ipairs(list) do
+            if type(skill.name) == "string" and skill.name ~= "" and Combat.skillReady(skill.slot) then anyReady = true break end
+        end
+        -- every skill cooling down (barrage is 23 s): heavy swings at the door meanwhile instead of standing idle
+        if not anyReady then
+            if Combat.heavySwing and Combat.heavySwing({ aim = aim }) then doorCastAt = os.clock() + DOOR_SWING_GAP end
+            return true
+        end
         -- barrage first: it does most of a door's damage
         local ordered = {}
         for _, skill in ipairs(list) do if skill.name == "Barrage" then table.insert(ordered, 1, skill) else ordered[#ordered + 1] = skill end end
@@ -31962,7 +32771,7 @@ function Run.new(env)
                 local cast = Combat.useSkill(skill.slot, aim)
                 if cast then
                     local hold = SKILL_HOLD[skill.name] or 0.15
-                    doorCastAt = os.clock() + hold + 1.2
+                    doorCastAt = os.clock() + hold + DOOR_CAST_GAP
                     local slot = skill.slot
                     task.delay(hold, function() Combat.releaseSkill(slot, aim) end) -- leak:allow a one-shot key release that neither loops nor waits again
                     return true
@@ -32396,12 +33205,16 @@ function Run.new(env)
                     stopFight()
                     env.wait("Out, spectating")
                 elseif not env.alive() then
+                    noteDeath()
                     env.wait("Waiting to respawn")
                 elseif lockObjective(st) and lockpicker.tick() then
                     picking = true
                     env.say(label(st, "Picking the lock"))
                 else
-                    local acted = stepHighway(st) or stepRecover(st) or stepHazards(st) or stepLeaveRoom(st) or stepGiveIce(st) or stepIce(st) or stepFight(st) or stepRest(st) or stepSpy(st) or stepDoor(st) or stepRoof(st) or stepPrompts(st, PROMPT_RADIUS)
+                    -- the train's cars hold the fight in (Highway Star's stages aren't cars, so none is set there)
+                    confineCar = carModel(st, st.Car)
+                    confineEdges = st.Raid == "Rings"
+                    local acted = stepHighway(st) or stepRecover(st) or stepAvoid(st) or stepHazards(st) or stepLeaveRoom(st) or stepGiveIce(st) or stepIce(st) or stepWarm(st) or stepFight(st) or stepSpareRings(st) or stepRingsBridge(st, j) or stepRingsBoss(st) or stepRingsArea(st, j) or stepRest(st) or stepSpy(st) or stepDoor(st) or stepRoof(st) or stepPrompts(st, PROMPT_RADIUS)
                     if acted then
                         idleSince = nil
                     else
@@ -32435,6 +33248,7 @@ function Run.new(env)
     function R.stop()
         stopFight()
         stopHighway()
+        stopStruggle()
     end
 
     return R
@@ -32447,18 +33261,56 @@ __bundle_register("Features/Auto/Raid/Plan", function(require, _LOADED, __bundle
 -- auto raid plan: the raid table, the difficulty pick off the board's per-member cooldowns, target ranking (adds before the boss), which raid npcs count as enemies, which prompts are safe to press and when a suspect is accused; pure, no game reads beyond model attributes
 local Plan = {}
 
--- TrainRaidClient.Raids.lua:3-50; 77 Rings needs climbing and a cold meter the script can't play yet, so it isn't offered
+-- TrainRaidClient.Raids.lua:3-50 (77 Rings: Stages 6, MinLevel 40; user 2026-11-19 at level 40: add it)
 Plan.RAIDS = {
     Train       = { key = "Train", label = "The Train", minLevel = 20, unit = "Car" },
     HighwayStar = { key = "HighwayStar", label = "Highway Star", minLevel = 30, unit = "Stage" },
+    Rings       = { key = "Rings", label = "77 Rings", minLevel = 40, unit = "Stage" },
 }
-Plan.ORDER = { "Train", "HighwayStar" }
+Plan.ORDER = { "Train", "HighwayStar", "Rings" }
 Plan.CHOICES = {}
 Plan.BY_LABEL = {}
 for _, key in ipairs(Plan.ORDER) do
     local raid = Plan.RAIDS[key]
     Plan.CHOICES[#Plan.CHOICES + 1] = raid.label
     Plan.BY_LABEL[raid.label] = key
+end
+
+-- user 2026-11-19: the raid picker is a multi-select; (keys) in raid order from its value, which an older config saved as one label
+function Plan.pickedKeys(value)
+    local out = {}
+    if type(value) == "string" then
+        if Plan.BY_LABEL[value] then out[1] = Plan.BY_LABEL[value] end
+        return out
+    end
+    if type(value) ~= "table" then return out end
+    -- obsidian holds a multi pick as a set ({ [label] = true }); a default is given as a list of labels
+    local set = {}
+    for k, v in pairs(value) do
+        if v == true then set[k] = true elseif type(v) == "string" then set[v] = true end
+    end
+    for _, key in ipairs(Plan.ORDER) do
+        if set[Plan.RAIDS[key].label] then out[#out + 1] = key end
+    end
+    return out
+end
+
+-- (key to start, nil) for the next picked raid after `last` that's off cooldown, or (nil, soonest key, seconds) when every one is cooling down; readyAt maps key -> clock
+function Plan.nextRaid(keys, readyAt, now, last)
+    local n = #keys
+    if n == 0 then return nil end
+    local start = 1
+    for i, key in ipairs(keys) do
+        if key == last then start = i % n + 1 end
+    end
+    local soonest, soonestAt = nil, math.huge
+    for step = 0, n - 1 do
+        local key = keys[(start - 1 + step) % n + 1]
+        local at = readyAt[key] or 0
+        if at <= now then return key end
+        if at < soonestAt then soonest, soonestAt = key, at end
+    end
+    return nil, soonest, soonestAt - now
 end
 
 -- TrainRaidClient.lua:1085 ("Regular", "Hard"); "Best Ready" takes hard while it is off cooldown, else regular
@@ -32545,8 +33397,100 @@ function Plan.clock(seconds)
 end
 
 -- a raid npc worth hitting: never a hidden passione spy or a dormant one (HandlerHUD.lua:705, 908 hide their bars), never a plain passenger
-function Plan.isEnemy(model, bossName)
+-- live 2026-11-19: rings objectives whose goal the client never gets (the CP* checkpoints are server-only), by a phrase in the objective; positions from the
+-- live map. "Climb to the first door": the hall (A3) itself didn't count; the door ledge (the spike pit's SendTo CP2_DoorLedge) is read as the east-face
+-- landing, where a campfire waits under the portcullis door
+Plan.RINGS_WAYPOINTS = {
+    -- live 2026-11-22 (user: we still aren't starting the fight in the graveyard): A1's marker (-5999, 6834, 196) sits past the south gate (z 157),
+    -- so "arriving" there started nothing; standing inside the graveyard between its gates (z 17-157) started wave 1 at once
+    { phrase = "survive the dead in the graveyard", at = Vector3.new(-6000, 6804, 87) },
+    -- live 2026-11-22 (user: make sure it doesn't happen again): the 7 knights came 0.3 s after the chain climb with us on the bridge's far landing
+    -- (-5900, 6831, 597); a run that hopped to the area's centre (-5844, 6822, 659) waited ~200 s for them. the landing first, then the road beside it
+    { phrase = "beat the knights", at = { Vector3.new(-5900, 6831, 597), Vector3.new(-5856, 6827, 593) } },
+    { phrase = "first door", at = Vector3.new(-5674, 6959, 829) },
+    -- live 2026-11-19: after tarkus, "Find the way out of the hall"; past the east portcullis (-5660, 6976, 938) and the ascent floor north of it
+    -- (-5687, 7003, 1098) didn't count. candidates are tried in turn: the ascent's two lowest floors at hall height just past the hall's north wall first
+    -- live 2026-11-19: areas are AreaTransitionZone boxes and the higher AreaPriority wins where they overlap: the hall (A3, priority 13) spans y 6934-7084,
+    -- the frozen ascent (A5, 12) y 7024-7384, z 639-1339. leaving the hall is standing in the ascent's box outside the hall's, so the ascent floors above
+    -- y 7024 and past the hall's z 889-1067 come first (the earlier floors at y 6986 sat under the ascent's box)
+}
+
+-- routes run on foot point to point (a player's own run, recorded), resumed from the nearest point after a fight
+Plan.RINGS_ROUTES = {
+    -- live 2026-11-22 (user climbed it, so_hall_trail.txt REC MOUNTAIN): the ground the user stood on up the frozen ascent and over to the shrine,
+    -- hopped by teleport (user: "you can probably just chain tps"); the objective turned to "Defeat DIO at the shrine" at about (-5984, 7302, 855)
+    { phrase = "climb the frozen mountain", teleport = true, points = {
+        Vector3.new(-6259, 7028, 991), Vector3.new(-6249, 7040, 1082), Vector3.new(-6240, 7068, 1129), Vector3.new(-6201, 7083, 1137),
+        Vector3.new(-6189, 7084, 1144), Vector3.new(-6065, 7136, 1148), Vector3.new(-5952, 7147, 1150), Vector3.new(-5892, 7157, 1134),
+        Vector3.new(-5880, 7158, 1128), Vector3.new(-5845, 7198, 1079), Vector3.new(-5855, 7198, 1086), Vector3.new(-5856, 7213, 1030),
+        Vector3.new(-5840, 7232, 988), Vector3.new(-5849, 7232, 962), Vector3.new(-5878, 7254, 890), Vector3.new(-5888, 7255, 878),
+        Vector3.new(-5921, 7279, 856), Vector3.new(-5932, 7277, 854), Vector3.new(-5984, 7302, 855),
+    } },
+    -- live 2026-11-22 (user ran it, so_hall_trail.txt): from the tarkus floor west along z 908-938, up the west ramp (y 6991 → 7031), and the
+    -- objective turned to "Climb the frozen mountain" at about (-6168, 7031, 976); teleports onto the ascent never counted
+    -- every 0.25 s sample of the user's run kept (5-8 studs apart): a thinned line from z 918 cut the spike pit's edge (-5956, 6960, 938) and fell in
+    -- live 2026-11-22 (user: we are failing to run the route, just do a chained tp): hopped point to point like the mountain
+    { phrase = "way out of the hall", teleport = true, points = {
+        Vector3.new(-5937, 6991, 928), Vector3.new(-5936, 6991, 917.8), Vector3.new(-5941, 6991, 912.2), Vector3.new(-5943.2, 6991, 910.8),
+        Vector3.new(-5951.4, 6991, 907.9), Vector3.new(-5959, 6991, 908.3), Vector3.new(-5966.5, 6991, 911), Vector3.new(-5972.7, 6991, 915.3),
+        Vector3.new(-5978.1, 6991, 921.9), Vector3.new(-5980.4, 6991, 929.2), Vector3.new(-5985.7, 6991, 934.3), Vector3.new(-5993.6, 6991, 935.9),
+        Vector3.new(-6001.1, 6994.6, 936.9), Vector3.new(-6009.1, 6998.8, 937.8), Vector3.new(-6017.1, 7003, 938.2), Vector3.new(-6025, 7007, 938.4),
+        Vector3.new(-6032.5, 7011, 938.9), Vector3.new(-6039.8, 7014.8, 936.1), Vector3.new(-6046.9, 7015, 937.1), Vector3.new(-6054.3, 7015, 940.3),
+        Vector3.new(-6062.1, 7015, 941.9), Vector3.new(-6067.6, 7015, 947.9), Vector3.new(-6074.3, 7015, 952.2), Vector3.new(-6080.8, 7015, 956.3),
+        Vector3.new(-6088.6, 7015, 957), Vector3.new(-6096.8, 7015, 957.4), Vector3.new(-6104.8, 7014.9, 958.1), Vector3.new(-6112.8, 7017.4, 958.6),
+        Vector3.new(-6120.8, 7021.7, 959.1), Vector3.new(-6128.3, 7025.7, 959.6), Vector3.new(-6135.6, 7029.6, 960.7), Vector3.new(-6141.5, 7031.1, 965.4),
+        Vector3.new(-6145.9, 7031.1, 971.6), Vector3.new(-6152, 7031.1, 975.9), Vector3.new(-6160.1, 7031, 976.1), Vector3.new(-6168.2, 7031, 976.4),
+        Vector3.new(-6176.2, 7031, 976.5), Vector3.new(-6182.7, 7031, 976.5),
+    } },
+}
+
+-- plain: the recorded route ({ Vector3 }) for a rings objective and whether it's hopped by teleport instead of run, or nil
+function Plan.ringsRoute(objective)
+    local text = lower(objective)
+    for _, r in ipairs(Plan.RINGS_ROUTES) do
+        if string.find(text, r.phrase, 1, true) then return r.points, r.teleport == true end
+    end
+    return nil
+end
+
+-- plain: where to pick a route up from `pos`: the point after the nearest one (so a resumed run never doubles back), 1 when far from it all
+function Plan.routeResume(points, pos, near)
+    local best, bestD = nil, math.huge
+    for i, p in ipairs(points) do
+        local d = (p - pos).Magnitude
+        if d < bestD then best, bestD = i, d end
+    end
+    if not best or bestD > (near or 25) then return 1, false end
+    return math.min(#points, best + 1), true
+end
+
+-- plain: the waypoints ({ Vector3 }, tried in order) for a rings objective and which of them are walked to from the one before ({ [i] = true }), or nil
+function Plan.ringsWaypoint(objective)
+    local text = lower(objective)
+    for _, w in ipairs(Plan.RINGS_WAYPOINTS) do
+        if string.find(text, w.phrase, 1, true) then
+            -- a single point has an X; a list of candidates doesn't
+            if w.at.X ~= nil then return { w.at }, w.walk or {} end
+            return w.at, w.walk or {}
+        end
+    end
+    return nil
+end
+
+-- plain: the names in the state's EncounterTargets ({ { Name, Position } }, TrainRaidClient.Rings.lua:1399-1466), the knights a rings arena wants killed
+function Plan.targetNames(state)
+    local out = {}
+    local list = type(state) == "table" and state.EncounterTargets
+    if type(list) ~= "table" then return out end
+    for _, t in ipairs(list) do
+        if type(t) == "table" and type(t.Name) == "string" then out[t.Name] = true end
+    end
+    return out
+end
+
+function Plan.isEnemy(model, bossName, targets)
     if model:GetAttribute("TrainRaidDisguised") == true or model:GetAttribute("TrainRaidDormant") == true then return false end
+    if targets and targets[model.Name] then return true end
     -- live 2026-11-18: the mist car's aged passengers (TrainRaidAmbient) were fought instead of iced
     if model:GetAttribute("TrainRaidAmbient") ~= nil and model:GetAttribute("TrainRaidAmbient") ~= false then return false end
     if Plan.isBoss(model, bossName) then return true end
@@ -32601,9 +33545,13 @@ end
 -- live 2026-11-18: car 8 says "Leave Coco Jumbo"; a prompt the objective names by its action is the way on, whatever the word
 function Plan.safePrompt(p, objective)
     local action = lower(p.action)
+    -- TrainRaidClient.Rings.lua:1371-1389: a spare ring you've claimed carries Claimed_<UserId> (the client only hides it), so it isn't pressed again
+    if p.claimed then return false end
     if action ~= "" and objective ~= nil and string.find(lower(objective), action, 1, true) then return true end
     -- live 2026-11-18: coco jumbo's "Enter, or tap to carry him" held through drops you into his room; it's only for an objective that says to enter
     if string.find(action, "enter", 1, true) then return objective ~= nil and string.find(lower(objective), "enter", 1, true) ~= nil end
+    -- live 2026-11-19 (user): car 5's front exit "Unlock" is enabled from the start, and we tried it during "Find the door key"; it waits for an objective that says unlock
+    if string.find(action, "unlock", 1, true) then return objective ~= nil and string.find(lower(objective), "unlock", 1, true) ~= nil end
     local text = action .. " " .. lower(p.name)
     for _, word in ipairs(UNSAFE) do
         if string.find(text, word, 1, true) then return false end
@@ -32644,7 +33592,125 @@ function Plan.limitReached(runs, limit)
     return limit > 0 and (tonumber(runs) or 0) >= limit
 end
 
+-- plain: true when the raid server holds more players than the user allows; a limit of 0 is off
+function Plan.tooCrowded(count, limit)
+    limit = tonumber(limit) or 0
+    return limit > 0 and (tonumber(count) or 0) > limit
+end
+
 return Plan
+
+end)
+__bundle_register("Features/Auto/Raid/Hazards", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- rings hazards: which of the raid's traps (spike strips and floor, the spike pit, the collapsing floor) and announced strikes (icefall, telegraphs) are dangerous at a spot now, and the nearest safe point out; pure, reads only the trap models' attributes and boxes (live map 2026-11-19, Rings.lua / RingsHazards.lua)
+local Hazards = {}
+
+-- a trap about to fire counts this long early, so stepping out lands before it does
+Hazards.LEAD = 0.6
+-- the box a trap covers is widened this much, and a way out lands this far past its edge
+Hazards.PAD = 2
+Hazards.CLEAR = 4
+
+-- plain: the phase of a timed trap ([0, Up) up, then Down, then Warn; TrapType SpikeFloor / SpikeStrip Mode Cycle), or its Phase attribute (Mode Plate,
+-- CollapsingFloor), at server time `now`
+function Hazards.phase(attrs, now)
+    if attrs.Mode == "Plate" or attrs.TrapType == "CollapsingFloor" then return attrs.Phase or "Armed", nil end
+    local up, down, warn = tonumber(attrs.UpSeconds) or 0, tonumber(attrs.DownSeconds) or 0, tonumber(attrs.WarnSeconds) or 0
+    local start, cycle = tonumber(attrs.CycleStart), up + down + warn
+    if not start or cycle <= 0 then return attrs.Phase or "Up", nil end
+    local t = (now - start) % cycle
+    if t < up then return "Up", up - t end
+    if t < up + down then return "Down", up + down - t end
+    return "Warn", cycle - t
+end
+
+-- plain: true when a trap hurts now or will within `lead` seconds
+function Hazards.dangerous(attrs, now, lead)
+    lead = lead or Hazards.LEAD
+    if attrs.TrapType == "SpikePit" then return true end
+    -- live 2026-11-19: twice a fight on the collapsing floor dropped us into its shaft (lives 3 → 1); it and the pressure plates are set off by standing on
+    -- them, so they're never stood on in any phase (moves cross them in an instant)
+    if attrs.TrapType == "CollapsingFloor" or attrs.Mode == "Plate" then return true end
+    local phase, left = Hazards.phase(attrs, now)
+    if phase == "Up" or phase == "Warn" then return true end
+    -- a timed trap about to come up
+    return phase == "Down" and left ~= nil and left <= lead
+end
+
+-- plain: true when `pos` is inside the flat box (centre cf with Position / PointToObjectSpace, size), widened by pad
+function Hazards.inside(box, pos, pad)
+    pad = pad or Hazards.PAD
+    local p = box.cf:PointToObjectSpace(pos)
+    return math.abs(p.X) <= box.size.X / 2 + pad and math.abs(p.Z) <= box.size.Z / 2 + pad
+        and p.Y <= box.size.Y / 2 + 6 and p.Y >= -box.size.Y / 2 - 6
+end
+
+-- plain: the nearest point outside the box on the ground plane, `clear` past its widened edge
+function Hazards.exit(box, pos, pad, clear)
+    pad, clear = pad or Hazards.PAD, clear or Hazards.CLEAR
+    local p = box.cf:PointToObjectSpace(pos)
+    local hx, hz = box.size.X / 2 + pad + clear, box.size.Z / 2 + pad + clear
+    -- out through the nearest side
+    local dx, dz = hx - math.abs(p.X), hz - math.abs(p.Z)
+    local out
+    if dx < dz then
+        out = Vector3.new((p.X >= 0 and 1 or -1) * hx, p.Y, p.Z)
+    else
+        out = Vector3.new(p.X, p.Y, (p.Z >= 0 and 1 or -1) * hz)
+    end
+    return box.cf:PointToWorldSpace(out)
+end
+
+-- plain: a circle strike (icefall: Position, Size, At) as a box, live until it lands
+function Hazards.circle(center, radius, untilAt)
+    return { strike = true, untilAt = untilAt, box = { cf = CFrame.new(center), size = Vector3.new(radius * 2, 40, radius * 2) } }
+end
+
+-- the live traps of a rings map: { attrs, box } for each spike strip (Props), the spike floor and pit (their Hitbox) and the collapsing floor (its Panels)
+function Hazards.collect(root)
+    local out = {}
+    local function boxOf(model)
+        local ok, cf, size = pcall(function()
+            if model:IsA("BasePart") then return model.CFrame, model.Size end
+            return model:GetBoundingBox()
+        end)
+        if ok and cf and size then return { cf = cf, size = size } end
+        return nil
+    end
+    local function add(trap, area)
+        local attrs = trap:GetAttributes()
+        local box = area and boxOf(area)
+        if box and attrs.TrapType then out[#out + 1] = { attrs = attrs, box = box, model = trap } end
+    end
+    local props = root:FindFirstChild("Props")
+    for _, c in ipairs(props and props:GetChildren() or {}) do
+        if c:GetAttribute("TrapType") == "SpikeStrip" then add(c, c:FindFirstChild("Spikes") or c) end
+    end
+    local map = root:FindFirstChild("Map")
+    local traps = map and map:FindFirstChild("Traps")
+    for _, t in ipairs(traps and traps:GetChildren() or {}) do
+        local kind = t:GetAttribute("TrapType")
+        if kind == "SpikeFloor" or kind == "SpikePit" then add(t, t:FindFirstChild("Hitbox"))
+        elseif kind == "CollapsingFloor" then add(t, t:FindFirstChild("Panels")) end
+    end
+    return out
+end
+
+-- (hazard, way out) for the first trap or strike dangerous at `pos` now; traps carry their live attributes, so `refresh` re-reads them; `always`
+-- counts every trap whatever its phase (a fight's hold point: live 2026-11-22, user: we fell into the spikes while fighting, held on the spike floor
+-- between its cycles and caught when it came up)
+function Hazards.at(list, strikes, pos, now, always)
+    for _, h in ipairs(strikes or {}) do
+        if now <= h.untilAt and Hazards.inside(h.box, pos, 0) then return h, Hazards.exit(h.box, pos, 0) end
+    end
+    for _, h in ipairs(list or {}) do
+        local attrs = h.model and h.model:GetAttributes() or h.attrs
+        if (always or Hazards.dangerous(attrs, now)) and Hazards.inside(h.box, pos) then return h, Hazards.exit(h.box, pos) end
+    end
+    return nil
+end
+
+return Hazards
 
 end)
 __bundle_register("Features/Auto/Raid/Highway", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -32753,15 +33819,16 @@ end
 -- live 2026-11-18 (tracks from hw_traffic.lua): swervers weave between the middle lane and one outer lane at 15-20 studs/s sideways, turning back about every
 -- second, so a straight-line guess caught them heading the wrong way; a car seen moving sideways this much is a swerver, and its band spans the middle and its side
 local SWERVE_SPAN = 5
-local SWERVE_SPEED = 4
 local OUTER = 16
 local SWERVE_WINDOW = 2
+local SWERVE_HEADING = 0.5
 -- a car that moved this far between two looks was put somewhere new
 local JUMP = 40
 
 -- plain: a swerver's band (lo, hi) around the road centre, from the range of z it has been seen at and its sideways speed; nil when it holds its lane
 function Highway.swerveBand(center, zmin, zmax, z, vz)
-    if zmax - zmin < SWERVE_SPAN and math.abs(vz) < SWERVE_SPEED then return nil end
+    -- live 2026-11-19: a 1-stud wobble over 0.1 s read as 10 studs/s sideways and flagged a straight car, whose band then blocked our clear lane; only the span counts
+    if zmax - zmin < SWERVE_SPAN then return nil end
     local lo, hi = math.min(zmin, z + vz, center), math.max(zmax, z + vz, center)
     if lo < center - SWERVE_SPAN then lo = math.min(lo, center - OUTER) end
     if hi > center + SWERVE_SPAN then hi = math.max(hi, center + OUTER) end
@@ -32794,6 +33861,105 @@ function Highway.pickLane(lanes, current, traffic, me, holes)
     end
     if best ~= current and bestRoom < currentRoom + SWITCH_MARGIN then return current end
     return best
+end
+
+-- live 2026-11-19 (user: predict longer routes): the one-step picker only looked 240 studs (1.8 s at 135 closing) and judged lanes one at a time, so it waited out
+-- traps (cars side by side in two lanes) and crossed a lane with too little room; the planner predicts every car PLAN_HORIZON seconds ahead and searches lane
+-- sequences (stay, or one lane over taking CHANGE_TIME, both lanes clear meanwhile) for the one that survives longest, then has the fewest changes and holes
+local PLAN_HORIZON = 3
+local PLAN_STEP = 0.1
+local CHANGE_TIME = 0.5
+-- a car this close along the road at the same moment is a hit; a hole this close is driven over
+local CAR_REACH = 16
+local HOLE_REACH = 6
+-- one clean change (0.2) beats a hole (about 0.3), two changes to duck one don't
+local CHANGE_COST = 0.2
+-- charged per planning step spent on a hole; at 90 studs/s one hole covers about two steps, so about 0.3 a hole
+local HOLE_COST = 0.15
+
+-- plain: a swerver's z after t seconds, moving at vz and turning back at the edges of its band lo..hi
+function Highway.bounce(z, vz, lo, hi, t)
+    local span = hi - lo
+    if span <= 0 then return z end
+    local p = (math.clamp(z, lo, hi) - lo + vz * t) % (2 * span)
+    if p > span then p = 2 * span - p end
+    return lo + p
+end
+
+-- plain: true when the lane at z holds one of things at t seconds from now, given us { x, vx }; reach is how close along the road counts
+function Highway.occupied(z, t, things, me, reach)
+    local ourX = me.x + me.vx * t
+    for _, c in ipairs(things) do
+        local dx = c.x + c.vx * t - ourX
+        if dx > -reach and dx < reach then
+            -- live 2026-11-19: a swerver's whole band, blocked for the full horizon, boxed us in front of an oncoming car while the swerver was already
+            -- heading for the far lane; it's followed along its path instead
+            local cz = c.lo and Highway.bounce(c.z, c.vz, c.lo, c.hi, t) or c.z + c.vz * math.min(t, DRIFT_FOR)
+            if math.abs(cz - z) < LANE_HALF then return true end
+        end
+    end
+    return false
+end
+
+-- plain: (lane z to head for, seconds survived) from a search over lane sequences; current is the lane we hold, holes (optional) only cost
+function Highway.plan(lanes, current, traffic, me, holes)
+    local n = math.floor(PLAN_HORIZON / PLAN_STEP + 0.5)
+    local change = math.max(1, math.floor(CHANGE_TIME / PLAN_STEP + 0.5))
+    local start, gap = 1, math.huge
+    for i, z in ipairs(lanes) do
+        if math.abs(z - current) < gap then start, gap = i, math.abs(z - current) end
+    end
+    -- only what we can meet inside the horizon is checked each step (the road holds about 280 holes)
+    local function reachable(list, reach)
+        local out = {}
+        for _, c in ipairs(list or {}) do
+            local closing = me.vx - c.vx
+            local dx = c.x - me.x
+            if dx > -reach and dx - math.max(0, closing) * PLAN_HORIZON < reach then out[#out + 1] = c end
+        end
+        return out
+    end
+    traffic, holes = reachable(traffic, CAR_REACH), holes and reachable(holes, HOLE_REACH) or nil
+    local occ, pot = {}, {}
+    for i, z in ipairs(lanes) do
+        occ[i], pot[i] = {}, {}
+        for k = 0, n do
+            occ[i][k] = Highway.occupied(z, k * PLAN_STEP, traffic, me, CAR_REACH)
+            pot[i][k] = holes and Highway.occupied(z, k * PLAN_STEP, holes, me, HOLE_REACH) or false
+        end
+    end
+    local memo = {}
+    -- (steps survived, cost, first lane moved to or nil)
+    local function best(i, k)
+        if k > n then return n, 0, nil end
+        if occ[i][k] then return k, 0, nil end
+        local key = i * 1000 + k
+        local hit = memo[key]
+        if hit then return hit[1], hit[2], hit[3] end
+        local here = pot[i][k] and HOLE_COST or 0
+        local bs, bc = best(i, k + 1)
+        bc = bc + here
+        local bfirst = nil
+        for j = i - 1, i + 1, 2 do
+            if lanes[j] then
+                local s, c = nil, 0
+                for m = k, math.min(n, k + change - 1) do
+                    if occ[i][m] or occ[j][m] then s = m break end
+                    if pot[j][m] then c = c + HOLE_COST end
+                end
+                if not s then
+                    local s2, c2 = best(j, k + change)
+                    -- a change costs more the later it comes, so a move the plan needs anyway is made now rather than at the last moment
+                    s, c = s2, c + c2 + CHANGE_COST * (1 + k / n)
+                end
+                if s > bs or (s == bs and c + here < bc) then bs, bc, bfirst = s, c + here, j end
+            end
+        end
+        memo[key] = { bs, bc, bfirst }
+        return bs, bc, bfirst
+    end
+    local survived, _, first = best(start, 0)
+    return lanes[first or start], survived * PLAN_STEP
 end
 
 function Highway.new(d)
@@ -32881,8 +34047,20 @@ function Highway.new(d)
                     while samples[1] and now - samples[1][1] > SWERVE_WINDOW do table.remove(samples, 1) end
                     local zmin, zmax = pos.Z, pos.Z
                     for _, sample in ipairs(samples) do zmin, zmax = math.min(zmin, sample[2]), math.max(zmax, sample[2]) end
+                    -- sideways speed over the whole window, so a stud of wobble between two looks isn't read as a lane change
+                    local first = samples[1]
+                    if first and now - first[1] >= 0.3 then h.vz = (pos.Z - first[2]) / (now - first[1]) else h.vz = 0 end
+                    -- a swerver turns about every second, so its heading comes from the last half second only
+                    local recent = nil
+                    for _, sample in ipairs(samples) do
+                        if now - sample[1] <= SWERVE_HEADING then recent = sample break end
+                    end
+                    local heading = (recent and now - recent[1] >= 0.15) and (pos.Z - recent[2]) / (now - recent[1]) or h.vz
                     local entry = { x = pos.X, z = pos.Z, vx = h.vx, vz = h.vz }
-                    if center then entry.lo, entry.hi = Highway.swerveBand(center, zmin, zmax, pos.Z, h.vz) end
+                    if center then
+                        entry.lo, entry.hi = Highway.swerveBand(center, zmin, zmax, pos.Z, h.vz)
+                        if entry.lo then entry.vz = heading end
+                    end
                     out[#out + 1] = entry
                 end
             end
@@ -32930,7 +34108,9 @@ function Highway.new(d)
         local hazards = traffic(car, centerZ)
         local vx = root.AssemblyLinearVelocity.X
         local me = { x = cf.Position.X, vx = math.max(vx, 40) }
-        local picked = Highway.pickLane(lanes, laneZ, hazards, me, potholes())
+        -- live 2026-11-19: planned from the lane we were steering for, half a change already counted as done, so it planned the next change from there and swept
+        -- across two lanes into traffic; the plan starts from the lane the car is actually in
+        local picked = Highway.plan(lanes, cf.Position.Z, hazards, me, potholes())
         if Highway.mayChange(laneZ, picked, cf.Position.Z, Highway.laneRoom(laneZ, hazards, me)) then laneZ = picked end
         local steer = math.clamp((laneZ - cf.Position.Z) * LANE_GAIN - cf.LookVector.Z * HEADING_GAIN, -1, 1)
         local action = Highway.recover(recovery, os.clock(), vx, cf.UpVector.Y)
@@ -33175,6 +34355,102 @@ function Lock.new(Activities)
 end
 
 return Lock
+
+end)
+__bundle_register("Utility/GameHud", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- game hud: puts the game's MainHUD (hp, moves, money) back after we force-close its dialogue; the dialogue fades the hud out on open and only its own close fades it back (DialogueHandler.lua:355-405, 496-513), which disabling the Dialogue gui skips
+local Identity = require("Utility/Identity")
+
+local M = {}
+
+-- plain: what a hud panel's transparency should return to; the game keeps a skill-driven target on the panel, else it's fully shown
+function M.target(group)
+    local wanted = group:GetAttribute("SkillVisibilityTarget")
+    if type(wanted) == "number" then return wanted end
+    return 0
+end
+
+-- true when the hud was hidden and has been shown again
+function M.restore(player)
+    local gui = player and player:FindFirstChild("PlayerGui")
+    local hud = gui and gui:FindFirstChild("MainHUD")
+    if not (hud and hud:IsA("ScreenGui")) then return false end
+    Identity.elevate()
+    local changed = false
+    pcall(function()
+        if not hud.Enabled then
+            hud.Enabled = true
+            changed = true
+        end
+        for _, child in ipairs(hud:GetChildren()) do
+            if child:IsA("CanvasGroup") and child.GroupTransparency > 0.99 then
+                child.GroupTransparency = M.target(child)
+                changed = true
+            end
+        end
+    end)
+    return changed
+end
+
+-- the dialogue's fade-out runs 0.6 s, so a close mid-fade is restored again once it has finished
+local FADE = 0.7
+function M.restoreAfterClose(player)
+    M.restore(player)
+    task.delay(FADE, function() M.restore(player) end) -- leak:allow a one-shot re-show that neither loops nor waits again
+end
+
+return M
+
+end)
+__bundle_register("Features/Auto/Keys", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- auto keys: answers the game's key-sequence prompts (QTE.lua sessions: Hamon's breathing and glass, raid struggles, story prompts) through Activities.qte / qteInput, keys sent in order a short gap apart without waiting for each answer; shared by Auto Hamon and Auto Raid
+local Keys = {}
+
+-- the first key goes this long after a prompt shows, then one every GAP, at most AHEAD past what the server has confirmed; with no progress for
+-- RESYNC the count falls back to the server's (live 2026-11-22: a key per round trip, ~0.5 s, ran Caesar's 5-key seventh wave out of time)
+Keys.REACT = 0.15
+Keys.GAP = 0.18
+Keys.AHEAD = 3
+Keys.RESYNC = 1
+Keys.TICK = 0.03
+
+-- one sender at a time: two loops each sending the next key would double it, and a doubled key reads as a miss
+local owner = nil
+
+-- runs until the job dies or `wanted()` says stop
+function Keys.loop(j, Activities, wanted)
+    local session, sent, sentAt, progress, progressAt = nil, 0, 0, 0, 0
+    while j.alive and wanted() do
+        local idle = owner ~= nil and owner ~= j and owner.alive
+        if not idle then
+            owner = j
+            local ok, q = Activities.qte()
+            local now = os.clock()
+            if ok and type(q) == "table" and not q.ended and type(q.sequence) == "table" then
+                local p = q.progress or 0
+                if q.sessionId ~= session then
+                    session, sent, progress, progressAt, sentAt = q.sessionId, 0, p, now, now - Keys.GAP + Keys.REACT
+                end
+                if p ~= progress then progress, progressAt = p, now end
+                if sent < p or (sent > p and now - progressAt > Keys.RESYNC) then sent = p end
+                local token = q.sequence[sent + 1]
+                if token and now - sentAt >= Keys.GAP and sent - p < Keys.AHEAD then
+                    if Activities.qteInput(q.sessionId, token, true) then
+                        sent, sentAt = sent + 1, now
+                    end
+                end
+            end
+        end
+        -- another feature's loop is answering: check back less often
+        if not j:sleep(idle and Keys.TICK * 10 or Keys.TICK) then
+            if owner == j then owner = nil end
+            return
+        end
+    end
+    if owner == j then owner = nil end
+end
+
+return Keys
 
 end)
 __bundle_register("Features/Auto/MobFarm", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -35055,11 +36331,18 @@ local FARM = "Cases"
 local TICK = 1
 local TOTAL = 10
 -- HowlerCases.lua:13-15: reveal at 200 studs, hide past 240
+-- live 2026-11-19 (user: sweep quicker): the reveal lands right after arrival, so a search stop waits this long, not the 3 s a known spot gets
 local REVEAL_WAIT = 3
+local SEARCH_REVEAL = 1.5
+-- search stops taken in one pass while movement is free, ending early on a case to open
+local SEARCH_BATCH = 6
 local OPEN_WAIT = 4
+-- HowlerCases.lua HoldDuration 0.8, plus slack
+local CASE_HOLD = 1.1
 local SEARCH_GAP = 250
 local RETRY_AFTER = 600
 local MAX_TRIES = 3
+local RESEARCH_AFTER = 1800
 local NAMESPACE = Store.GAME .. "/cases"
 local KEY = "spots"
 -- every landmark kind the travel menu knows, minus zones and story props
@@ -35079,6 +36362,45 @@ function M.spread(points, gap)
         if far then kept[#kept + 1] = p end
     end
     return kept
+end
+
+-- live 2026-11-19 (user: howler crates don't all get grabbed): cases 05, 06 and 09 never revealed, because the search only stood at landmarks 250 apart while a
+-- case shows within 200 (HowlerCases.lua RevealRange); a grid this far apart over the landmarks' box leaves no ground more than 200 from a stop (270 / sqrt 2 = 191)
+M.GRID_STEP = 270
+-- a grid stop farther than this from every landmark is open water or off the map, where no case sits
+M.GRID_NEAR = 500
+
+-- grid stops over the box around `points` (padded by `pad`), each at the height of its nearest landmark so it lands near the ground
+function M.grid(points, step, pad)
+    if #points == 0 then return {} end
+    local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+    for _, p in ipairs(points) do
+        minX, maxX = math.min(minX, p.X), math.max(maxX, p.X)
+        minZ, maxZ = math.min(minZ, p.Z), math.max(maxZ, p.Z)
+    end
+    local out = {}
+    for x = minX - pad, maxX + pad, step do
+        for z = minZ - pad, maxZ + pad, step do
+            local nearest, nearestD = points[1], math.huge
+            for _, p in ipairs(points) do
+                local d = (p.X - x) ^ 2 + (p.Z - z) ^ 2
+                if d < nearestD then nearest, nearestD = p, d end
+            end
+            out[#out + 1] = Vector3.new(x, nearest.Y, z)
+        end
+    end
+    return out
+end
+
+-- the stops within `radius` of any of `points` (on the ground plane)
+function M.near(stops, points, radius)
+    local out = {}
+    for _, g in ipairs(stops) do
+        for _, p in ipairs(points) do
+            if (g.X - p.X) ^ 2 + (g.Z - p.Z) ^ 2 <= radius * radius then out[#out + 1] = g break end
+        end
+    end
+    return out
 end
 
 -- a nearest-next tour from `from`
@@ -35101,7 +36423,7 @@ function M.mount(ctx)
     local O = Mount.orchestrator(ctx, "CashCases")
     if not O then return end
     local Api = ctx.Api or {}
-    local Player, World = Api.Player, Api.World
+    local Player, World, Activities = Api.Player, Api.World, Api.Activities
     if not (Player and World) then
         Log.devwarn("CashCases", "player or world api missing; cash cases won't load")
         return
@@ -35113,6 +36435,7 @@ function M.mount(ctx)
     if type(spots) ~= "table" then spots = {} end
     local tries, skipUntil = {}, {}
     local route, routeAt = nil, 1
+    local searchDoneAt = nil
 
     local function post(text, level) Status.set(OWNER, text, level) end
 
@@ -35202,7 +36525,21 @@ function M.mount(ctx)
 
     local function open(j, id, case)
         post("Opening a cash case", Status.ACTING)
-        local ok = World.travelTo(case.model, { token = token, offset = 3 })
+        -- the prompt sits on its own small part with an 8 stud range (HowlerCases.lua PromptRange); travel there rather than 3 over the model's pivot
+        local at = case.prompt.Parent
+        local target = (at and at:IsA("BasePart")) and at.Position or case.model
+        local ok = World.travelTo(target, { token = token, offset = 3 })
+        -- live 2026-11-19 (user: the first open always fails): an unfocused window's scripted hold falls back to an instant fire, which sends Open without the
+        -- Hold the server wants first; the prompt's own two sends go out directly, Hold then Open after the hold time, with the prompt press as the fallback
+        if ok and Activities and Activities.howlerCase then
+            Activities.howlerCase("Hold", id)
+            j:sleep(CASE_HOLD)
+            Activities.howlerCase("Open", id)
+            if waitFor(j, function() return opened()[id] end, OPEN_WAIT) then
+                tries[id] = nil
+                return true
+            end
+        end
         if ok then ok = World.firePrompt(case.prompt) end
         if ok and waitFor(j, function() return opened()[id] end, OPEN_WAIT) then
             tries[id] = nil
@@ -35229,7 +36566,9 @@ function M.mount(ctx)
                 if typeof(d.position) == "Vector3" then points[#points + 1] = d.position end
             end
             local root = References.humanoidRootPart
-            route = M.tour(M.spread(points, SEARCH_GAP), root and root.Position or Vector3.new())
+            local from = root and root.Position or Vector3.new()
+            -- the grid alone covers every spot within reveal range, so landmark stops would only repeat it; grid stops far from any landmark are dropped
+            route = M.tour(M.near(M.grid(points, M.GRID_STEP, M.GRID_STEP / 2), points, M.GRID_NEAR), from)
             routeAt = 1
         end
         local p = route[routeAt]
@@ -35288,7 +36627,7 @@ function M.mount(ctx)
         end
         if spot then
             post("Going to a cash case", Status.ACTING)
-            local ok = World.travelTo(spot, { token = token })
+            local ok = World.travelTo(spot, { token = token, ground = true })
             local case = ok and waitFor(j, function() return liveCases()[spotId] end, REVEAL_WAIT)
             local opened1 = case and open(j, spotId, case)
             if not case then failed(spotId) end
@@ -35299,14 +36638,32 @@ function M.mount(ctx)
         if not point then
             found = false
             release()
+            -- a finished sweep starts over after a while, rather than never looking again
+            searchDoneAt = searchDoneAt or os.clock()
+            if os.clock() - searchDoneAt >= RESEARCH_AFTER then route, searchDoneAt = nil, nil end
             return "Search done", Status.IDLE
         end
-        post(("Searching %d of %d"):format(routeAt - 1, #route), Status.ACTING)
-        World.travelTo(point, { token = token })
-        waitFor(j, function() return next(liveCases()) ~= nil end, REVEAL_WAIT)
-        remember(liveCases())
+        -- several stops per pass while nothing else wants movement; a closed case found ends the batch so the next pass opens it
+        local function unopenedHere()
+            local live, doneNow = liveCases(), opened()
+            remember(live)
+            for id in pairs(live) do
+                if not doneNow[id] and not skipped(id) then return true end
+            end
+            return false
+        end
+        for stop = 1, SEARCH_BATCH do
+            if stop > 1 then
+                point = nextRoutePoint()
+                if not point or not j.alive or WorldEvents.wants() or Farms.priority("Cases") then break end
+            end
+            post(("Searching %d of %d"):format(routeAt - 1, #route), Status.ACTING)
+            -- live 2026-11-19 (user: falling and hurt between stops): a grid stop's height is a guess, so it lands on the floor found under it
+            World.travelTo(point, { token = token, ground = true })
+            if waitFor(j, unopenedHere, SEARCH_REVEAL) then break end
+        end
         release()
-        return ("Searching %d of %d"):format(routeAt - 1, #route), Status.ACTING
+        return ("Searching %d of %d"):format(math.max(routeAt - 1, 0), #route), Status.ACTING
     end
 
     local function loop(j)
@@ -35533,7 +36890,7 @@ return function(ctx)
     local Q = {
         Activities = Activities, World = World, Player = Player, Combat = Api.Combat, Net = Api.Net,
         References = ctx.References, Workspace = ctx.Services.Workspace, RunService = ctx.Services.RunService, UserInputService = ctx.Services.UserInputService,
-        owner = OWNER, job = nil, token = nil, current = nil,
+        owner = OWNER, job = nil, token = nil, current = nil, Toggles = Toggles,
     }
     -- every line goes to the topbar (Utility/Status); a line said mid-step is the action under way
     local function post(text, level) Status.set(OWNER, text, level) end
@@ -35745,6 +37102,11 @@ return function(ctx)
         Tooltip = "Takes elimination contracts when the story asks for a level",
         Default = true,
     })
+    options:AddToggle("AutoQuest_PreferVampire", {
+        Text    = "Prefer Vampire Bounties",
+        Tooltip = "For Hamon's vampire lessons",
+        Default = false,
+    })
     options:AddToggle("AutoQuest_Puzzles", {
         Text    = "Solve Story Puzzles",
         Tooltip = "ID checks, staff records and the cash timing",
@@ -35897,17 +37259,20 @@ function Flow.new(ctx, owner)
         return F.grade(entry) * 100 + (LOW_BASE[crop] and 50 or 75)
     end
 
-    -- the best seed you own, by grade then by crop value; a name asked for (a story seed) narrows it to that seed
+    -- the best seed you own, by grade then by crop value; a name asked for (a story seed) narrows it to that seed. with no name a rokaka seed is never the pick:
+    -- it grows 48 min into fruit that can't be sold (gardening.md, GM:374-381), so it's only planted when asked for (Grow Roka, or Rokaka in the seed list)
     function F.bestSeed(name)
         local best, bestValue = nil, -1
         for _, entry in ipairs(F.seeds()) do
-            if not name or entry.name == name then
+            if (name and entry.name == name) or (not name and entry.name ~= F.ROKA_SEED) then
                 local v = seedValue(entry)
                 if v > bestValue then best, bestValue = entry, v end
             end
         end
         return best
     end
+
+    F.ROKA_SEED = "Rokaka Seed"
 
     local function seedNamed(name) return F.bestSeed(name) end
 
@@ -38012,6 +39377,8 @@ __bundle_register("Features/Auto/Quests/Errands", function(require, _LOADED, __b
 local Contracts = require("Features/Auto/Quests/Contracts")
 
 local PROMPT_WAIT  = 4
+-- how far past the exit zone's centre (away from the registry) the escape walk ends; still inside the 54-wide exit ring
+local ESCAPE_OUT   = 15
 local TALK_SETTLE  = 1
 local ACTOR_RANGE  = 150
 local MAX_POTS     = 2
@@ -38089,6 +39456,27 @@ return function(Q, D)
     end
     E.questPrompt = questPrompt
 
+    -- MuseumHandler.lua builds your own exhibits and record stacks client-side (StoryActors.MuseumErrands.Museum<Kind>_<UserId>), untagged by quest
+    -- id; the nearest enabled one (a looked-at exhibit or searched stack goes quiet)
+    local function museumPrompt(from)
+        local folder = D.gamePath({ "StoryActors", "MuseumErrands" })
+        if not folder then return nil end
+        local suffix = "_" .. tostring(me())
+        local best, bestDistance = nil, math.huge
+        for _, set in ipairs(folder:GetChildren()) do
+            if string.sub(set.Name, -#suffix) == suffix then
+                for _, d in ipairs(set:GetDescendants()) do
+                    if d:IsA("ProximityPrompt") and d.Name == "MuseumPrompt" and d.Enabled then
+                        local spot = spotOf(d)
+                        local distance = spot and from and (spot - from).Magnitude or 0
+                        if spot and distance < bestDistance then best, bestDistance = d, distance end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
     local function here()
         local root = References.humanoidRootPart
         return root and root.Position or nil
@@ -38107,7 +39495,7 @@ return function(Q, D)
 
     -- the nearest tagged prompt, looked for again at the marker when none has streamed in yet
     local function usePrompt(q, name, walk)
-        local prompt = questPrompt(q, D.locate(q) or here())
+        local prompt = q.id == "MUSEUM_ERRANDS" and museumPrompt(here()) or questPrompt(q, D.locate(q) or here())
         if not prompt then
             local position = D.locate(q)
             if not position then return false, "no_prompt" end
@@ -38118,6 +39506,18 @@ return function(Q, D)
         end
         local ok, err = move(spotOf(prompt) or D.locate(q), name, walk)
         if not ok then return false, err end
+        -- live 2026-11-22: the museum's upper-floor exhibits sit above the roof line, so a ground landing put us on the roof out of reach;
+        -- then stand on the floor just in front of the prompt instead
+        local spot, root = spotOf(prompt), References.humanoidRootPart
+        if spot and root and (spot - root.Position).Magnitude > prompt.MaxActivationDistance then
+            local parent = prompt.Parent
+            local facing = parent and parent:IsA("BasePart") and parent.CFrame.LookVector or Vector3.zero
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = { root.Parent }
+            local floor = workspace:Raycast(spot + facing * 4 + Vector3.new(0, -1, 0), Vector3.new(0, -40, 0), params)
+            if floor then World.travelTo(floor.Position + Vector3.new(0, 3, 0), { token = Q.token, offset = 0 }) end
+        end
         if not D.waitFor(function() return prompt.Parent ~= nil and prompt.Enabled end, PROMPT_WAIT) then return false, "no_prompt" end
         Q.say(prompt.ActionText ~= "" and prompt.ActionText or ("Using " .. (name or "it")))
         return World.firePrompt(prompt)
@@ -38339,7 +39739,22 @@ return function(Q, D)
             if not questPrompt(q, here()) then return nil end
             return { run = function() return usePrompt(q, "the net") end }
         end
-        if tag == "Museum_Escape" then return { run = function() return goMarker(q, "the exit") end } end
+        -- live 2026-11-22: the marker for this step chases you (the guard), and a long teleport away dropped the records; walking out of the
+        -- LandRegistry zone into the LandRegistryExit ring around it is what counts
+        if tag == "Museum_Escape" then
+            return { run = function()
+                local registry, exit = D.gamePath({ "QuestZones", "LandRegistry" }), D.gamePath({ "QuestZones", "LandRegistryExit" })
+                local from, to = registry and D.positionOf(registry), exit and D.positionOf(exit)
+                if not (from and to) then return goMarker(q, "the exit") end
+                local away = (to - from) * Vector3.new(1, 0, 1)
+                local target = to + (away.Magnitude > 0.1 and away.Unit or Vector3.new(1, 0, 0)) * ESCAPE_OUT
+                Q.say("Walking out of the registry")
+                local ok, err = World.walkTo(target, { token = Q.token, sprint = true })
+                if ok then return true end
+                if not D.alive() then return false, "died" end
+                return false, err
+            end }
+        end
         if tag == "Museum_Ambush" then
             if Player.playerAttr("MuseumAmbush") then return { run = function() return fight(q, tag, "the Stand users", false) end } end
             return { run = function() return goMarker(q, "the museum") end }
@@ -39012,6 +40427,7 @@ __bundle_register("Features/Auto/Quests/Driver", function(require, _LOADED, __bu
 -- auto quests driver: the generic objective driver keyed by objective tag (talk, interact, reach, defeat, hand-in, howler checkpoint), plus the waits every step shares; a step only counts once the server's quest state changes, and a step that keeps failing is parked instead of retried forever
 local Executor = require("Utility/Executor")
 local Identity = require("Utility/Identity")
+local GameHud  = require("Utility/GameHud")
 
 local POLL          = 0.25
 local STEP_TIMEOUT  = 12
@@ -39294,7 +40710,10 @@ return function(Q)
         local dialogue = gui and gui:FindFirstChild("Dialogue")
         if not (dialogue and dialogue:IsA("ScreenGui") and dialogue.Enabled) then return false end
         Identity.elevate()
-        return (pcall(function() dialogue.Enabled = false end))
+        local ok = pcall(function() dialogue.Enabled = false end)
+        -- live 2026-11-19 (user: the hp/moves/money hud sometimes vanishes): disabling the dialogue skips the close that fades the hud back in
+        if ok then GameHud.restoreAfterClose(player) end
+        return ok
     end
 
     -- live 2026-11-17: d'arby's open table holds QTEInputLocked for as long as you sit at it, and the wager is played right there
@@ -39770,13 +41189,27 @@ return function(Q, D)
     end
 
     -- live 2026-11-17: every tier lists the same seven bounties and a finished one reads done on all of them, so only your own tier is read
+    -- plain: true when a bounty has vampires to fight (Bounty.lua "Dispose of the Vampires": Summon Vampire, which Hamon's vampire lessons count)
+    function B.hasVampires(definition)
+        for _, step in ipairs(type(definition) == "table" and definition.Steps or {}) do
+            if type(step) == "table" and step.Target == "Vampire" then return true end
+        end
+        return false
+    end
+
     local function pick()
         local ok, board = Activities.bountyBoard()
         if not ok then return nil end
+        local preferVampires = Q.Toggles and Q.Toggles.AutoQuest_PreferVampire and Q.Toggles.AutoQuest_PreferVampire.Value
+        -- vampires first when preferred; with none listed the rest still pay xp and loot while the board waits to rotate
+        local first = nil
         for _, b in ipairs(board) do
-            if not b.completed and not b.active and B.drivable(b.definition) and not D.blocked("bounty|" .. b.id) then return b end
+            if not b.completed and not b.active and B.drivable(b.definition) and not D.blocked("bounty|" .. b.id) then
+                if not preferVampires or B.hasVampires(b.definition) then return b end
+                first = first or b
+            end
         end
-        return nil
+        return first
     end
 
     -- Bounty.lua:784-787: the board rotates on the server hour
@@ -39950,7 +41383,10 @@ local HOLD_WAIT   = 25
 local STREAM_WAIT = 4
 local OPEN_WAIT   = 4
 local REPLY_WAIT  = 3
-local PUZZLE_TIME = 40
+local PUZZLE_TIME = 25
+-- no open puzzle seen for this long, or the same move sent this many times unanswered, closes it for a fresh try
+local PUZZLE_STALE = 3
+local MOVE_REPEATS = 2
 -- the game's own inspection sends a keepalive every 10 s (IncidentHandler.lua:1057-1070)
 local KEEPALIVE   = 8
 local POLL        = 0.25
@@ -40033,19 +41469,27 @@ return function(Q, D)
         return unit ~= nil and unit:GetAttribute("HarvestMoving") == true
     end
 
+    -- live 2026-11-19 (user: the first box opens, the second fails every time): a box already solved can keep its prompt, and the nearest-first pick reopened it
+    -- each try; a box found solved is passed over while another is left
+    local spent = setmetatable({}, { __mode = "k" })
     local function promptIn(model, spot)
         local filter = { root = model }
         if spot then filter.near = spot end
         local ok, recs = World.prompts(filter)
         if not ok then return nil end
-        local fallback = nil
+        local fallback, used = nil, nil
         for _, rec in ipairs(recs) do
             if string.sub(rec.name, 1, #PREFIX) == PREFIX and rec.position and not rec.prompt:GetAttribute("BountySourceHidden") then
-                if not moving(rec) then return rec end
-                fallback = fallback or rec
+                if spent[rec.prompt] then
+                    used = used or rec
+                elseif not moving(rec) then
+                    return rec
+                else
+                    fallback = fallback or rec
+                end
             end
         end
-        return fallback
+        return fallback or used
     end
 
     -- the same prompt's position now, for a target that runs
@@ -40070,7 +41514,10 @@ return function(Q, D)
             elseif type(payload) ~= "table" or payload.Token ~= token then
                 return
             elseif verb == "Puzzle" then
-                if not s.puzzle or (tonumber(payload.Version) or 0) >= (tonumber(s.puzzle.Version) or 0) then
+                -- live 2026-11-19 (user: the first box opens, the second fails every time): each box starts its own Version count again, so the second box's
+                -- pushes read as older than the first box's last and were dropped; a new box (another Index) always replaces the old one
+                local newBox = s.puzzle and payload.Index ~= s.puzzle.Index
+                if not s.puzzle or newBox or (tonumber(payload.Version) or 0) >= (tonumber(s.puzzle.Version) or 0) then
                     s.puzzle = payload
                     if payload.Open then s.closed = false end
                 end
@@ -40109,14 +41556,23 @@ return function(Q, D)
         end, timeout)
     end
 
+    local function allPlaced(p)
+        for _, name in ipairs(COMPONENTS) do
+            if not (type(p.Placed) == "table" and p.Placed[name] == true) then return false end
+        end
+        return true
+    end
+
+    -- live 2026-11-19 (user: meryl's necklace sticks on grabbing it to return): with every piece fitted the necklace read as solved and was closed 3 s later,
+    -- just before the server opened its Evidence stage (seen 7 s after); a fitted necklace waits for that stage and takes the evidence instead
+    local function awaitingEvidence(p)
+        return (p.Kind == "Assembly" or p.Index == 4) and p.Stage ~= "Evidence" and allPlaced(p)
+    end
+
     local function puzzleDone(p)
         if p.Stage == "Evidence" then return false end
-        if p.Kind == "Assembly" or p.Index == 4 then
-            for _, name in ipairs(COMPONENTS) do
-                if not (type(p.Placed) == "table" and p.Placed[name] == true) then return false end
-            end
-            return true
-        end
+        -- the necklace is finished by taking its evidence (the incident moves on), never by its pieces alone
+        if p.Kind == "Assembly" or p.Index == 4 then return false end
         for row = 1, 3 do
             if not (type(p.Values) == "table" and type(p.Target) == "table" and p.Values[row] == p.Target[row]) then return false end
         end
@@ -40153,20 +41609,39 @@ return function(Q, D)
         return false
     end
 
+    -- the puzzle is closed and the step retried rather than waiting out PUZZLE_TIME when no open puzzle has been seen this long, or one move went unanswered twice
+    local function giveUp(c, s, why)
+        if s.puzzle and not s.closed then Activities.incident(c.id, s.puzzle.Token, "ClosePuzzle") end
+        return false, why
+    end
+
     local function solvePuzzle(c, s, before)
         local deadline = os.clock() + PUZZLE_TIME
         local lastAlive = os.clock()
+        local seenAt = os.clock()
+        local lastMove, repeats = nil, 0
         while os.clock() < deadline do
             if not D.alive() then return false, "died" end
             if I.fingerprint(fresh(c.id)) ~= before then break end
             if s.closed then return false, "puzzle_closed" end
             local p = s.puzzle
-            if p and puzzleDone(p) then
+            -- live 2026-11-19: 20 s of keepalives with no puzzle to act on; a puzzle that isn't there (or isn't open) is given up on quickly
+            if p and p.Open then seenAt = os.clock() end
+            if os.clock() - seenAt >= PUZZLE_STALE then return giveUp(c, s, "puzzle_stale") end
+            if p and awaitingEvidence(p) then
+                -- nothing to send: the evidence stage is on its way
+                Q.say("Waiting for the evidence")
+            elseif p and puzzleDone(p) then
                 -- solved but not yet counted: the close below may be what hands the piece over
                 waitProgress(c, s, before, REPLY_WAIT)
                 break
             elseif p then
                 local version = p.Version
+                -- the same move against the same version twice means the server isn't taking it
+                local move = tostring(p.Index) .. "|" .. tostring(version) .. "|" .. tostring(p.Stage) .. "|" .. (type(p.Values) == "table" and table.concat(p.Values, ",") or "")
+                repeats = (move == lastMove) and repeats + 1 or 0
+                lastMove = move
+                if repeats >= MOVE_REPEATS then return giveUp(c, s, "puzzle_rejected") end
                 local sent = puzzleMove(c, p)
                 if not sent then return false, "puzzle_stuck" end
                 lastAlive = os.clock()
@@ -40246,6 +41721,8 @@ return function(Q, D)
     end
 
     local function press(c, s, model, rec, before, scenario)
+        -- only this press's box counts: the last box's finished puzzle must not read as this one solved (cleared before the press, whose reply can be instant)
+        if scenario == "Jewelry" then s.puzzle, s.closed = nil, false end
         local fired, ferr = reachAndFire(model, rec)
         if not fired then return false, ferr end
         if scenario == "Jewelry" then
@@ -40253,7 +41730,13 @@ return function(Q, D)
             local opened = D.waitFor(function()
                 return (s.puzzle and s.puzzle.Open) or I.fingerprint(fresh(c.id)) ~= before
             end, OPEN_WAIT)
-            if s.puzzle and s.puzzle.Open then return solvePuzzle(c, s, before) end
+            if s.puzzle and s.puzzle.Open then
+                -- solved the moment it opened: this box is done, so the next pick goes to another
+                if puzzleDone(s.puzzle) then spent[rec.prompt] = true end
+                local ok, why = solvePuzzle(c, s, before)
+                if not ok and s.puzzle and puzzleDone(s.puzzle) then spent[rec.prompt] = true end
+                return ok, why
+            end
             if opened then return true end
             return false, "no_puzzle"
         end
@@ -40319,6 +41802,986 @@ return function(Q, D)
 end
 
 end)
+__bundle_register("Features/Auto/Hamon", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- auto hamon: Lisa Lisa's Hamon training end to end (buy it, the breathing mask, reporting back, the pillar climb, the mask trial through Auto Quests' bounties and contracts, then starting a style path), plus Auto Key Prompts, which answers every key-sequence prompt the game shows (QTE.lua); quest ids from Quests.lua:1427-1658, Lisa Lisa's choices from DialogueInfo.lua:675-817
+local GameHud  = require("Utility/GameHud")
+local Identity = require("Utility/Identity")
+local Jobs     = require("Utility/Jobs")
+local Log      = require("Utility/Log")
+local Mount    = require("Utility/Mount")
+local Status   = require("Utility/Status")
+local UiWrite  = require("Utility/UiWrite")
+local Keys     = require("Features/Auto/Keys")
+local Climb    = require("Features/Auto/Hamon/Climb")
+local Lessons  = require("Features/Auto/Hamon/Lessons")
+
+local M = {}
+
+local OWNER = "AutoHamon"
+local TICK = 1
+local PRICE = 10000                                          -- DialogueInfo.lua:762 "The training costs 10,000 dalas"
+local MASK = "Ripple Training Mask"
+local LISA = "Lisa Lisa"
+local LISA_SPOT = Vector3.new(-2627.7, 669.6, 1204.8)        -- beside her at the pillar (recon/quest_chain.md)
+local PILLAR_NEAR = 90
+local TALK_GAP = 8
+-- a lesson started from Lisa Lisa runs this long at most before another try (Caesar's glass: 7 waves of about 3 s)
+local LESSON_GAP = 30
+local TALK_WAIT = 2
+local ACCESSORY_SLOTS = { "Accessory1", "Accessory2", "Accessory3", "Accessory4" }
+-- Lisa Lisa's three paths and the StartPath argument each sends (DialogueInfo.lua:784-798)
+local STYLES = { Caesar = "Caesar", Jonathan = "Hamon", Zeppeli = "Zeppeli" }
+local STYLE_NAMES = { "Caesar", "Jonathan", "Zeppeli" }
+
+-- plain: the training step from the comma lists of active and completed quests and the sub-ability
+function M.step(active, completed, subAbility)
+    local function has(list, id) return type(list) == "string" and string.find("," .. list .. ",", "," .. id .. ",", 1, true) ~= nil end
+    if subAbility == "Vampire" then return "vampire" end
+    if has(active, "RIPPLE_TRAINING_MASK") then return "mask" end
+    if has(active, "RIPPLE_TRAINING_PILLAR") then return "pillar" end
+    if has(active, "RIPPLE_TRAINING_TRIAL") then return "trial" end
+    if has(active, "RIPPLE_TRAINING_TALK") or has(active, "RIPPLE_TRAINING_RETURN") or has(active, "RIPPLE_TRAINING_PATH") then return "talk" end
+    if type(active) == "string" and string.find(active, "RIPPLE_PATH_", 1, true) then return "lessons" end
+    -- live 2026-11-22: a finished path sets the style's name ("Caesar Hamon"; Quests.lua ExcludedSubAbilities), not plain "Hamon"
+    if type(subAbility) == "string" and string.find(subAbility, "Hamon", 1, true) then return "done" end
+    if has(completed, "RIPPLE_TRAINING_PATH") then return "choose" end
+    if has(completed, "RIPPLE_TRAINING_TRIAL") then return "talk" end
+    if has(completed, "RIPPLE_TRAINING_MASK") then return "talk" end
+    return "buy"
+end
+
+-- plain: which style lesson the active quest list is on (Quests.lua:1495-1658), or nil
+function M.lesson(active)
+    local function has(id) return type(active) == "string" and string.find("," .. active .. ",", "," .. id .. ",", 1, true) ~= nil end
+    if has("RIPPLE_PATH_CAESAR") then return "glass" end
+    if has("RIPPLE_PATH_CAESAR_SWIM") then return "swim" end
+    if has("RIPPLE_PATH_CAESAR_BALANCE") then return "balance" end
+    if has("RIPPLE_PATH_CAESAR_BOSS") then return "vampire" end
+    return nil
+end
+
+function M.mount(ctx)
+    local O = Mount.orchestrator(ctx, "AutoHamon")
+    if not O then return end
+    local Api = ctx.Api or {}
+    local Player, World, Activities, Net = Api.Player, Api.World, Api.Activities, Api.Net
+    if not (Player and World and Activities and Net) then
+        Log.devwarn("AutoHamon", "apis missing; auto hamon won't load")
+        return
+    end
+    local Options, Toggles = ctx.Options, ctx.Toggles
+    local References = ctx.References
+
+    local training, keys = false, false
+    local job, keyJob, climber = nil, nil, nil
+    local lastTalk, trialSet, lastLesson, vampireSet = -math.huge, false, -math.huge, false
+
+    local function post(text, level) Status.set(OWNER, text, level or Status.ACTING) end
+
+    local function keyLoop(j)
+        Keys.loop(j, Activities, function() return keys or training end)
+        keyJob = nil
+    end
+
+    local function ensureKeys()
+        if keyJob then return end
+        keyJob = O.track(Jobs.spawn(keyLoop, { name = "AutoHamon.keys" }))
+    end
+
+    local function closeDialogue()
+        local player = References.player
+        local gui = player and player:FindFirstChild("PlayerGui")
+        local dialogue = gui and gui:FindFirstChild("Dialogue")
+        if not (dialogue and dialogue:IsA("ScreenGui") and dialogue.Enabled) then return end
+        Identity.elevate()
+        if pcall(function() dialogue.Enabled = false end) then GameHud.restoreAfterClose(player) end
+    end
+
+    local function stopClimb()
+        if climber then climber.Destroy() end
+        climber = nil
+    end
+
+    -- the mask on in a free accessory slot (it's what the breathing, the pillar and the trial all check)
+    local function ensureMask()
+        local okE, eq = Player.equipment()
+        if not okE or type(eq) ~= "table" then return false end
+        for _, slot in ipairs(ACCESSORY_SLOTS) do
+            if eq[slot] and eq[slot].Name == MASK then return true end
+        end
+        local okF, entry = Player.findItem(MASK)
+        if not (okF and type(entry) == "table") then return false end
+        for _, slot in ipairs(ACCESSORY_SLOTS) do
+            if not eq[slot] then
+                Player.equipAccessory(entry.name, entry.id, slot)
+                return false
+            end
+        end
+        return false
+    end
+
+    -- talk to Lisa Lisa; opening her dialogue is what reports a lesson (DialogueInfo.lua:675-760 fire HamonTraining "Talk" on open)
+    local function talk(j, after)
+        if os.clock() - lastTalk < TALK_GAP then return end
+        lastTalk = os.clock()
+        World.travelTo(LISA_SPOT, { ground = true })
+        local okN, lisa = World.npc(LISA)
+        local prompt = okN and lisa:FindFirstChildWhichIsA("ProximityPrompt", true)
+        if not prompt then return end
+        World.firePrompt(prompt)
+        if not j:sleep(TALK_WAIT) then return end
+        if after then after() end
+        closeDialogue()
+    end
+
+    local function pass(j)
+        local active = Player.value("Stats.ActiveQuest")
+        local completed = Player.value("Stats.CompletedQuests")
+        local step = M.step(active, completed, Player.value("SubAbility"))
+        if step ~= "pillar" then stopClimb() end
+        if step == "vampire" then
+            post("Vampires can't learn Hamon", Status.IDLE)
+        elseif step == "done" then
+            post("Hamon learned", Status.IDLE)
+        elseif step == "buy" then
+            local coins = tonumber(Player.value("Stats.Coins")) or 0
+            if coins < PRICE then
+                post(("Need %d dalas for Hamon"):format(PRICE), Status.IDLE)
+                return
+            end
+            post("Buying Hamon training")
+            talk(j, function() Net.fireAllowed("HamonTraining", "Purchase") end)
+        elseif step == "mask" then
+            ensureKeys()
+            post(ensureMask() and "Breathing through the mask" or "Putting the mask on")
+        elseif step == "talk" then
+            ensureMask()
+            post("Reporting to Lisa Lisa")
+            talk(j)
+        elseif step == "pillar" then
+            ensureKeys()
+            if not ensureMask() then
+                post("Putting the mask on")
+                return
+            end
+            local character = References.player and References.player.Character
+            local pillar = workspace:FindFirstChild("HamonPillar")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if not (pillar and root) then return end
+            if climber and (climber.finished or climber.character ~= character) then stopClimb() end
+            if not climber then
+                if ((root.Position - pillar.Position) * Vector3.new(1, 0, 1)).Magnitude > PILLAR_NEAR then
+                    World.travelTo(LISA_SPOT, { ground = true })
+                    return
+                end
+                local c, err = Climb.new(character, pillar, Net, function(text) post(text) end)
+                if not c then
+                    post("Can't climb yet", Status.IDLE)
+                    Log.devwarn("AutoHamon", "climb: %s", tostring(err))
+                    return
+                end
+                c.character = character
+                climber = c
+                c.place()
+            end
+        elseif step == "trial" then
+            ensureKeys()
+            ensureMask()
+            -- the trial is a bounty and an elimination with the mask on: auto quests runs both
+            if not trialSet and Options.AutoQuest_Side and Toggles.AutoQuest_Enabled then
+                trialSet = true
+                local picked = {}
+                for k, v in pairs(Options.AutoQuest_Side.Value or {}) do picked[k] = v end
+                picked["Petyr's Bounties"], picked["Elimination Contracts"] = true, true
+                UiWrite.value(Options.AutoQuest_Side, picked)
+                UiWrite.value(Toggles.AutoQuest_Enabled, true)
+            end
+            post("Mask trial: bounty and elimination")
+        elseif step == "choose" then
+            local style = STYLES[Options.AutoHamon_Style and Options.AutoHamon_Style.Value] or "Caesar"
+            post("Starting a Hamon style")
+            talk(j, function() Net.fireAllowed("HamonTraining", "StartPath", style) end)
+        elseif step == "lessons" then
+            ensureKeys()
+            local lesson = M.lesson(active)
+            if lesson == "glass" then
+                -- DialogueInfo.lua:806-811 GlassOffer: the glass comes on "Lesson" "Glass", then 7 waves of key prompts
+                if os.clock() - lastLesson < LESSON_GAP then
+                    post("Holding the glass")
+                    return
+                end
+                lastLesson = os.clock()
+                post("Holding the glass")
+                lastTalk = -math.huge
+                talk(j, function() Net.fire("HamonTraining", "Lesson", "Glass") end)
+            elseif lesson == "swim" then
+                post("Swimming the buoys")
+                local character = References.player and References.player.Character
+                local ok, why = Lessons.swim(j, { World = World, Net = Net, controls = Climb.controls(), character = character })
+                if not ok then Log.dev("AutoHamon", "swim: %s", tostring(why)) end
+            elseif lesson == "balance" then
+                post("Balancing on the post")
+                local stats = ctx.Services.Stats
+                local okP, ping = pcall(function() return stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+                local ok, why = Lessons.balance(j, { World = World, Activities = Activities, ping = okP and ping or nil })
+                if why == "ping" then
+                    post("Ping too high to balance", Status.IDLE)
+                    if not j:sleep(TALK_GAP) then return end
+                elseif not ok then
+                    Log.dev("AutoHamon", "balance: %s", tostring(why))
+                end
+            elseif lesson == "vampire" then
+                -- Caesar's final test: Auto Quests takes the vampire bounty when the board has one
+                if not vampireSet and Options.AutoQuest_Side and Toggles.AutoQuest_Enabled and Toggles.AutoQuest_PreferVampire then
+                    vampireSet = true
+                    local picked = {}
+                    for k, v in pairs(Options.AutoQuest_Side.Value or {}) do picked[k] = v end
+                    picked["Petyr's Bounties"] = true
+                    UiWrite.value(Options.AutoQuest_Side, picked)
+                    UiWrite.value(Toggles.AutoQuest_PreferVampire, true)
+                    UiWrite.value(Toggles.AutoQuest_Enabled, true)
+                end
+                post("Hunting a vampire bounty")
+            else
+                post("Hamon style lessons", Status.IDLE)
+            end
+        end
+    end
+
+    local function loop(j)
+        while j.alive and training do
+            local ok, err = pcall(pass, j)
+            if not ok then Log.devwarn("AutoHamon", "pass failed: %s", tostring(err)) end
+            if not j:sleep(TICK) then return end
+        end
+    end
+
+    local function stopTraining()
+        training = false
+        if job then job:Cancel() end
+        job = nil
+        stopClimb()
+        trialSet, vampireSet = false, false
+        Status.clear(OWNER)
+    end
+
+    local box = ctx.Tabs.Quests:AddRightGroupbox("Hamon", "wind")
+    box:AddToggle("AutoHamon_Enabled", {
+        Text     = "Auto Hamon Training",
+        Default  = false,
+        Callback = function(on)
+            if on then
+                if training then return end
+                training = true
+                job = O.track(Jobs.spawn(loop, { name = "AutoHamon" }))
+            else
+                stopTraining()
+            end
+        end,
+    })
+    box:AddDropdown("AutoHamon_Style", {
+        Text    = "Style",
+        Values  = STYLE_NAMES,
+        Default = "Caesar",
+    })
+    box:AddToggle("AutoHamon_Keys", {
+        Text     = "Auto Key Prompts",
+        Default  = false,
+        Callback = function(on)
+            keys = on
+            if on then ensureKeys() end
+        end,
+    })
+
+    O.onUnload(function()
+        stopTraining()
+        keys = false
+    end)
+    O.finalize()
+end
+
+return M
+
+end)
+__bundle_register("Features/Auto/Hamon/Lessons", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- hamon lessons: Caesar's swim (HamonLesson "Begin" Kind Swim, "Update" Next: six pool buoys in order within 60 s, steered through the control module's camera-relative move vector the game's own swim reads, PlayerController.lua updateSwimming) and fingertip balance (the BalanceStart prompt opens an ArmWrestling "Breath" session: ten rounds pressed at their perfect moment, ArmWrestling.lua Angle is linear in time)
+local Lessons = {}
+
+local SWIM_START = Vector3.new(-2670.93, 674.33, 1166.57)    -- RIPPLE_PATH_CAESAR_SWIM tracker
+local SWIM_LIMIT = 80
+local SWIM_TICK = 0.05
+local SWIM_ARRIVE = 0.3
+local BALANCE_SIDE = 3
+local BALANCE_START_WAIT = 3
+local BALANCE_TRIES = 5
+local BALANCE_LIMIT = 45
+-- live 2026-11-22: at 450 ms ping every perfect-time press was graded a miss; at 150 ms all ten landed
+Lessons.BALANCE_MAX_PING = 300
+
+-- swims the buoys; true when the lesson's session ended (the quest tells whether it counted), false and why otherwise
+function Lessons.swim(j, deps)
+    local World, Net, controls, character = deps.World, deps.Net, deps.controls, deps.character
+    local grounds = workspace:FindFirstChild("HamonTrainingGrounds")
+    local rings = grounds and grounds:FindFirstChild("SwimRings")
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not (rings and hum and root and controls) then return false, "not ready" end
+    local nextRing, ended, desired = 1, false, Vector3.zero
+    local handle = Net.on("HamonLesson", function(verb, a, b) -- leak:allow disconnected by finish() on every return path below
+        if verb == "Begin" and type(a) == "table" and a.Kind == "Swim" then
+            nextRing = 1
+        elseif verb == "Update" and type(b) == "table" and tonumber(b.Next) then
+            nextRing = tonumber(b.Next)
+        elseif verb == "End" then
+            ended = true
+        end
+    end)
+    -- the swim turns the move vector through the camera (PlayerController.lua updateSwimming: CurrentCamera VectorToWorldSpace), so it's handed back camera-relative
+    rawset(controls, "GetMoveVector", function()
+        if desired.Magnitude < 0.1 then return Vector3.zero end
+        local v = workspace.CurrentCamera.CFrame:VectorToObjectSpace(desired)
+        local flat = Vector3.new(v.X, 0, v.Z)
+        return flat.Magnitude > 0.01 and flat.Unit or Vector3.zero
+    end)
+    local function finish(...)
+        rawset(controls, "GetMoveVector", nil)
+        if handle then handle:Disconnect() end
+        return ...
+    end
+    World.travelTo(SWIM_START, { ground = true })
+    local deadline = os.clock() + SWIM_LIMIT
+    while os.clock() < deadline do
+        if ended and nextRing > 1 then return finish(true) end
+        local ring = rings:FindFirstChild("Ring" .. math.min(nextRing, 6))
+        if not ring then return finish(false, "no buoy") end
+        local target = ring:GetPivot().Position
+        local d = (target - root.Position) * Vector3.new(1, 0, 1)
+        desired = d.Magnitude > SWIM_ARRIVE and d.Unit or Vector3.zero
+        -- on the deck the walk ignores the swim's move vector, so step into the pool toward the buoy
+        if not hum.PlatformStand then hum:MoveTo(Vector3.new(target.X, root.Position.Y, target.Z)) end
+        if not j:sleep(SWIM_TICK) then return finish(false, "stopped") end
+    end
+    return finish(false, "timed out")
+end
+
+-- balances on the post; true when the session ended in success, false and why otherwise
+function Lessons.balance(j, deps)
+    local World, Activities, ping = deps.World, deps.Activities, deps.ping
+    if ping and ping > Lessons.BALANCE_MAX_PING then return false, "ping" end
+    local grounds = workspace:FindFirstChild("HamonTrainingGrounds")
+    local post = grounds and grounds:FindFirstChild("BalancePost")
+    local prompt = post and post:FindFirstChild("BalanceStart", true)
+    if not (prompt and prompt:IsA("ProximityPrompt")) then return false, "no post" end
+    local at = prompt.Parent:IsA("Attachment") and prompt.Parent.WorldPosition or post:GetPivot().Position
+    World.travelTo(at + Vector3.new(BALANCE_SIDE, 0, 0), { ground = true, offset = 0 })
+    local _, before = Activities.armWrestle()
+    local beforeId = type(before) == "table" and before.id or nil
+    local session = nil
+    for _ = 1, BALANCE_TRIES do
+        World.firePrompt(prompt)
+        local waitUntil = os.clock() + BALANCE_START_WAIT
+        while os.clock() < waitUntil do
+            local _, s = Activities.armWrestle()
+            if type(s) == "table" and s.id and s.id ~= beforeId then session = s break end
+            if not j:sleep(0.1) then return false, "stopped" end
+        end
+        if session then break end
+    end
+    if not session then return false, "not started" end
+    local deadline = os.clock() + BALANCE_LIMIT
+    while os.clock() < deadline do
+        local _, s = Activities.armWrestle()
+        if type(s) ~= "table" or s.id ~= session.id then return false, "lost" end
+        if s.ended then
+            local ok = type(s.result) == "table" and s.result.Success == true
+            return ok, not ok and "fell" or nil
+        end
+        if s.round and not s.pressed then
+            local okT, perfect = Activities.armWrestlePerfectTime(s)
+            if okT and workspace:GetServerTimeNow() >= perfect then
+                Activities.armWrestleInput(s.id, s.round, perfect)
+            end
+        end
+        if not j:sleep(1 / 90) then return false, "stopped" end
+    end
+    return false, "timed out"
+end
+
+return Lessons
+
+end)
+__bundle_register("Features/Auto/Hamon/Climb", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- hamon climb: drives Lisa Lisa's pillar climb through the game's own climbing (the character's Core.Climbing module: RequestJump grabs, its controls' move vector steers) along Pillar's cost-to-top grid, sidestepping the oil pours the pillar aims at you (HamonLesson "Fx" OilWarn); a stepper the feature starts and destroys
+local Executor  = require("Utility/Executor")
+local Log       = require("Utility/Log")
+local Scheduler = require("Utility/Scheduler")
+local Pillar    = require("Features/Auto/Hamon/Pillar")
+
+local Climb = {}
+
+-- the pillar's bottom sits this far under the ground around it, and the grid stops this far under its top
+local GROUND_ABOVE_BOTTOM = 9.4
+local TOP_MARGIN = 3
+-- re-plan at this rate, and re-read the slicks for changes this often
+local PLAN_GAP = 0.05
+local PATCH_GAP = 1
+-- back on the ground: settle this long before grabbing (live 2026-11-22: a grab while still falling from a teleport got a server "Fall" release)
+local SETTLE = 0.8
+local GRAB_GAP = 1
+-- a fall beside the wall is caught again above this height
+local CATCH_ABOVE = -150
+local CATCH_RANGE = 3.2
+-- the root sits this far off the wall when it grabs
+local WALL_OFF = 1.6
+local CORNER_HOLD = 0.6
+-- the start column keeps this many cells from each edge
+local START_INSET = 6
+
+-- the character's climbing module (RequestJump, IsClimbing, its humanoid as RequestJump's first upvalue) and the player's control module
+local function findGameParts(hum)
+    local getgc = Executor.get("getgc")
+    if not (getgc and debug.getupvalue) then return nil, nil end
+    local climb, controls
+    for _, t in ipairs(getgc(true)) do
+        if type(t) == "table" then
+            if type(rawget(t, "RequestJump")) == "function" and type(rawget(t, "IsClimbing")) == "function" then
+                local ok, h = pcall(debug.getupvalue, t.RequestJump, 1)
+                if ok and h == hum then climb = t end
+            elseif rawget(t, "controllers") ~= nil and rawget(t, "moveFunction") ~= nil then
+                controls = t
+            end
+        end
+    end
+    return climb, controls
+end
+
+-- the player's control module alone (the swim reads its GetMoveVector too)
+function Climb.controls()
+    local getgc = Executor.get("getgc")
+    if not getgc then return nil end
+    local found
+    for _, t in ipairs(getgc(true)) do
+        if type(t) == "table" and rawget(t, "controllers") ~= nil and rawget(t, "moveFunction") ~= nil then found = t end
+    end
+    return found
+end
+
+-- the slicks on the pillar as Pillar rectangles, and a signature that changes when any of them does
+local function readSlicks(pillar)
+    local list, sig = {}, {}
+    for _, p in ipairs(pillar:GetChildren()) do
+        if p:IsA("BasePart") and p.Name == "Oil" then
+            local cf = pillar.CFrame:ToObjectSpace(p.CFrame)
+            list[#list + 1] = Pillar.patch(cf.Position, p.Size, cf.YVector, cf.ZVector)
+            sig[#sig + 1] = string.format("%.1f%.1f%.1f%.1f%.1f", cf.Position.X, cf.Position.Y, cf.Position.Z, p.Size.Y, p.Size.Z)
+        end
+    end
+    table.sort(sig)
+    return list, table.concat(sig)
+end
+
+-- the point WALL_OFF off `face` at lateral `lat`, height `y`, all pillar-local
+local function offWall(pillar, face, lat, y)
+    local off = pillar.Size.X / 2 + WALL_OFF
+    if face == "+X" then return Vector3.new(off, y, lat) end
+    if face == "-X" then return Vector3.new(-off, y, lat) end
+    if face == "+Z" then return Vector3.new(lat, y, off) end
+    return Vector3.new(lat, y, -off)
+end
+
+local function inwardOf(pillar, face)
+    local v = face == "+X" and Vector3.new(-1, 0, 0) or face == "-X" and Vector3.new(1, 0, 0) or face == "+Z" and Vector3.new(0, 0, -1) or Vector3.new(0, 0, 1)
+    return pillar.CFrame:VectorToWorldSpace(v)
+end
+
+-- a climb run for `character` up `pillar`; Net listens for the pours; `say(text)` reports progress
+function Climb.new(character, pillar, Net, say)
+    local hum = character:FindFirstChildOfClass("Humanoid")
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not (hum and hrp) then return nil, "no character" end
+    local climb, controls = findGameParts(hum)
+    if not (climb and controls) then return nil, "climbing not found" end
+
+    local self = { finished = false }
+    local slicks, slickSig = readSlicks(pillar)
+    local groundY = -pillar.Size.Y / 2 + GROUND_ABOVE_BOTTOM
+    local grid = Pillar.grid(slicks, pillar.Size.X / 2, groundY, pillar.Size.Y / 2 - TOP_MARGIN)
+    local warnings, want = {}, Vector3.zero
+    local lastGrab, lastPlan, settledAt, cornerUntil = 0, 0, nil, 0
+    local handles = {}
+
+    -- the pillar aims a pour at your lane (HamonLessons.lua OilWarn: face, lateral, warn seconds)
+    handles[#handles + 1] = Net.onVerb("HamonLesson", "Fx", function(kind, face, lat, warnSeconds)
+        if kind ~= "OilWarn" then return end
+        warnings[#warnings + 1] = Pillar.warning(tostring(face), lat, warnSeconds, nil, os.clock())
+    end)
+    rawset(controls, "GetMoveVector", function() return want end)
+
+    local function onGround(now)
+        local p = pillar.CFrame:PointToObjectSpace(hrp.Position)
+        local face, lat = Pillar.faceOf(p)
+        local dist = math.max(math.abs(p.X), math.abs(p.Z)) - pillar.Size.X / 2
+        local inward = inwardOf(pillar, face)
+        -- back against the wall, facing it, before a grab
+        if dist > WALL_OFF + 0.8 or dist < WALL_OFF - 0.8 then
+            local spot = pillar.CFrame:PointToWorldSpace(offWall(pillar, face, math.clamp(lat, -grid.limit, grid.limit), p.Y))
+            hrp.CFrame = CFrame.lookAt(spot, spot + inward)
+            settledAt = now
+            return
+        end
+        if hrp.CFrame.LookVector:Dot(inward) < 0.9 then
+            hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + inward)
+            settledAt = now
+            return
+        end
+        if now - settledAt > SETTLE and now - lastGrab > GRAB_GAP then
+            lastGrab = now
+            climb:RequestJump()
+        end
+    end
+
+    local function notClimbing(now)
+        -- the mantle onto the top runs in the physics state; leave it be
+        if character:GetAttribute("Vaulting") then
+            want = Vector3.new(0, 0, -1)
+            return
+        end
+        want = Vector3.zero
+        -- a dropped climb can leave the physics state behind (Climbing.lua stop only restores it when not stunned)
+        if hum:GetState() == Enum.HumanoidStateType.Physics and now - lastGrab > 0.6 then
+            hum:ChangeState(Enum.HumanoidStateType.Running)
+            return
+        end
+        if hum.FloorMaterial == Enum.Material.Air then
+            settledAt = nil
+            -- falling beside the wall: catch it again before the drop
+            local p = pillar.CFrame:PointToObjectSpace(hrp.Position)
+            local dist = math.max(math.abs(p.X), math.abs(p.Z)) - pillar.Size.X / 2
+            if dist < CATCH_RANGE and p.Y > CATCH_ABOVE and now - lastGrab > 0.25 then
+                lastGrab = now
+                want = Vector3.new(0, 0, -1)
+                climb:RequestJump()
+            end
+            return
+        end
+        settledAt = settledAt or now
+        onGround(now)
+    end
+
+    local function steer(now)
+        if now - lastPlan < PLAN_GAP then return end
+        lastPlan = now
+        -- mid-corner the face reads ambiguously; keep the turn going until the game's corner step ends
+        local state = debug.getupvalue(climb.IsClimbing, 1)
+        if (type(state) == "table" and state.Corner) or now < cornerUntil then return end
+        local p = pillar.CFrame:PointToObjectSpace(hrp.Position)
+        local move, arg, face = Pillar.step(grid, Pillar.livePours(warnings, now), p)
+        local _, lat = Pillar.faceOf(p)
+        -- the move vector's X is "right" along the wall the character faces
+        local right = hrp.CFrame.LookVector:Cross(Vector3.new(0, 1, 0))
+        local side = (face == "+X" or face == "-X") and pillar.CFrame.ZVector or pillar.CFrame.XVector
+        local sign = right:Dot(side) >= 0 and 1 or -1
+        if move == "up" or move == "top" then
+            want = Vector3.new(0, 0, -1)
+        elseif move == "down" then
+            want = Vector3.new(0, 0, 1)
+        elseif move == "side" then
+            local d = arg - lat
+            want = math.abs(d) < 0.15 and Vector3.zero or Vector3.new(sign * (d > 0 and 1 or -1), 0, 0)
+        elseif move == "corner" then
+            want = Vector3.new(sign * arg, 0, 0)
+            cornerUntil = now + CORNER_HOLD
+        else
+            want = Vector3.zero
+        end
+        if say then
+            local left = Pillar.secondsLeft(grid, p)
+            say(left and ("Climbing, %ds left"):format(math.ceil(left)) or "Climbing the pillar")
+        end
+    end
+
+    -- grabs and state changes land on the next physics step only from the frame's start (PreRender); from a resumed thread they lost to the climb's own heartbeat check
+    handles[#handles + 1] = Scheduler.render(function()
+        if self.finished then return end
+        local now = os.clock()
+        if not hum.Parent or hum.Health <= 0 then return end
+        if climb:IsClimbing() then steer(now) else notClimbing(now) end
+    end, { name = "AutoHamon.climb" })
+
+    -- the slicks get rerolled now and then; a changed set rebuilds the grid
+    handles[#handles + 1] = Scheduler.heartbeat(function()
+        if self.finished then return end
+        local list, sig = readSlicks(pillar)
+        if sig ~= slickSig then
+            slickSig = sig
+            grid = Pillar.grid(list, pillar.Size.X / 2, groundY, pillar.Size.Y / 2 - TOP_MARGIN)
+            Log.dev("AutoHamon", "slicks changed: grid rebuilt (%d)", #list)
+        end
+    end, { name = "AutoHamon.slicks", interval = PATCH_GAP })
+
+    -- the start: the cheapest bottom cell away from the edges, on the ground facing the wall
+    function self.place()
+        local faces = { "+X", "-X", "+Z", "-Z" }
+        local best, bf, bc = math.huge, nil, nil
+        for f = 1, 4 do
+            for c = START_INSET, grid.cols - START_INSET do
+                local cost = grid.cost[grid.key(f, c, 0)]
+                if cost and cost < best then best, bf, bc = cost, f, c end
+            end
+        end
+        if not bf then return false end
+        local face = faces[bf]
+        local spot = pillar.CFrame:PointToWorldSpace(offWall(pillar, face, -grid.limit + bc * Pillar.COL, 0))
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { character, pillar }
+        local floorY = pillar.Position.Y - pillar.Size.Y / 2 + GROUND_ABOVE_BOTTOM
+        local hit = workspace:Raycast(Vector3.new(spot.X, floorY + 30, spot.Z), Vector3.new(0, -60, 0), params)
+        spot = Vector3.new(spot.X, (hit and hit.Position.Y or floorY - 3.5) + 3.1, spot.Z)
+        hum:ChangeState(Enum.HumanoidStateType.Running)
+        hrp.CFrame = CFrame.lookAt(spot, spot + inwardOf(pillar, face))
+        settledAt = os.clock()
+        return true
+    end
+
+    function self.Destroy()
+        if self.finished then return end
+        self.finished = true
+        for _, h in ipairs(handles) do pcall(function() h:Disconnect() end) end
+        table.clear(handles)
+        rawset(controls, "GetMoveVector", nil)
+    end
+    self.Disconnect = self.Destroy
+
+    return self
+end
+
+return Climb
+
+end)
+__bundle_register("Features/Auto/Hamon/Pillar", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- hamon pillar: plans Lisa Lisa's pillar climb (HamonLessons.lua, Climbing.lua) around the pillar's oil patches and live oil pours; pure, in the pillar's local frame where a face's lateral axis is Z on the X faces and X on the Z faces (HamonLessons.lua:1429-1455 faceFrame); a cost-to-top grid over every face is built once per climb and followed a cell at a time
+local Pillar = {}
+
+-- the climbing body (Climbing.lua:13 parts, arms raised in the climb pose) around the root plus a little slack: half its width, how far legs hang below and
+-- hands reach above (live 2026-11-22: slicks are slanted up to 6 degrees, so an upright box both over-padded their sides and missed their raised corners)
+Pillar.BODY_HALF = 2.4
+Pillar.BODY_DOWN = 3.4
+Pillar.BODY_UP = 3.4
+-- a cell within this much more of a slick costs NEAR_COST times as much, so the route takes the widest gaps it can
+Pillar.NEAR = 1.4
+Pillar.NEAR_COST = 6
+-- the face edge kept clear of, and a pour's sheet half-width (HamonLessons.lua:1636 width 4.8 ± 0.25) plus slack
+Pillar.EDGE = 1.6
+Pillar.POUR_HALF = 3
+-- a warned pour runs warn + its fall down the whole pillar (HamonLessons.lua:1635 grows the sheet at 95 studs/s from the top, 362 tall) + pour seconds (OilWarn 1.25, OilPour 2.2) with slack
+-- (live 2026-11-22: a window without the fall expired before the sheet reached us low on the pillar and walked us into it)
+Pillar.POUR_FALL = 4
+Pillar.POUR_SLACK = 0.6
+-- grid steps and climb speeds (Climbing.lua: 8.4 up, 9.8 down, 5.6 to the side); a corner is priced well over its time so it is only taken when a face has no way up (live 2026-11-22: a turn mid-pour dropped us)
+Pillar.ROW = 1
+Pillar.COL = 0.5
+Pillar.UP_SPEED, Pillar.DOWN_SPEED, Pillar.SIDE_SPEED = 8.4, 9.8, 5.6
+Pillar.CORNER_COST = 6
+-- how close to the edge the turn carries the body on each face
+Pillar.CORNER_REACH = 0.6
+
+local FACES = { "+X", "-X", "+Z", "-Z" }
+
+-- plain: the face a local point is on and its lateral coordinate
+function Pillar.faceOf(p)
+    if math.abs(p.X) > math.abs(p.Z) then
+        return p.X > 0 and "+X" or "-X", p.Z
+    end
+    return p.Z > 0 and "+Z" or "-Z", p.X
+end
+
+-- plain: a slick (its local centre, size, and its local Y and Z axes) as a rectangle on its face: centre (lat, y), the height axis (ux, uy) and
+-- width axis (vx, vy) in the face's (lateral, up) plane with their half-lengths, and its vertical extent for a quick reject
+function Pillar.patch(center, size, yAxis, zAxis)
+    local face, lat = Pillar.faceOf(center)
+    local onX = face == "+X" or face == "-X"
+    yAxis = yAxis or Vector3.new(0, 1, 0)
+    zAxis = zAxis or (onX and Vector3.new(0, 0, 1) or Vector3.new(1, 0, 0))
+    local ux, uy = onX and yAxis.Z or yAxis.X, yAxis.Y
+    local vx, vy = onX and zAxis.Z or zAxis.X, zAxis.Y
+    local lu, lv = math.sqrt(ux * ux + uy * uy), math.sqrt(vx * vx + vy * vy)
+    ux, uy, vx, vy = ux / lu, uy / lu, vx / lv, vy / lv
+    local hu, hv = size.Y / 2, size.Z / 2
+    local ext = math.abs(uy) * hu + math.abs(vy) * hv
+    local wide = math.abs(ux) * hu + math.abs(vx) * hv
+    return { face = face, lat = lat, y = center.Y, ux = ux, uy = uy, vx = vx, vy = vy, hu = hu, hv = hv,
+        y0 = center.Y - ext, y1 = center.Y + ext, half = wide }
+end
+
+-- plain: true when the upright box (centre cx, cy, half sizes bx, by) overlaps the slanted slick (separating axes: the box's two and the slick's two)
+function Pillar.overlaps(p, cx, cy, bx, by)
+    local dx, dy = p.lat - cx, p.y - cy
+    -- box axes
+    if math.abs(dx) > bx + math.abs(p.ux) * p.hu + math.abs(p.vx) * p.hv then return false end
+    if math.abs(dy) > by + math.abs(p.uy) * p.hu + math.abs(p.vy) * p.hv then return false end
+    -- slick axes
+    if math.abs(dx * p.ux + dy * p.uy) > p.hu + bx * math.abs(p.ux) + by * math.abs(p.uy) then return false end
+    if math.abs(dx * p.vx + dy * p.vy) > p.hv + bx * math.abs(p.vx) + by * math.abs(p.vy) then return false end
+    return true
+end
+
+-- plain: round the outer corner from `face` toward `dir` (+1 = higher lateral): the neighbouring face and the lateral you land on
+function Pillar.neighbor(face, dir, limit)
+    if face == "+X" or face == "-X" then
+        return dir > 0 and "+Z" or "-Z", (face == "+X" and 1 or -1) * limit
+    end
+    return dir > 0 and "+X" or "-X", (face == "+Z" and 1 or -1) * limit
+end
+
+-- plain: true when the body at (face, lat, y), grown by `pad` all round, touches no slick
+local function clear(patches, face, lat, y, pad)
+    pad = pad or 0
+    local bx, by = Pillar.BODY_HALF + pad, (Pillar.BODY_UP + Pillar.BODY_DOWN) / 2 + pad
+    local cy = y + (Pillar.BODY_UP - Pillar.BODY_DOWN) / 2
+    for _, p in ipairs(patches) do
+        if p.face == face and p.y1 > cy - by and p.y0 < cy + by and Pillar.overlaps(p, lat, cy, bx, by) then
+            return false
+        end
+    end
+    return true
+end
+
+-- a small binary heap of { cost, key }
+local function push(heap, item)
+    heap[#heap + 1] = item
+    local i = #heap
+    while i > 1 do
+        local parent = i // 2
+        if heap[parent][1] <= heap[i][1] then break end
+        heap[parent], heap[i] = heap[i], heap[parent]
+        i = parent
+    end
+end
+local function pop(heap)
+    local top = heap[1]
+    local last = table.remove(heap)
+    if #heap > 0 then
+        heap[1] = last
+        local i = 1
+        while true do
+            local l, r, m = i * 2, i * 2 + 1, i
+            if l <= #heap and heap[l][1] < heap[m][1] then m = l end
+            if r <= #heap and heap[r][1] < heap[m][1] then m = r end
+            if m == i then break end
+            heap[m], heap[i] = heap[i], heap[m]
+            i = m
+        end
+    end
+    return top
+end
+
+-- plain: the climb grid for a pillar `halfWidth` wide spanning local y [bottom, top]: per cell whether the body fits and its seconds to the top
+function Pillar.grid(patches, halfWidth, bottom, top)
+    local limit = halfWidth - Pillar.EDGE
+    local cols = math.floor(limit * 2 / Pillar.COL + 0.5)
+    local rows = math.floor((top - bottom) / Pillar.ROW)
+    local g = { limit = limit, cols = cols, rows = rows, bottom = bottom, top = top, free = {}, cost = {}, near = {} }
+    local function key(f, c, r) return (f * (cols + 1) + c) * (rows + 1) + r end
+    g.key = key
+    -- a corner turn sweeps the body round the edge (Climbing.lua stepCorner), so both faces must be clear right up to it at that height
+    -- (live 2026-11-22: turns landed us in slicks beside the edge)
+    local turnOk = {}
+    -- `loose` drops the extra padding, for a turn that escapes a pour
+    function g.cornerOk(face, dir, r, loose)
+        local tk = face .. dir .. ":" .. r .. (loose and "L" or "")
+        if turnOk[tk] == nil then
+            local y = bottom + r * Pillar.ROW
+            local nextFace, land = Pillar.neighbor(face, dir, limit)
+            local edge = halfWidth - Pillar.CORNER_REACH
+            local pad = not loose and Pillar.NEAR or nil
+            turnOk[tk] = clear(patches, face, dir * edge, y, pad) and clear(patches, nextFace, (land > 0 and 1 or -1) * edge, y, pad)
+                and clear(patches, nextFace, land, y)
+        end
+        return turnOk[tk]
+    end
+    for f, face in ipairs(FACES) do
+        for c = 0, cols do
+            local lat = -limit + c * Pillar.COL
+            for r = 0, rows do
+                local k = key(f, c, r)
+                g.free[k] = clear(patches, face, lat, bottom + r * Pillar.ROW)
+                g.near[k] = g.free[k] and not clear(patches, face, lat, bottom + r * Pillar.ROW, Pillar.NEAR)
+            end
+        end
+    end
+    -- seconds to the top, spreading back from the top row along the moves that lead to it
+    local heap = {}
+    for f = 1, 4 do
+        for c = 0, cols do
+            local k = key(f, c, rows)
+            if g.free[k] then
+                g.cost[k] = 0
+                push(heap, { 0, f, c, rows })
+            end
+        end
+    end
+    local faceIndex = {}
+    for i, face in ipairs(FACES) do faceIndex[face] = i end
+    while #heap > 0 do
+        local item = pop(heap)
+        local d, f, c, r = item[1], item[2], item[3], item[4]
+        if d <= (g.cost[key(f, c, r)] or math.huge) then
+            -- the cells that reach this one in one move, with what that move costs
+            local from = {
+                { f, c, r - 1, Pillar.ROW / Pillar.UP_SPEED },
+                { f, c, r + 1, Pillar.ROW / Pillar.DOWN_SPEED },
+                { f, c - 1, r, Pillar.COL / Pillar.SIDE_SPEED },
+                { f, c + 1, r, Pillar.COL / Pillar.SIDE_SPEED },
+            }
+            if c == 0 or c == cols then
+                local dir = c == cols and 1 or -1
+                local nextFace, land = Pillar.neighbor(FACES[f], dir, limit)
+                if g.cornerOk(FACES[f], dir, r) then
+                    from[#from + 1] = { faceIndex[nextFace], land > 0 and cols or 0, r, Pillar.CORNER_COST }
+                end
+            end
+            for _, m in ipairs(from) do
+                local mf, mc, mr, step = m[1], m[2], m[3], m[4]
+                if mc >= 0 and mc <= cols and mr >= 0 and mr <= rows then
+                    local mk = key(mf, mc, mr)
+                    local nd = d + step * (g.near[mk] and Pillar.NEAR_COST or 1)
+                    if g.free[mk] and nd < (g.cost[mk] or math.huge) then
+                        g.cost[mk] = nd
+                        push(heap, { nd, mf, mc, mr })
+                    end
+                end
+            end
+        end
+    end
+    g.faceIndex = faceIndex
+    return g
+end
+
+-- the grid cell nearest a local point
+local function cellOf(g, p)
+    local face, lat = Pillar.faceOf(p)
+    local c = math.clamp(math.floor((lat + g.limit) / Pillar.COL + 0.5), 0, g.cols)
+    local r = math.clamp(math.floor((p.Y - g.bottom) / Pillar.ROW + 0.5), 0, g.rows)
+    return g.faceIndex[face], c, r, face, lat
+end
+
+local function inPour(pours, face, lat)
+    for _, w in ipairs(pours or {}) do
+        if w.face == face and math.abs(w.lat - lat) < Pillar.POUR_HALF + Pillar.BODY_HALF then return true end
+    end
+    return false
+end
+
+-- plain: the move this tick at local root `p`: "up", "down", "side" with the lateral to reach, "corner" with the direction (+1 toward
+-- higher lateral), "hold" when nothing reachable is clear, or "top" at the last row; a cell inside a live pour's sheet is skipped unless we're already in it
+function Pillar.step(g, pours, p)
+    local f, c, r, face, lat = cellOf(g, p)
+    if r >= g.rows then return "top", lat, face end
+    local here = g.cost[g.key(f, c, r)]
+    local inSheet = inPour(pours, face, lat)
+    -- under a coming sheet: sideways to the nearest dry column with a way up, never across a slick on the way (live 2026-11-22: a dodge
+    -- cut through one 85% of the way up), or round the nearer corner
+    if inSheet then
+        local best, bestDist = nil, math.huge
+        for _, s in ipairs({ 1, -1 }) do
+            for d = 1, g.cols do
+                local mc = c + s * d
+                if mc < 0 or mc > g.cols or not g.free[g.key(f, mc, r)] then break end
+                local mlat = -g.limit + mc * Pillar.COL
+                if g.cost[g.key(f, mc, r)] and not inPour(pours, face, mlat) then
+                    if d < bestDist then best, bestDist = mlat, d end
+                    break
+                end
+            end
+        end
+        if best then return "side", best, face end
+        -- no dry column: round a corner only where the turn is clear, else hold (the sheet may still miss)
+        local first = lat >= 0 and 1 or -1
+        -- at (or a free run from) an edge: turn the corner there, padded if we can, bare if we must (live 2026-11-22: pours aim at our lane, and one
+        -- pinned us at an edge whose padded turn was refused)
+        for _, dir in ipairs({ first, -first }) do
+            local edgeCol = dir > 0 and g.cols or 0
+            local reachable, mc = true, c
+            while mc ~= edgeCol do
+                mc = mc + dir
+                if not g.free[g.key(f, mc, r)] then reachable = false break end
+            end
+            if reachable and (g.cornerOk(face, dir, r) or g.cornerOk(face, dir, r, true)) then
+                if c == edgeCol then return "corner", dir, face end
+                return "side", dir * g.limit, face
+            end
+        end
+        -- else as far from the sheet as free cells run, the edge of it may still miss us
+        local away = first
+        for _, w in ipairs(pours) do
+            if w.face == face then away = lat >= w.lat and 1 or -1 end
+        end
+        local far = c
+        while far + away >= 0 and far + away <= g.cols and g.free[g.key(f, far + away, r)] do far = far + away end
+        return "side", -g.limit + far * Pillar.COL, face
+    end
+    local best, bestMove, bestArg = math.huge, "hold", lat
+    local function consider(mf, mc, mr, step, move, arg)
+        if mc < 0 or mc > g.cols or mr < 0 or mr > g.rows then return end
+        local cost = g.cost[g.key(mf, mc, mr)]
+        if not cost then return end
+        local mlat = -g.limit + mc * Pillar.COL
+        local wet = inPour(pours, FACES[mf], mlat)
+        -- out of a sheet first: any dry cell beats a wet one
+        -- the grid charges a move to the cell it leaves, so the same here
+        local score = cost + step * (g.near[g.key(f, c, r)] and Pillar.NEAR_COST or 1) + (wet and 100 or 0)
+        if wet and not inSheet then return end
+        if score < best then best, bestMove, bestArg = score, move, arg end
+    end
+    consider(f, c, r + 1, Pillar.ROW / Pillar.UP_SPEED, "up", lat)
+    consider(f, c, r - 1, Pillar.ROW / Pillar.DOWN_SPEED, "down", lat)
+    consider(f, c - 1, r, Pillar.COL / Pillar.SIDE_SPEED, "side", -g.limit + (c - 1) * Pillar.COL)
+    consider(f, c + 1, r, Pillar.COL / Pillar.SIDE_SPEED, "side", -g.limit + (c + 1) * Pillar.COL)
+    if c == 0 or c == g.cols then
+        local dir = c == g.cols and 1 or -1
+        local nextFace, land = Pillar.neighbor(face, dir, g.limit)
+        if g.cornerOk(face, dir, r) then
+            consider(g.faceIndex[nextFace], land > 0 and g.cols or 0, r, Pillar.CORNER_COST, "corner", dir)
+        end
+    end
+    -- off the grid's free cells (the cell rounded into a patch's margin): nudge toward the nearest free column on this row
+    if not here and bestMove == "hold" then
+        for d = 1, g.cols do
+            for _, s in ipairs({ -1, 1 }) do
+                local mc = c + s * d
+                if mc >= 0 and mc <= g.cols and g.cost[g.key(f, mc, r)] then
+                    return "side", -g.limit + mc * Pillar.COL, face
+                end
+            end
+        end
+    end
+    return bestMove, bestArg, face
+end
+
+-- plain: seconds to the top from a local point, nil when there's no way up from it
+function Pillar.secondsLeft(g, p)
+    local f, c, r = cellOf(g, p)
+    return g.cost[g.key(f, c, r)]
+end
+
+-- plain: pours still live at `now`
+function Pillar.livePours(warnings, now)
+    local out = {}
+    for _, w in ipairs(warnings) do
+        if now <= w.untilAt then out[#out + 1] = w end
+    end
+    return out
+end
+
+-- plain: a warning's pour window from an OilWarn push (face, lateral, warn seconds) and the pour's own seconds
+function Pillar.warning(face, lat, warnSeconds, pourSeconds, now)
+    return { face = face, lat = tonumber(lat) or 0, untilAt = now + (tonumber(warnSeconds) or 1.25) + Pillar.POUR_FALL + (pourSeconds or 2.2) + Pillar.POUR_SLACK }
+end
+
+return Pillar
+
+end)
 __bundle_register("Features/Auto/Garden", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- auto garden: keeps your pots growing on their own; buys a pot, dirt and seeds at big chop when you run out, places, fills, plants and harvests through the shared garden flow, and can sell the harvest; it never touches a crop a story step still needs
 local Jobs      = require("Utility/Jobs")
@@ -40340,7 +42803,7 @@ local RETRY_AFTER = 20
 local SELL_PER_POT = 4
 -- gardening.md: the seed offers rotate every 30 minutes
 local SHOP_ROTATION = 1800
-local SEEDS = { "Any seed I own", "Apple", "Lemon", "Cherry", "Carrot", "Tomato", "Pineapple" }
+local SEEDS = { "Any seed I own", "Apple", "Lemon", "Cherry", "Carrot", "Tomato", "Pineapple", "Rokaka" }
 -- the delivery step needs the plain crop in your bag (recon/gardening.md)
 local KEEP_FOR = "P9_22C_DELIVER_JODIO_CROP"
 
@@ -40369,6 +42832,26 @@ return function(ctx)
         local element = Toggles[id]
         if element == nil then return default end
         return element.Value == true
+    end
+
+    -- user 2026-11-19: the seed list shows the seeds you own (plus any seed and whatever is picked now), refreshed as the bag changes
+    local seedListKey = nil
+    local function refreshSeedList()
+        local element = Options.AutoGarden_Seed
+        if not element then return end
+        local names, seen = {}, {}
+        for _, entry in ipairs(flow.seeds()) do
+            local crop = string.gsub(entry.name, " Seed$", "")
+            if not seen[crop] then seen[crop] = true names[#names + 1] = crop end
+        end
+        table.sort(names)
+        local current = element.Value
+        if type(current) == "string" and current ~= SEEDS[1] and not seen[current] then names[#names + 1] = current end
+        table.insert(names, 1, SEEDS[1])
+        local key = table.concat(names, "|")
+        if key == seedListKey then return end
+        seedListKey = key
+        UiWrite.values(element, names)
     end
 
     local function wantedSeed()
@@ -40426,6 +42909,7 @@ return function(ctx)
 
     local function pass()
         gated = false
+        pcall(refreshSeedList)
         if not Player.ready() then return "Waiting for your save" end
         -- events first: a live world event the user put ahead of everything gets movement; the idle return releases the claim
         if WorldEvents.wants() then return "Paused for an event" end
@@ -40452,22 +42936,29 @@ return function(ctx)
             return nil
         end
 
+        -- user 2026-11-19: with Grow Roka on, the first pot grows rokaka whenever you have its seed; the rest keep the picked crop
+        local function seedFor(index)
+            if index == 1 and toggleOn("AutoGarden_Roka", false) and flow.bestSeed(flow.ROKA_SEED) then return flow.ROKA_SEED end
+            return seed
+        end
         local soonest = nil
-        for _, pot in ipairs(pots) do
+        for index, pot in ipairs(pots) do
             local stage = flow.stage(pot)
+            local potSeed = seedFor(index)
             if stage == "Empty" and flow.count("Dirt Bag") < 1 then
                 if not buy then return "Out of dirt" end
                 flow.buySupplies(false, true, false)
                 return nil
             end
-            if stage == "DirtReady" and #flow.seeds() == 0 then
+            -- out of normal seeds (rokaka seeds don't count, since they're only planted on purpose); a picked seed you lack is left to plant's own retry as before
+            if stage == "DirtReady" and potSeed ~= flow.ROKA_SEED and not flow.bestSeed(nil) then
                 if not buy then return "Out of seeds" end
                 flow.buySupplies(false, false, true)
                 return nil
             end
             if stage == "Empty" or stage == "DirtReady" or stage == "Ready" then
                 if not cooling(pot) then
-                    local ok = flow.tend(pot, seed)
+                    local ok = flow.tend(pot, potSeed)
                     if not ok then failedAt[pot] = os.clock() end
                 end
                 return nil
@@ -40546,10 +43037,12 @@ return function(ctx)
         wants   = function() return enabled and work end,
     })
     box:AddDropdown("AutoGarden_Seed", { Text = "Seed", Values = SEEDS, Default = SEEDS[1] })
+    pcall(refreshSeedList)
     box:AddSlider("AutoGarden_Pots", { Text = "Pots", Default = 2, Min = 1, Max = 2, Rounding = 0 })
     box:AddToggle("AutoGarden_Buy", { Text = "Buy Supplies", Default = true })
     box:AddToggle("AutoGarden_Sell", { Text = "Sell Harvest", Default = false })
     box:AddToggle("AutoGarden_Upgrade", { Text = "Upgrade Seeds", Default = true, Tooltip = "Buys a better grade each shop rotation" })
+    box:AddToggle("AutoGarden_Roka", { Text = "Grow Roka", Default = false, Tooltip = "Your first pot grows Rokaka when you have the seed" })
 
     O.onUnload(stop)
     O.onUnload(function() Farms.unregister(FARM) end)
@@ -48497,6 +50990,7 @@ return {
     AutoQuests  = true,
     AutoGarden  = true,
     AutoStats   = true,
+    AutoHamon   = true,
     AutoWorldEvents = true,
     MobFarm = true,
     AutoRaid = true,
