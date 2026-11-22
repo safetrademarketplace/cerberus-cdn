@@ -632,7 +632,7 @@ function Panel:pitch(o)
         Text = "", FontFace = MONO, TextSize = 12, TextColor3 = T.faint, TextXAlignment = Enum.TextXAlignment.Right,
         AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -22, 0, WIN_H - 88), Size = UDim2.fromOffset(44, 16), Parent = self.win,
     })
-    local card = self:_pitchCard(o)
+    local card = (not o.noCard) and self:_pitchCard(o) or nil
     self:slides(o.slides, o.seconds / #o.slides)
 
     self.sweep.Visible = false
@@ -648,7 +648,7 @@ function Panel:pitch(o)
     self:stopSlides()
     if not self.gui then return false end
     timer:Destroy()
-    card:Destroy()
+    if card then card:Destroy() end
     self.progWrap.Size = UDim2.new(1, -44, 0, 5)
     self.statusRow.Visible = true
     self:dress(C)
@@ -777,9 +777,8 @@ end
 local closeBtn = { text = "Close", kind = "ghost", cb = function() panel:destroy() end }
 local getKeyBtn = { text = "Get a key", kind = "ghost", flash = "Discord copied!", cb = function() return copyTo(DISCORD_URL) end }
 local chimeraBtn = { text = "Copy Chimera Discord", kind = "primary", flash = "Link copied!", cb = function() return copyTo(CHIMERA_DISCORD) end }
--- the pitch card's one action, one per brand
+-- the pitch card's one action, chimera only (the cerberus discord pitch shows no card)
 local ctaBtn = { text = "Get Chimera", kind = "primary", flash = "Discord copied!", cb = function() return copyTo(CHIMERA_DISCORD) end }
-local joinDiscordBtn = { text = "Join Discord", kind = "primary", flash = "Invite copied!", cb = function() return copyTo(CERBERUS_DISCORD) end }
 
 -- chimera pitch slides, in chimera's own look (serif headlines with the key word in gold italics, mono
 -- eyebrows, quiet bordered panels); each fills a blank SLIDE_W x SLIDE_H page and returns what to play on screen.
@@ -937,7 +936,7 @@ local CERBERUS_BENEFITS = {
     { "Free keys", "Giveaways and daily drops." },
     { "Direct support", "The devs are in there every day." },
     { "Script updates", "New games and fixes land here first." },
-    { "Skip this wait", "Set inDiscord = true to skip it." },
+    { "Skip this wait", "Members skip it from here on." },
 }
 
 local function cerberusBenefitsSlide(page)
@@ -973,28 +972,21 @@ local function cerberusBenefitsSlide(page)
     end
 end
 
--- the ask: the invite in full, tappable, and the one line to add to skip from here on
+-- the ask: the invite in full, tappable, so it works even where the clipboard doesn't
 local function cerberusInviteSlide(page, owner)
-    local breathe = glow(page, SLIDE_W / 2, 92, 148, C.accent)
+    local breathe = glow(page, SLIDE_W / 2, 106, 168, C.accent)
     local function centered(props)
         props.TextXAlignment = Enum.TextXAlignment.Center
         props.ZIndex = 2
         return stxt(props)
     end
-    centered({ Text = "SKIP THE WAIT", FontFace = FONT.semi, TextSize = 11, TextColor3 = C.accent, Position = UDim2.fromOffset(0, 4), Size = UDim2.new(1, 0, 0, 14), Parent = page })
-    centered({ Text = "Join " .. green("discord.gg/cerberus"), FontFace = FONT.bold, TextSize = 28, TextColor3 = C.text, RichText = true, Position = UDim2.fromOffset(0, 22), Size = UDim2.new(1, 0, 0, 34), Parent = page })
-    centered({ Text = "Then add this one line above your loadstring:", TextSize = 13, TextColor3 = C.subtext, Position = UDim2.fromOffset(0, 60), Size = UDim2.new(1, 0, 0, 16), Parent = page })
-    local code = make("Frame", {
-        BackgroundColor3 = C.bg, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 82),
-        Size = UDim2.fromOffset(300, 30), ZIndex = 2, Parent = page,
-    })
-    corner(code, 6)
-    stroke(code, C.faint, 0.6)
-    txt({ Text = "inDiscord = true", FontFace = MONO, TextSize = 14, TextColor3 = C.accentHi, TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.fromScale(1, 1), Parent = code })
+    centered({ Text = "JOIN THE DISCORD", FontFace = FONT.semi, TextSize = 11, TextColor3 = C.accent, Position = UDim2.fromOffset(0, 12), Size = UDim2.new(1, 0, 0, 14), Parent = page })
+    centered({ Text = "Join " .. green("discord.gg/cerberus"), FontFace = FONT.bold, TextSize = 30, TextColor3 = C.text, RichText = true, Position = UDim2.fromOffset(0, 30), Size = UDim2.new(1, 0, 0, 40), Parent = page })
+    centered({ Text = "Members skip this wait from here on.", TextSize = 14, TextColor3 = C.subtext, Position = UDim2.fromOffset(0, 76), Size = UDim2.new(1, 0, 0, 18), Parent = page })
     local invite = make("TextButton", {
         Text = "Tap to copy the invite", FontFace = MONO, TextSize = 13, TextColor3 = C.accentDk, AutoButtonColor = false,
-        BackgroundColor3 = C.accent, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 122),
-        Size = UDim2.fromOffset(240, 36), ZIndex = 2, Parent = page,
+        BackgroundColor3 = C.accent, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 114),
+        Size = UDim2.fromOffset(260, 40), ZIndex = 2, Parent = page,
     })
     corner(invite, 8)
     owner:track(invite.MouseEnter:Connect(function() tween(invite, TI(0.1), { BackgroundColor3 = C.accentHi }) end))
@@ -1100,9 +1092,7 @@ local function boot()
             else
                 if not panel:pitch({
                     seconds = FREE_WAIT, pill = "DISCORD",
-                    theme = C, logo = LOGO_ASSET, logoColor = C.accent, name = "Cerberus", tag = "COMMUNITY", nameFont = FONT.bold,
-                    slides = CERBERUS_SLIDES, cta = joinDiscordBtn,
-                    sub = "Set inDiscord = true to skip from now on.",
+                    theme = C, slides = CERBERUS_SLIDES, noCard = true,
                 }) then return end
             end
         elseif chimeraAds and Random.new():NextInteger(1, PAID_PITCH_ODDS) == 1 then
