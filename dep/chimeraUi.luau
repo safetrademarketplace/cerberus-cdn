@@ -12,6 +12,7 @@ local TweenService = service("TweenService")
 local UserInputService = service("UserInputService")
 local CoreGui = service("CoreGui")
 local GuiService = service("GuiService")
+local TextService = service("TextService")
 
 local LocalPlayer = Players.LocalPlayer
 local Environment = (getgenv and getgenv()) or _G
@@ -549,6 +550,24 @@ function Window:_header(subtitle)
 		Theme = { TextColor3 = "muted" },
 		Parent = heading,
 	})
+	for _, label in ipairs({ self.TitleLabel, self.SubtitleLabel }) do
+		label.AutomaticSize = Enum.AutomaticSize.None
+		local function fit(width)
+			label.Size = UDim2.fromOffset(math.ceil(math.max(width or 0, label.TextBounds.X)), 18)
+		end
+		fit()
+		self:_connect(label:GetPropertyChangedSignal("TextBounds"), function()
+			fit()
+		end)
+		task.spawn(function()
+			local params = Instance.new("GetTextBoundsParams")
+			params.Text, params.Font, params.Size, params.Width = label.Text, label.FontFace, label.TextSize, 1e5
+			local ok, bounds = pcall(TextService.GetTextBoundsAsync, TextService, params)
+			if ok and label.Parent and label.Text == params.Text then
+				fit(bounds.X)
+			end
+		end)
+	end
 
 	local grab = new("TextButton", { Size = UDim2.new(1, -64, 1, 0), Parent = header })
 	self:_drag(grab, function()
