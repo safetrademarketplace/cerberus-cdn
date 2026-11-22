@@ -9676,6 +9676,7 @@ function M.mount(ctx)
     local box = ctx.Tabs.GameCharacter:AddLeftGroupbox("Stand Roller", "dices")
     box:AddToggle("StandRoller_Enabled", {
         Text     = "Auto Roll Stand",
+        Premium  = true,
         Default  = false,
         Tooltip  = "Uses your arrows until you get a pick",
         Callback = function(on)
@@ -11558,6 +11559,7 @@ function M.mount(ctx)
     local box = ctx.Tabs.Fights:AddLeftGroupbox("World Events", "swords")
     box:AddToggle("AutoWorldEvents_Enabled", {
         Text     = "Auto World Events",
+        Premium  = true,
         Default  = false,
         Callback = function(on)
             if on then
@@ -31141,6 +31143,7 @@ function M.mount(ctx, O)
     local box = ctx.Tabs.Gathering:AddRightGroupbox("Arrow Hunt", "crosshair")
     box:AddToggle("ArrowHunt_Enabled", {
         Text     = "Arrow Hunt",
+        Premium  = true,
         Default  = false,
         Tooltip  = "Visits arrow spawns across the map",
         Callback = function(on)
@@ -31699,6 +31702,7 @@ function M.mount(ctx)
     local box = ctx.Tabs.Fights:AddLeftGroupbox("Auto Raid", "train-front")
     box:AddToggle("AutoRaid_Enabled", {
         Text     = "Auto Raid",
+        Premium  = true,
         Default  = false,
         Callback = function(on)
             if on then
@@ -31725,26 +31729,29 @@ function M.mount(ctx)
         active  = M.active,
         wants   = function() return enabled and (inRaid or work) end,
     })
-    box:AddDropdown("AutoRaid_Raid", { Text = "Raids", Values = Plan.CHOICES, Default = { Plan.CHOICES[1] }, Multi = true, Tooltip = "Picks several and takes turns as each comes off cooldown" })
+    box:AddDropdown("AutoRaid_Raid", { Premium = true, Text = "Raids", Values = Plan.CHOICES, Default = { Plan.CHOICES[1] }, Multi = true, Tooltip = "Picks several and takes turns as each comes off cooldown" })
     box:AddDropdown("AutoRaid_Difficulty", {
         Text    = "Difficulty",
+        Premium = true,
         Values  = Plan.DIFFICULTIES,
         Default = "Regular",
         Tooltip = "Best Ready plays Hard when it's off cooldown",
     })
     box:AddToggle("AutoRaid_Replay", {
         Text    = "Auto Replay",
+        Premium = true,
         Default = true,
         Tooltip = "Starts the next run when one ends",
     })
-    box:AddSlider("AutoRaid_Runs", { Text = "Runs (0 = no limit)", Default = 0, Min = 0, Max = 50, Rounding = 0 })
+    box:AddSlider("AutoRaid_Runs", { Premium = true, Text = "Runs (0 = no limit)", Default = 0, Min = 0, Max = 50, Rounding = 0 })
 
     local settings = ctx.Tabs.Fights:AddLeftGroupbox("Raid Settings", "settings")
-    settings:AddToggle("AutoRaid_Party", { Text = "Join Party Raids", Default = true })
-    settings:AddDropdown("AutoRaid_Position", { Text = "Position", Values = Plan.POSITIONS, Default = "Combat Settings" })
-    settings:AddSlider("AutoRaid_Distance", { Text = "Distance", Default = 3, Min = 1, Max = 10, Rounding = 1 })
+    settings:AddToggle("AutoRaid_Party", { Premium = true, Text = "Join Party Raids", Default = true })
+    settings:AddDropdown("AutoRaid_Position", { Premium = true, Text = "Position", Values = Plan.POSITIONS, Default = "Combat Settings" })
+    settings:AddSlider("AutoRaid_Distance", { Premium = true, Text = "Distance", Default = 3, Min = 1, Max = 10, Rounding = 1 })
     settings:AddSlider("AutoRaid_MaxPlayers", {
         Text     = "Max Players In Raid",
+        Premium  = true,
         Default  = 0,
         Min      = 0,
         Max      = 20,
@@ -34922,6 +34929,7 @@ function M.mount(ctx)
     local farmBox = ctx.Tabs.Fights:AddRightGroupbox("Mob Farm", "skull")
     farmBox:AddToggle("MobFarm_Enabled", {
         Text     = "Auto Mob Farm",
+        Premium  = true,
         Default  = false,
         Callback = function(on)
             if on then
@@ -42068,6 +42076,7 @@ function M.mount(ctx)
     local box = ctx.Tabs.Quests:AddRightGroupbox("Hamon", "wind")
     box:AddToggle("AutoHamon_Enabled", {
         Text     = "Auto Hamon Training",
+        Premium  = true,
         Default  = false,
         Callback = function(on)
             if on then
@@ -42081,11 +42090,13 @@ function M.mount(ctx)
     })
     box:AddDropdown("AutoHamon_Style", {
         Text    = "Style",
+        Premium = true,
         Values  = STYLE_NAMES,
         Default = "Caesar",
     })
     box:AddToggle("AutoHamon_Keys", {
         Text     = "Auto Key Prompts",
+        Premium  = true,
         Default  = false,
         Callback = function(on)
             keys = on
@@ -43016,6 +43027,7 @@ return function(ctx)
     local box = ctx.Tabs.Gathering:AddLeftGroupbox("Auto Garden", "sprout")
     box:AddToggle("AutoGarden_Enabled", {
         Text     = "Auto Garden",
+        Premium  = true,
         Default  = false,
         Callback = function(on)
             if on then
@@ -44385,6 +44397,7 @@ return function(ctx)
     local aura = ctx.Tabs.Combat:AddLeftGroupbox("Kill Aura", "swords")
     aura:AddToggle("KillAura_Enabled", {
         Text     = "Kill Aura",
+        Premium  = true,
         Default  = false,
         Callback = function(on)
             if on then
