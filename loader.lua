@@ -6,6 +6,7 @@ local CoreGui          = game:GetService("CoreGui")
 local GITHUB_BASE_URL  = "https://raw.githubusercontent.com/safetrademarketplace/scripts/refs/heads/main/"
 local UNIVERSAL_URL    = "https://api.luarmor.net/files/v4/loaders/1acad587672d96c8afb9c5bbc36bf921.lua"
 local DISCORD_URL      = "https://getcerberus.com/discord"
+local CERBERUS_DISCORD = "https://discord.gg/cerberus"
 local CHIMERA_DISCORD  = "https://discord.gg/fhErCU8GJx"
 local CHIMERA_LOGO     = "rbxassetid://109836038071568"
 local SUNC_RESULTS     = "https://r.sunc.su/w6aTeygyt9"
@@ -14,10 +15,14 @@ local SKIP_FOLDER      = "Cerberus"
 local SKIP_FILE        = "Cerberus/executor_warning.txt"
 local LOGO_ASSET       = "rbxassetid://136497541793809"
 
--- off chimera and mobile, a keyless run waits FREE_WAIT; a keyed run gets a short pitch one run in PAID_PITCH_ODDS
-local FREE_WAIT        = 30
-local PAID_PITCH_WAIT  = 5
-local PAID_PITCH_ODDS  = 3
+-- off chimera and mobile, a keyless run waits FREE_WAIT on a cerberus discord pitch; setting
+-- inDiscord=true before the loader skips the wait, but one run in IN_DISCORD_PITCH_ODDS still shows
+-- a short chimera ad; a keyed run gets a shorter one in PAID_PITCH_ODDS
+local FREE_WAIT              = 30
+local IN_DISCORD_PITCH_WAIT  = 10
+local IN_DISCORD_PITCH_ODDS  = 3
+local PAID_PITCH_WAIT        = 5
+local PAID_PITCH_ODDS        = 4
 
 -- the window, shrunk to fit small screens; the pitch slides fill its body between the header and the progress bar
 local WIN_W, WIN_H     = 560, 380
@@ -146,6 +151,18 @@ end
 -- a flag handed out by hand: getgenv().bypassExecutorPromo = true before this runs skips the chimera pitch and the unsupported executor screen, and leaves the key check alone
 local function promoBypassed()
     return truthy(ENV.bypassExecutorPromo) or truthy(_G.bypassExecutorPromo)
+end
+
+-- the user tells us they joined the cerberus discord by setting inDiscord=true above the loader line;
+-- the keyless wait is skipped on it, though one run in IN_DISCORD_PITCH_ODDS still gets a short chimera ad
+local function inDiscord()
+    return truthy(ENV.inDiscord) or truthy(_G.inDiscord)
+end
+
+-- the chimera ads (the in-discord 10s one and the paid 5s one) are off by default and only run
+-- when getgenv().CERBERUS_SHOW_CHIMERA_ADS = true; the cerberus discord pitch is unaffected
+local function chimeraAdsOn()
+    return truthy(ENV.CERBERUS_SHOW_CHIMERA_ADS) or truthy(_G.CERBERUS_SHOW_CHIMERA_ADS)
 end
 
 -- executors cerberus does not run on, matched against the reported name
@@ -536,7 +553,7 @@ function Panel:slides(builders, interval)
             Size = UDim2.fromOffset(SLIDE_W, SLIDE_H), Parent = page,
         })
         pages[i], plays[i] = page, build(content, self)
-        dots[i] = make("Frame", { BackgroundColor3 = CH.track, BorderSizePixel = 0, Size = UDim2.fromOffset(6, 6), LayoutOrder = i, Parent = dotRow })
+        dots[i] = make("Frame", { BackgroundColor3 = self.theme.track, BorderSizePixel = 0, Size = UDim2.fromOffset(6, 6), LayoutOrder = i, Parent = dotRow })
         corner(dots[i], 3)
     end
 
@@ -545,12 +562,12 @@ function Panel:slides(builders, interval)
         local prev = pages[shown]
         if prev then
             tween(prev, TI(0.35, Enum.EasingStyle.Quint), { GroupTransparency = 1, Position = UDim2.fromOffset(0, -14) })
-            tween(dots[shown], TI(0.3), { BackgroundColor3 = CH.track, Size = UDim2.fromOffset(6, 6) })
+            tween(dots[shown], TI(0.3), { BackgroundColor3 = self.theme.track, Size = UDim2.fromOffset(6, 6) })
         end
         local page = pages[i]
         page.Position, page.GroupTransparency, page.Visible = UDim2.fromOffset(0, 14), 1, true
         tween(page, TI(0.5, Enum.EasingStyle.Quint), { GroupTransparency = 0, Position = UDim2.fromOffset(0, 0) })
-        tween(dots[i], TI(0.3), { BackgroundColor3 = CH.accent, Size = UDim2.fromOffset(20, 6) })
+        tween(dots[i], TI(0.3), { BackgroundColor3 = self.theme.accent, Size = UDim2.fromOffset(20, 6) })
         if plays[i] then pcall(plays[i]) end
         shown = i
     end
@@ -572,24 +589,25 @@ function Panel:stopSlides()
     if self.slideWrap then self.slideWrap:Destroy(); self.slideWrap = nil end
 end
 
--- the pitch's ask, pinned under the bar for the whole wait: what chimera is, and the one thing to do about it
+-- the pitch's ask, pinned under the bar for the whole wait: the brand and the one thing to do about it
 function Panel:_pitchCard(o)
-    local card = make("Frame", { BackgroundColor3 = CH.surface, Position = UDim2.fromOffset(22, WIN_H - 74), Size = UDim2.new(1, -44, 0, 56), Parent = self.win })
+    local T = self.theme
+    local card = make("Frame", { BackgroundColor3 = T.surface, Position = UDim2.fromOffset(22, WIN_H - 74), Size = UDim2.new(1, -44, 0, 56), Parent = self.win })
     corner(card, 8)
-    stroke(card, CH.edge, 0)
-    make("ImageLabel", { BackgroundTransparency = 1, Image = CHIMERA_LOGO, ScaleType = Enum.ScaleType.Fit, Position = UDim2.fromOffset(12, 11), Size = UDim2.fromOffset(34, 34), Parent = card })
+    stroke(card, T.edge, T.edgeFade > 0 and 0.7 or 0)
+    make("ImageLabel", { BackgroundTransparency = 1, Image = o.logo or CHIMERA_LOGO, ImageColor3 = o.logoColor or Color3.new(1, 1, 1), ScaleType = Enum.ScaleType.Fit, Position = UDim2.fromOffset(12, 11), Size = UDim2.fromOffset(34, 34), Parent = card })
 
     local textW = -(58 + 150 + 22)
     local nameRow = make("Frame", { BackgroundTransparency = 1, Position = UDim2.fromOffset(58, 9), Size = UDim2.new(1, textW, 0, 20), Parent = card })
     make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = nameRow })
-    txt({ Text = "Chimera", FontFace = SERIF, TextSize = 19, TextColor3 = CH.text, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20), LayoutOrder = 1, Parent = nameRow })
+    txt({ Text = o.name or "Chimera", FontFace = o.nameFont or SERIF, TextSize = 19, TextColor3 = T.text, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20), LayoutOrder = 1, Parent = nameRow })
     local tag = txt({
-        Text = "FREE TRIAL EXECUTOR", FontFace = MONO, TextSize = 9, TextColor3 = CH.accent, TextXAlignment = Enum.TextXAlignment.Center,
-        BackgroundColor3 = CH.accent, BackgroundTransparency = 0.88, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 16), LayoutOrder = 2, Parent = nameRow,
+        Text = o.tag or "FREE TRIAL EXECUTOR", FontFace = MONO, TextSize = 9, TextColor3 = T.accent, TextXAlignment = Enum.TextXAlignment.Center,
+        BackgroundColor3 = T.accent, BackgroundTransparency = 0.88, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 16), LayoutOrder = 2, Parent = nameRow,
     })
     corner(tag, 4)
     make("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = tag })
-    stxt({ Text = o.sub, TextSize = 12, TextColor3 = CH.subtext, Position = UDim2.fromOffset(58, 31), Size = UDim2.new(1, textW, 0, 16), Parent = card })
+    stxt({ Text = o.sub, TextSize = 12, TextColor3 = T.subtext, Position = UDim2.fromOffset(58, 31), Size = UDim2.new(1, textW, 0, 16), Parent = card })
 
     local spec = o.cta
     local btn = self:_button(spec, 150, 36, card, 1, function(b)
@@ -600,17 +618,18 @@ function Panel:_pitchCard(o)
     return card
 end
 
--- the chimera pitch: the window dresses in chimera's theme, slides play while the bar fills over `seconds`
--- with the countdown beside it, and the chimera card holds the ask; then it all undresses. false if the window was closed
+-- a pitch: the window dresses in the pitch's theme (chimera's gold, or cerberus' own), slides play while the bar
+-- fills over `seconds` with the countdown beside it, and a brand card holds the ask; then it all undresses. false if the window was closed
 function Panel:pitch(o)
-    self:dress(CH)
-    self:mode(o.pill, CH.accent)
+    local T = o.theme or CH
+    self:dress(T)
+    self:mode(o.pill, T.accent)
     self.iconWrap.Visible, self.title.Visible, self.bodyScroll.Visible = false, false, false
     self.statusRow.Visible, self.btnRow.Visible = false, false
     self.progWrap.Visible = true
     self.progWrap.Size = UDim2.new(1, -44 - 52, 0, 5)
     local timer = txt({
-        Text = "", FontFace = MONO, TextSize = 12, TextColor3 = CH.faint, TextXAlignment = Enum.TextXAlignment.Right,
+        Text = "", FontFace = MONO, TextSize = 12, TextColor3 = T.faint, TextXAlignment = Enum.TextXAlignment.Right,
         AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -22, 0, WIN_H - 88), Size = UDim2.fromOffset(44, 16), Parent = self.win,
     })
     local card = self:_pitchCard(o)
@@ -758,8 +777,9 @@ end
 local closeBtn = { text = "Close", kind = "ghost", cb = function() panel:destroy() end }
 local getKeyBtn = { text = "Get a key", kind = "ghost", flash = "Discord copied!", cb = function() return copyTo(DISCORD_URL) end }
 local chimeraBtn = { text = "Copy Chimera Discord", kind = "primary", flash = "Link copied!", cb = function() return copyTo(CHIMERA_DISCORD) end }
--- the pitch card's one action
+-- the pitch card's one action, one per brand
 local ctaBtn = { text = "Get Chimera", kind = "primary", flash = "Discord copied!", cb = function() return copyTo(CHIMERA_DISCORD) end }
+local joinDiscordBtn = { text = "Join Discord", kind = "primary", flash = "Invite copied!", cb = function() return copyTo(CERBERUS_DISCORD) end }
 
 -- chimera pitch slides, in chimera's own look (serif headlines with the key word in gold italics, mono
 -- eyebrows, quiet bordered panels); each fills a blank SLIDE_W x SLIDE_H page and returns what to play on screen.
@@ -770,15 +790,16 @@ local function slideHead(page, eyebrow, title)
     stxt({ Text = title, FontFace = SERIF, TextSize = 28, TextColor3 = CH.text, RichText = true, Position = UDim2.fromOffset(0, 16), Size = UDim2.new(1, 0, 0, 34), Parent = page })
 end
 
--- a soft gold glow: stacked circles, faintest outermost, breathing slowly; `maxD` is the widest it ever gets,
--- so callers size it to stay inside the page
+-- a soft accent glow: stacked circles, faintest outermost, breathing slowly; `maxD` is the widest it ever gets,
+-- so callers size it to stay inside the page; `color` picks the ring color, defaulting to chimera's gold
 local BREATHE = 1.08
-local function glow(page, cx, cy, maxD)
+local function glow(page, cx, cy, maxD, color)
+    local accent = color or CH.accent
     local rings = {}
     for i, fade in ipairs({ 0.9, 0.94, 0.97 }) do
         local d = math.floor(maxD / BREATHE * (0.4 + i * 0.2))
         local ring = make("Frame", {
-            BackgroundColor3 = CH.accent, BackgroundTransparency = fade, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
+            BackgroundColor3 = accent, BackgroundTransparency = fade, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
             Position = UDim2.fromOffset(cx, cy), Size = UDim2.fromOffset(d, d), ZIndex = 0, Parent = page,
         })
         corner(ring, math.floor(d / 2))
@@ -873,40 +894,78 @@ local function benchmarkSlide(page, owner)
     end
 end
 
--- the first card is the headline, so it is the one outlined in gold
-local FEATURES = {
-    { "Free trial", "Three days, no card." },
-    { "HWID ban bypass", "Hardware bans don't stop it." },
-    { "Automatic updates", "Always on the latest build." },
-    { "Multi instance", "Run several clients at once." },
+local PAID_SLIDES = {
+    heroSlide("QUICK TIP", "Have you tried the\nChimera " .. gold("executor") .. "?",
+        "It's a Roblox executor with a free three-day trial. On it you'd skip this wait and never need a key for Cerberus."),
+    benchmarkSlide,
 }
 
-local function featureSlide(page)
-    slideHead(page, "FEATURES", "The executor with a free " .. gold("trial"))
+-- a word in cerberus' accent green italics, for rich-text headlines
+local GREEN_HEX = "#5aff8c"
+local function green(word) return ('<i><font color="%s">%s</font></i>'):format(GREEN_HEX, word) end
+
+-- cerberus hero: the brand mark and the headline, "join the discord"
+local function cerberusHeroSlide(page)
+    local breathe = glow(page, 86, 100, 168, C.accent)
+    local badge = make("Frame", { BackgroundColor3 = C.surface, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(86, 100), Size = UDim2.fromOffset(120, 120), ZIndex = 2, Parent = page })
+    corner(badge, 22)
+    local ring = stroke(badge, C.accent, 0.45, 1.5)
+    local logo = make("ImageLabel", {
+        BackgroundTransparency = 1, Image = LOGO_ASSET, ImageColor3 = C.accent, ScaleType = Enum.ScaleType.Fit, ZIndex = 3,
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(78, 78), Parent = badge,
+    })
+    local pop = make("UIScale", { Scale = 1, Parent = logo })
+    stxt({ Text = "CERBERUS", FontFace = FONT.semi, TextSize = 11, TextColor3 = C.accent, TextXAlignment = Enum.TextXAlignment.Center, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromOffset(86, 168), Size = UDim2.fromOffset(120, 14), ZIndex = 2, Parent = page })
+    local x = 186
+    stxt({ Text = "JOIN THE COMMUNITY", FontFace = FONT.semi, TextSize = 11, TextColor3 = C.accent, Position = UDim2.fromOffset(x, 22), Size = UDim2.new(1, -x, 0, 14), Parent = page })
+    stxt({ Text = "Join the Cerberus\n" .. green("Discord") .. ".", FontFace = FONT.bold, TextSize = 36, TextColor3 = C.text, RichText = true, TextYAlignment = Enum.TextYAlignment.Top, Position = UDim2.fromOffset(x, 40), Size = UDim2.new(1, -x, 0, 88), Parent = page })
+    stxt({
+        Text = "Join once and skip this wait from then on. Keys, support, giveaways and update notes all live in there.",
+        TextSize = 14, TextColor3 = C.subtext, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+        Position = UDim2.fromOffset(x, 132), Size = UDim2.new(1, -x, 0, 72), Parent = page,
+    })
+    return function()
+        pop.Scale = 0.6
+        tween(pop, TI(0.6, Enum.EasingStyle.Quint), { Scale = 1 })
+        tween(ring, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { Transparency = 0.85 })
+        breathe()
+    end
+end
+
+-- what's in the cerberus discord: four small cards, the "skip this wait" one highlighted
+local CERBERUS_BENEFITS = {
+    { "Free keys", "Giveaways and daily drops." },
+    { "Direct support", "The devs are in there every day." },
+    { "Script updates", "New games and fixes land here first." },
+    { "Skip this wait", "Set inDiscord = true to skip it." },
+}
+
+local function cerberusBenefitsSlide(page)
+    stxt({ Text = "WHAT'S IN THE DISCORD", FontFace = FONT.semi, TextSize = 11, TextColor3 = C.accent, Size = UDim2.new(1, 0, 0, 14), Parent = page })
+    stxt({ Text = "Why " .. green("join") .. "?", FontFace = FONT.bold, TextSize = 28, TextColor3 = C.text, RichText = true, Position = UDim2.fromOffset(0, 16), Size = UDim2.new(1, 0, 0, 34), Parent = page })
     local gap = 12
     local w = math.floor((SLIDE_W - gap) / 2)
     local h = 66
     local pops = {}
-    for i, f in ipairs(FEATURES) do
-        local lead = i == 1
+    for i, f in ipairs(CERBERUS_BENEFITS) do
+        local lead = i == 4
         local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
         local card = make("Frame", {
-            BackgroundColor3 = CH.white, AnchorPoint = Vector2.new(0.5, 0.5),
+            BackgroundColor3 = C.white, AnchorPoint = Vector2.new(0.5, 0.5),
             Position = UDim2.fromOffset(col * (w + gap) + w / 2, 62 + row * (h + 10) + h / 2), Size = UDim2.fromOffset(w, h), Parent = page,
         })
         corner(card, 8)
-        grad(card, CH.surface, CH.bg, 160)
-        stroke(card, lead and CH.accent or CH.edge, lead and 0.35 or 0)
-        local chip = make("Frame", { BackgroundColor3 = CH.accent, BackgroundTransparency = 0.88, Position = UDim2.fromOffset(14, 16), Size = UDim2.fromOffset(34, 34), Parent = card })
+        grad(card, C.surface, C.bg, 160)
+        stroke(card, lead and C.accent or C.faint, lead and 0.35 or 0.65)
+        local chip = make("Frame", { BackgroundColor3 = C.accent, BackgroundTransparency = 0.86, Position = UDim2.fromOffset(14, 16), Size = UDim2.fromOffset(34, 34), Parent = card })
         corner(chip, 6)
-        local pip = make("Frame", { BackgroundColor3 = CH.accent, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(10, 10), Parent = chip })
+        local pip = make("Frame", { BackgroundColor3 = C.accent, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(10, 10), Parent = chip })
         corner(pip, lead and 5 or 2)
-        stxt({ Text = f[1], FontFace = SERIF, TextSize = 21, TextColor3 = lead and CH.accentHi or CH.text, Position = UDim2.fromOffset(62, 12), Size = UDim2.new(1, -76, 0, 24), Parent = card })
-        stxt({ Text = f[2], TextSize = 12, TextColor3 = CH.subtext, Position = UDim2.fromOffset(62, 38), Size = UDim2.new(1, -76, 0, 16), Parent = card })
+        stxt({ Text = f[1], FontFace = FONT.bold, TextSize = 19, TextColor3 = lead and C.accentHi or C.text, Position = UDim2.fromOffset(62, 12), Size = UDim2.new(1, -76, 0, 24), Parent = card })
+        stxt({ Text = f[2], TextSize = 12, TextColor3 = C.subtext, Position = UDim2.fromOffset(62, 38), Size = UDim2.new(1, -76, 0, 16), Parent = card })
         pops[i] = make("UIScale", { Scale = 1, Parent = card })
     end
     return function()
-        -- settle in from slightly smaller, never past full size
         for i, pop in ipairs(pops) do
             pop.Scale = 0.9
             task.delay((i - 1) * 0.08, function() tween(pop, TI(0.5, Enum.EasingStyle.Quint), { Scale = 1 }) end)
@@ -914,76 +973,43 @@ local function featureSlide(page)
     end
 end
 
-local SAFETY = {
-    { "Undetected by Roblox", "Proof is posted in the Chimera Discord." },
-    { "Undetected by games", "Tested on Steal an Egg, GPO and Bridger Western." },
-    { "Error & output redirection", "Built right in." },
-}
-
-local function safetySlide(page)
-    slideHead(page, "SAFETY", "Safe and " .. gold("reliable"))
-    local rows = {}
-    for i, item in ipairs(SAFETY) do
-        local row = make("Frame", { BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 62 + (i - 1) * 48), Size = UDim2.new(1, 0, 0, 44), Parent = page })
-        local bar = make("Frame", { BackgroundColor3 = CH.accent, BorderSizePixel = 0, Position = UDim2.fromOffset(0, 6), Size = UDim2.fromOffset(2, 30), Parent = row })
-        corner(bar, 1)
-        stxt({ Text = item[1], FontFace = FONT.semi, TextSize = 15, TextColor3 = CH.text, Position = UDim2.fromOffset(16, 4), Size = UDim2.new(1, -16, 0, 18), Parent = row })
-        stxt({ Text = item[2], TextSize = 12, TextColor3 = CH.subtext, Position = UDim2.fromOffset(16, 23), Size = UDim2.new(1, -16, 0, 15), Parent = row })
-        if i < #SAFETY then
-            make("Frame", { BackgroundColor3 = CH.lineSoft, BorderSizePixel = 0, Position = UDim2.new(0, 16, 1, 1), Size = UDim2.new(1, -16, 0, 1), Parent = row })
-        end
-        rows[i] = { row = row, home = row.Position }
-    end
-    return function()
-        -- each row rises a few pixels into place, staggered
-        for i, r in ipairs(rows) do
-            r.row.Position = r.home + UDim2.fromOffset(0, 8)
-            task.delay((i - 1) * 0.1, function() tween(r.row, TI(0.45, Enum.EasingStyle.Quint), { Position = r.home }) end)
-        end
-    end
-end
-
--- the closing ask: skipping the wait is the headline, and the invite is shown in full and tappable, so it
--- works even where the clipboard doesn't
-local function inviteSlide(page, owner)
-    local breathe = glow(page, SLIDE_W / 2, 140, 132)
+-- the ask: the invite in full, tappable, and the one line to add to skip from here on
+local function cerberusInviteSlide(page, owner)
+    local breathe = glow(page, SLIDE_W / 2, 92, 148, C.accent)
     local function centered(props)
         props.TextXAlignment = Enum.TextXAlignment.Center
         props.ZIndex = 2
         return stxt(props)
     end
-    centered({ Text = "FREE TRIAL", FontFace = MONO, TextSize = 11, TextColor3 = CH.accent, Position = UDim2.fromOffset(0, 6), Size = UDim2.new(1, 0, 0, 14), Parent = page })
-    centered({ Text = "Skip the wait with " .. gold("Chimera"), FontFace = SERIF, TextSize = 38, TextColor3 = CH.text, RichText = true, Position = UDim2.fromOffset(0, 24), Size = UDim2.new(1, 0, 0, 46), Parent = page })
-    centered({ Text = "Start on a free three-day trial. No payment, no card.", TextSize = 14, TextColor3 = CH.subtext, Position = UDim2.fromOffset(0, 76), Size = UDim2.new(1, 0, 0, 18), Parent = page })
+    centered({ Text = "SKIP THE WAIT", FontFace = FONT.semi, TextSize = 11, TextColor3 = C.accent, Position = UDim2.fromOffset(0, 4), Size = UDim2.new(1, 0, 0, 14), Parent = page })
+    centered({ Text = "Join " .. green("discord.gg/cerberus"), FontFace = FONT.bold, TextSize = 28, TextColor3 = C.text, RichText = true, Position = UDim2.fromOffset(0, 22), Size = UDim2.new(1, 0, 0, 34), Parent = page })
+    centered({ Text = "Then add this one line above your loadstring:", TextSize = 13, TextColor3 = C.subtext, Position = UDim2.fromOffset(0, 60), Size = UDim2.new(1, 0, 0, 16), Parent = page })
+    local code = make("Frame", {
+        BackgroundColor3 = C.bg, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 82),
+        Size = UDim2.fromOffset(300, 30), ZIndex = 2, Parent = page,
+    })
+    corner(code, 6)
+    stroke(code, C.faint, 0.6)
+    txt({ Text = "inDiscord = true", FontFace = MONO, TextSize = 14, TextColor3 = C.accentHi, TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.fromScale(1, 1), Parent = code })
     local invite = make("TextButton", {
-        Text = "discord.gg/fhErCU8GJx", FontFace = MONO, TextSize = 15, TextColor3 = CH.accentHi, AutoButtonColor = false,
-        BackgroundColor3 = CH.bg, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 114),
-        Size = UDim2.fromOffset(270, 44), ZIndex = 2, Parent = page,
+        Text = "Tap to copy the invite", FontFace = MONO, TextSize = 13, TextColor3 = C.accentDk, AutoButtonColor = false,
+        BackgroundColor3 = C.accent, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 122),
+        Size = UDim2.fromOffset(240, 36), ZIndex = 2, Parent = page,
     })
     corner(invite, 8)
-    local edge = stroke(invite, CH.accent, 0.35, 1.5)
-    centered({ Text = "Tap to copy the invite", FontFace = MONO, TextSize = 10, TextColor3 = CH.faint, Position = UDim2.fromOffset(0, 168), Size = UDim2.new(1, 0, 0, 12), Parent = page })
+    owner:track(invite.MouseEnter:Connect(function() tween(invite, TI(0.1), { BackgroundColor3 = C.accentHi }) end))
+    owner:track(invite.MouseLeave:Connect(function() tween(invite, TI(0.16), { BackgroundColor3 = C.accent }) end))
     owner:track(invite.MouseButton1Click:Connect(function()
-        invite.Text = copyTo(CHIMERA_DISCORD) and "Invite copied!" or "discord.gg/fhErCU8GJx"
-        task.delay(1.6, function() if invite.Parent then invite.Text = "discord.gg/fhErCU8GJx" end end)
+        invite.Text = copyTo(CERBERUS_DISCORD) and "Invite copied!" or "discord.gg/cerberus"
+        task.delay(1.6, function() if invite.Parent then invite.Text = "Tap to copy the invite" end end)
     end))
+    centered({ Text = "You only have to join once.", FontFace = MONO, TextSize = 10, TextColor3 = C.faint, Position = UDim2.fromOffset(0, 168), Size = UDim2.new(1, 0, 0, 12), Parent = page })
     return function()
         breathe()
-        tween(edge, TweenInfo.new(1.1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { Transparency = 0.8 })
     end
 end
 
-local FREE_SLIDES = {
-    heroSlide("MEET CHIMERA", "An executor on a\nfree " .. gold("trial") .. ".",
-        "Run this script on Chimera and you skip the wait, every time. The trial runs three days with no payment and no card, and every Cerberus premium feature unlocks on it."),
-    benchmarkSlide, featureSlide, safetySlide, inviteSlide,
-}
-
-local PAID_SLIDES = {
-    heroSlide("QUICK TIP", "Have you tried the\nChimera " .. gold("executor") .. "?",
-        "It's a Roblox executor with a free three-day trial. On it you'd skip this wait and never need a key for Cerberus."),
-    benchmarkSlide,
-}
+local CERBERUS_SLIDES = { cerberusHeroSlide, cerberusBenefitsSlide, cerberusInviteSlide }
 
 local function checkKey()
     if onChimera() then return true, "CHIMERA" end
@@ -1060,12 +1086,26 @@ local function boot()
     panel:icon(C.accent)
     panel:option(nil)
 
-    -- chimera and mobile never wait; keyless runs elsewhere wait out the full pitch, keyed runs see a short one now and then
+    -- chimera and mobile never wait. keyless off chimera waits out the cerberus discord pitch, unless the user
+    -- set inDiscord=true, in which case the wait is gone. the chimera ads (one run in IN_DISCORD_PITCH_ODDS
+    -- for in-discord keyless, one run in PAID_PITCH_ODDS for keyed) are off unless CERBERUS_SHOW_CHIMERA_ADS=true.
     local rawKey = ENV.script_key or _G.script_key or script_key
+    local chimeraAds = chimeraAdsOn()
     if not onChimera() and not onMobile() and not promoBypassed() then
         if not truthy(rawKey) then
-            if not panel:pitch({ seconds = FREE_WAIT, pill = "KEYLESS", slides = FREE_SLIDES, cta = ctaBtn, sub = "Run this script on it and you skip the wait." }) then return end
-        elseif Random.new():NextInteger(1, PAID_PITCH_ODDS) == 1 then
+            if inDiscord() then
+                if chimeraAds and Random.new():NextInteger(1, IN_DISCORD_PITCH_ODDS) == 1 then
+                    if not panel:pitch({ seconds = IN_DISCORD_PITCH_WAIT, pill = "TIP", slides = PAID_SLIDES, cta = ctaBtn, sub = "On it you'd skip this wait and never need a key." }) then return end
+                end
+            else
+                if not panel:pitch({
+                    seconds = FREE_WAIT, pill = "DISCORD",
+                    theme = C, logo = LOGO_ASSET, logoColor = C.accent, name = "Cerberus", tag = "COMMUNITY", nameFont = FONT.bold,
+                    slides = CERBERUS_SLIDES, cta = joinDiscordBtn,
+                    sub = "Set inDiscord = true to skip from now on.",
+                }) then return end
+            end
+        elseif chimeraAds and Random.new():NextInteger(1, PAID_PITCH_ODDS) == 1 then
             if not panel:pitch({ seconds = PAID_PITCH_WAIT, pill = "TIP", slides = PAID_SLIDES, cta = ctaBtn, sub = "On it you'd skip this wait and never need a key." }) then return end
         end
     end
