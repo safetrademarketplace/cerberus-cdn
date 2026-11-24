@@ -110,7 +110,7 @@ local FREE_SCRIPTS = {
     ["shindoLife.lua"] = true, ["practicalBasketball.lua"] = true, ["aba.lua"] = true, ["rivals.lua"] = true, ["ryujin.lua"] = true,
     ["stealAnEgg.lua"] = true, ["wonderland.lua"] = true, ["violenceDistrict.lua"] = true, ["dqr.lua"] = true, ["RH2.lua"] = true,
     ["bridger.lua"] = true, ["theVeil.lua"] = true, ["projectSlayers2.lua"] = true, ["cloverRPG.lua"] = true,
-    ["beyondNen.lua"] = true, ["standOut.lua"] = true
+    ["beyondNen.lua"] = true, ["standOut.lua"] = true, ["theForge.lua"] = true
 }
 
 local LUARMOR_SDK_URL   = "https://sdkapi-public.luarmor.net/library.lua"
